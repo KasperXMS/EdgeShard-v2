@@ -7,11 +7,13 @@ on ``model_type`` or architecture names.
 
 from __future__ import annotations
 
-from typing import ClassVar, Protocol
+from typing import Any, ClassVar, Protocol
 
+import torch
 import torch.nn as nn
 from accelerate import init_empty_weights
 from transformers import AutoConfig, AutoModelForCausalLM, PretrainedConfig
+from transformers.cache_utils import DynamicCache
 
 from edgeshard.model.layout import ModelLayout
 from edgeshard.model.source import ModelSource
@@ -37,13 +39,39 @@ def keep_layer_range(layers: nn.ModuleList, blocks: BlockRange) -> None:
     del layers[: blocks.start]
 
 
+def causal_attention_mask(q_len: int, kv_len: int, reference: torch.Tensor) -> torch.Tensor:
+    """Build the 4D additive dense causal mask for direct layer execution.
+
+    Layers called outside the full HF model receive no model-level causal
+    masking, so it is reconstructed here from canonical position metadata
+    (spec 14.1): query position ``i`` attends to key positions
+    ``j <= i + (kv_len - q_len)``. Entries are ``0`` where attention is kept
+    and ``finfo(dtype).min`` elsewhere. Shape is ``(1, 1, q_len, kv_len)``;
+    device and dtype follow ``reference`` so the same code serves CPU and
+    GPU runtimes.
+
+    Phase 0 uses dense causal masks: test sequences stay within any sliding
+    window, so windowed variants are observationally identical here.
+    """
+    if q_len == 1:
+        # A single decode query attends to every cached key plus itself.
+        return reference.new_zeros((1, 1, 1, kv_len))
+    i = torch.arange(q_len, device=reference.device).unsqueeze(1)
+    j = torch.arange(kv_len, device=reference.device).unsqueeze(0)
+    keep = j <= i + (kv_len - q_len)
+    mask = reference.new_zeros((q_len, kv_len))
+    mask = mask.masked_fill(~keep, torch.finfo(reference.dtype).min)
+    return mask.unsqueeze(0).unsqueeze(0)
+
+
 class ModelAdapter(Protocol):
     """Adapter for one Hugging Face model architecture.
 
     Responsibilities over Phase 0 (spec 9.2): structure discovery and layout,
-    shard-compatible skeleton construction, and canonical-state adaptation for
-    prefill/decode. Signatures may evolve across 0A-0C, but all
-    architecture-specific behavior stays confined to adapter implementations.
+    shard-compatible skeleton construction, and native-execution hooks used
+    by ``ShardModule`` for prefill/decode. Signatures may evolve across
+    0A-0C, but all architecture-specific behavior stays confined to adapter
+    implementations.
     """
 
     #: ``config.model_type`` handled by this adapter, e.g. ``"llama"``.
@@ -53,6 +81,32 @@ class ModelAdapter(Protocol):
 
     def inspect(self, source: ModelSource) -> ModelLayout:
         """Describe the model backbone without loading weights."""
+        ...
+
+    def build_skeleton(self, source: ModelSource, shard: ShardSpec) -> nn.Module:
+        """Create a meta-device skeleton reduced to the shard's modules."""
+        ...
+
+    def new_cache(self) -> object:
+        """Create a fresh native KV cache for one session (spec 13)."""
+        ...
+
+    def embed_tokens(self, module: nn.Module, input_ids: torch.Tensor) -> torch.Tensor:
+        """Run the input stage on token ids."""
+        ...
+
+    def forward_blocks(
+        self,
+        module: nn.Module,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        cache: Any,
+    ) -> torch.Tensor:
+        """Run the shard's Transformer blocks, updating the session cache."""
+        ...
+
+    def finalize(self, module: nn.Module, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Run the output stage (final norm + LM head) producing logits."""
         ...
 
 
@@ -118,8 +172,60 @@ class StandardDecoderLMAdapter:
         if not shard.include_input_stage:
             backbone.embed_tokens = nn.Identity()
         keep_layer_range(backbone.layers, shard.blocks)
+        # Attention modules cache by ``self_attn.layer_idx``; after trimming,
+        # retained layers must use skeleton-local indices so the session KV
+        # cache (indexed 0..k-1) stays coherent.
+        for local_index, layer in enumerate(backbone.layers):
+            layer.self_attn.layer_idx = local_index
         if not shard.include_output_stage:
             backbone.norm = nn.Identity()
             skeleton.lm_head = nn.Identity()
         model: nn.Module = skeleton
         return model
+
+    def new_cache(self) -> object:
+        """Create the native HF dynamic KV cache for one session."""
+        return DynamicCache()
+
+    def embed_tokens(self, module: nn.Module, input_ids: torch.Tensor) -> torch.Tensor:
+        backbone: Any = module.model
+        embedded: torch.Tensor = backbone.embed_tokens(input_ids)
+        return embedded
+
+    def forward_blocks(
+        self,
+        module: nn.Module,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        cache: Any,
+    ) -> torch.Tensor:
+        """Run the retained layers with locally reconstructed causal masking.
+
+        Direct layer calls bypass the HF model-level mask (spec 14.1), so the
+        dense causal mask is rebuilt from ``positions`` and the cache's current
+        sequence length. Rotary embeddings are produced once and passed to
+        every layer via ``position_embeddings``.
+        """
+        backbone: Any = module.model
+        position_embeddings = backbone.rotary_emb(hidden_states, positions)
+        q_len = int(hidden_states.shape[1])
+        past_length: int = int(cache.get_seq_length())
+        mask = causal_attention_mask(q_len, past_length + q_len, hidden_states)
+        hidden = hidden_states
+        for layer in backbone.layers:
+            hidden = layer(
+                hidden,
+                attention_mask=mask,
+                position_ids=positions,
+                past_key_values=cache,
+                use_cache=True,
+                position_embeddings=position_embeddings,
+            )
+        result: torch.Tensor = hidden
+        return result
+
+    def finalize(self, module: nn.Module, hidden_states: torch.Tensor) -> torch.Tensor:
+        backbone: Any = module.model
+        head: Any = module.lm_head
+        logits: torch.Tensor = head(backbone.norm(hidden_states))
+        return logits

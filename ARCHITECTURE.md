@@ -147,6 +147,27 @@ in Phase 0.
 - **Phase 0 inference is `batch_size = 1`**; protocol structures retain batch
   fields for later extension. Sampling is deterministic greedy, driven outside
   the shard runtime (`GenerationDriver`).
+- **Canonical execution state lives in `inference/`** (`InferencePhase`,
+  `ExecutionContext`, `ShardState`, `LogitsOutput`). Backends reconstruct
+  whatever they need (attention masks, RoPE inputs) from this metadata;
+  backend-specific masks never cross shard boundaries (spec 14.1).
+- **Execution is split adapter hooks + canonical orchestration.** The spec 9.2
+  sketch shows `execute_prefill/decode` on the adapter; that would invert the
+  dependency direction (`model` → `inference`). Instead the adapter exposes
+  native hooks (`new_cache`, `embed_tokens`, `forward_blocks`, `finalize`)
+  containing every HF-version-specific detail — layer call signature, rotary
+  invocation, cache API, causal mask reconstruction, skeleton-local
+  `self_attn.layer_idx` repair — while `ShardModule` orchestrates sessions,
+  positions, and canonical outputs.
+- **Direct layer execution reconstructs causal masking.** Layers called
+  outside the full HF model get no model-level mask, so the adapter builds a
+  4D additive dense causal mask from canonical position metadata and cache
+  length (`finfo(dtype).min` fill; decode uses an all-keep mask). Phase 0 test
+  sequences stay within any sliding window, so windowed attention models
+  behave identically; window-specific masks are later work.
+- **`ShardModule` is device/dtype-parametrized.** All execution derives
+  devices and dtypes from the module and its inputs (no hardcoded `cpu`),
+  so the same code serves the CPU development tier and GPU containers.
 
 ---
 
