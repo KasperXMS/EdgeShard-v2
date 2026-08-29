@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Environments
+.venv/
+
+# Tool caches
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+.hypothesis/
+.coverage
+htmlcov/
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Local Claude Code session/permission state (machine-specific)
+.claude/
+
+# NOTE: uv.lock is intentionally committed (spec 4.10 reproducibility).
