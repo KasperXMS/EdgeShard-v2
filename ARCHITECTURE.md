@@ -189,6 +189,20 @@ in Phase 0.
   Protocol version is enforced both on wire reads and by message validation;
   every spec 16.2 violation fails explicitly (`ProtocolError` /
   `SequencingError`), never silently recovers.
+- **The serialized boundary is a port/adapter seam.** `inference/pipeline.py`
+  defines the `StageTransport` port using inference domain types only;
+  `protocol/boundary.py` implements it (`SerializedStageBoundary`: domain →
+  protobuf → bytes → domain → spec 16.2 validation per hop). Composition
+  happens in tests and the runtime server, keeping the spec 7 direction
+  `protocol → inference` intact (the inference layer never imports
+  protocol). `protocol/boundary.py` is an addition to the spec 6 layout.
+- **Prompt ingestion is driver-local.** The three canonical payload
+  categories (Token/HiddenState/Logits) describe inter-shard state; the
+  prefill prompt enters stage 0 directly via `input_ids`, while every
+  stage-to-stage hop and the final reply cross the serialized boundary.
+- **Sampling lives outside the shard runtime.** `GenerationDriver`
+  (`inference/generation.py`) runs deterministic greedy decoding over a
+  `LocalPipeline`; shards never sample.
 
 ---
 
