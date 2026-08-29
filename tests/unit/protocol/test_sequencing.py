@@ -49,7 +49,7 @@ def make_message(
         past_length=step,
         positions=torch.zeros(1, 1, dtype=torch.long) if step else None,
     )
-    return ShardMessage(header=header, context=context, payload=TokenPayload(token_id=1))
+    return ShardMessage(header=header, context=context, payload=TokenPayload(token_ids=(1,)))
 
 
 def make_expectation(

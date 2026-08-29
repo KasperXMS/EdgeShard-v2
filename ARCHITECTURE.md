@@ -103,6 +103,7 @@ protocol     -> model-specific adapter branching
 ```text
 proto/                    gRPC/protobuf definitions (0D+)
 src/edgeshard/
+  cli.py, __main__.py     runtime process entry point (`python -m edgeshard`)
   model/                  specs, sources, layouts, adapters/, weights/
   inference/              shard module, sessions, pipeline, generation
   protocol/               canonical domain, protobuf mapper, tensor codec, gRPC
@@ -196,13 +197,35 @@ in Phase 0.
   happens in tests and the runtime server, keeping the spec 7 direction
   `protocol → inference` intact (the inference layer never imports
   protocol). `protocol/boundary.py` is an addition to the spec 6 layout.
-- **Prompt ingestion is driver-local.** The three canonical payload
-  categories (Token/HiddenState/Logits) describe inter-shard state; the
-  prefill prompt enters stage 0 directly via `input_ids`, while every
-  stage-to-stage hop and the final reply cross the serialized boundary.
+- **Prompt ingestion evolved into the TokenPayload sequence.** At 0E the
+  prompt entered stage 0 directly via `input_ids` (driver-local). At 0F the
+  gRPC runtime receives the prompt as a master → stage-0 TokenPayload hop:
+  `repeated int64 token_ids = 1` carries the full prompt on prefill and
+  exactly one token on decode (the header phase disambiguates). Field 1 is
+  wire-compatible with the earlier singular int64 field. Stage-to-stage hops
+  still carry hidden states; the final reply carries logits.
 - **Sampling lives outside the shard runtime.** `GenerationDriver`
   (`inference/generation.py`) runs deterministic greedy decoding over a
   `LocalPipeline`; shards never sample.
+- **One process is one pipeline stage (the 0F composition root).**
+  `runtime/shard_server.py` composes config → `ShardModule` → handler →
+  gRPC server; `python -m edgeshard --config stage.yaml` (or the `edgeshard`
+  console script) binds, prints `READY runtime=... endpoint=...`, and serves.
+  Hidden states move stage → stage directly via `next_endpoint` forwarding —
+  the Mock Master never relays activations; it only sends token hops and
+  receives final logits replies.
+- **Session RPCs chain through the pipeline with rollback** (spec 18.1):
+  CreateSession/CloseSession propagate along `next_endpoint`, every runtime
+  creates its own local KV state, and a refused downstream creation rolls
+  back the local session.
+- **Two explicit error styles at the gRPC boundary.** Session lifecycle RPCs
+  return structured `ok`/`detail` replies (clients raise `ProtocolError` on
+  failure); Prefill/Decode abort with `INVALID_ARGUMENT` carrying the spec
+  16.2 violation text. Both surface failures loudly; neither degrades
+  silently.
+- **Readiness is GetRuntimeInfo.** Phase 0 adds no health-checking
+  dependency; clients poll `GetRuntimeInfo` until the runtime answers (also
+  how deployment tooling reads runtime identity/topology, spec 17.1).
 
 ---
 

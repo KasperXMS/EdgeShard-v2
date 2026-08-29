@@ -92,14 +92,14 @@ def test_token_payload_roundtrip() -> None:
     message = ShardMessage(
         header=make_header(phase=InferencePhase.DECODE, step=3),
         context=make_context(InferencePhase.DECODE, positions=torch.tensor([[9]])),
-        payload=TokenPayload(token_id=127),
+        payload=TokenPayload(token_ids=(127,)),
     )
     restored = roundtrip_request(message)
 
     assert_headers_equal(restored.header, message.header)
     assert_contexts_equal(restored.context, message.context)
     assert isinstance(restored.payload, TokenPayload)
-    assert restored.payload.token_id == 127
+    assert restored.payload.token_ids == (127,)
 
 
 def test_hidden_state_payload_roundtrip_preserves_tensor() -> None:
@@ -151,7 +151,7 @@ def test_bfloat16_tensor_survives_the_wire() -> None:
 
 def test_wrong_protocol_version_on_read_is_rejected() -> None:
     message = ShardMessage(
-        header=make_header(), context=make_context(), payload=TokenPayload(token_id=1)
+        header=make_header(), context=make_context(), payload=TokenPayload(token_ids=(1,))
     )
     wire = mapper.message_to_forward_request(message)
     wire.header.protocol_version = PROTOCOL_VERSION + 1
@@ -161,7 +161,7 @@ def test_wrong_protocol_version_on_read_is_rejected() -> None:
 
 def test_unknown_wire_phase_is_rejected() -> None:
     message = ShardMessage(
-        header=make_header(), context=make_context(), payload=TokenPayload(token_id=1)
+        header=make_header(), context=make_context(), payload=TokenPayload(token_ids=(1,))
     )
     wire = mapper.message_to_forward_request(message)
     wire.header.phase = 99

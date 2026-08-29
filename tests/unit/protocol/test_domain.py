@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pytest
 import torch
 
 from edgeshard.inference.state import ExecutionContext, InferencePhase
@@ -61,22 +62,29 @@ def test_master_stage_precedes_the_first_shard_stage() -> None:
 
 
 def test_payload_categories_are_distinct() -> None:
-    token = TokenPayload(token_id=7)
+    token = TokenPayload(token_ids=(7,))
     hidden = HiddenStatePayload(hidden_states=torch.zeros(1, 2, 4))
     logits = LogitsPayload(logits=torch.zeros(1, 2, 8))
 
-    assert token.token_id == 7
+    assert token.token_ids == (7,)
     assert hidden.hidden_states.shape == (1, 2, 4)
     assert logits.logits.shape == (1, 2, 8)
     assert not isinstance(token, HiddenStatePayload)
     assert not isinstance(hidden, LogitsPayload)
 
 
+def test_prompt_and_single_token_both_use_token_payload() -> None:
+    prompt = TokenPayload(token_ids=(1, 2, 3))
+    assert prompt.token_ids == (1, 2, 3)
+    with pytest.raises(ValueError, match="at least one token"):
+        TokenPayload(token_ids=())
+
+
 def test_message_bundles_header_context_and_payload() -> None:
     message = ShardMessage(
         header=make_header(),
         context=make_context(),
-        payload=TokenPayload(token_id=3),
+        payload=TokenPayload(token_ids=(3,)),
     )
     assert message.header.execution_id == "exec-1"
     assert message.context.sequence_lengths == (3,)

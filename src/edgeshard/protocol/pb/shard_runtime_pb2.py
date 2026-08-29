@@ -24,43 +24,43 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x13shard_runtime.proto\x12\x0f\x65\x64geshard.proto\"\xc8\x01\n\rMessageHeader\x12\x18\n\x10protocol_version\x18\x01 \x01(\x05\x12\x14\n\x0c\x65xecution_id\x18\x02 \x01(\t\x12\x12\n\nsession_id\x18\x03 \x01(\t\x12\x12\n\nrequest_id\x18\x04 \x01(\t\x12%\n\x05phase\x18\x05 \x01(\x0e\x32\x16.edgeshard.proto.Phase\x12\x0c\n\x04step\x18\x06 \x01(\x05\x12\x14\n\x0csource_stage\x18\x07 \x01(\x05\x12\x14\n\x0ctarget_stage\x18\x08 \x01(\x05\"\x8a\x01\n\x10\x45xecutionContext\x12%\n\x05phase\x18\x01 \x01(\x0e\x32\x16.edgeshard.proto.Phase\x12\x0c\n\x04step\x18\x02 \x01(\x05\x12\x12\n\nbatch_size\x18\x03 \x01(\x05\x12\x18\n\x10sequence_lengths\x18\x04 \x03(\x03\x12\x13\n\x0bpast_length\x18\x05 \x01(\x03\" \n\x0cTokenPayload\x12\x10\n\x08token_id\x18\x01 \x01(\x03\"(\n\x12HiddenStatePayload\x12\x12\n\ntensor_key\x18\x01 \x01(\t\"#\n\rLogitsPayload\x12\x12\n\ntensor_key\x18\x01 \x01(\t\"\xb7\x01\n\x0cShardPayload\x12.\n\x05token\x18\x01 \x01(\x0b\x32\x1d.edgeshard.proto.TokenPayloadH\x00\x12<\n\rhidden_states\x18\x02 \x01(\x0b\x32#.edgeshard.proto.HiddenStatePayloadH\x00\x12\x30\n\x06logits\x18\x03 \x01(\x0b\x32\x1e.edgeshard.proto.LogitsPayloadH\x00\x42\x07\n\x05value\"\xbb\x01\n\x0e\x46orwardRequest\x12.\n\x06header\x18\x01 \x01(\x0b\x32\x1e.edgeshard.proto.MessageHeader\x12\x32\n\x07\x63ontext\x18\x02 \x01(\x0b\x32!.edgeshard.proto.ExecutionContext\x12.\n\x07payload\x18\x03 \x01(\x0b\x32\x1d.edgeshard.proto.ShardPayload\x12\x15\n\rtensor_bundle\x18\x04 \x01(\x0c\"\xb9\x01\n\x0c\x46orwardReply\x12.\n\x06header\x18\x01 \x01(\x0b\x32\x1e.edgeshard.proto.MessageHeader\x12\x32\n\x07\x63ontext\x18\x02 \x01(\x0b\x32!.edgeshard.proto.ExecutionContext\x12.\n\x07payload\x18\x03 \x01(\x0b\x32\x1d.edgeshard.proto.ShardPayload\x12\x15\n\rtensor_bundle\x18\x04 \x01(\x0c\"\x14\n\x12RuntimeInfoRequest\"\xcb\x01\n\x10RuntimeInfoReply\x12\x10\n\x08model_id\x18\x01 \x01(\t\x12\x13\n\x0bstage_index\x18\x02 \x01(\x05\x12\x13\n\x0bstage_count\x18\x03 \x01(\x05\x12\x13\n\x0b\x62lock_start\x18\x04 \x01(\x05\x12\x11\n\tblock_end\x18\x05 \x01(\x05\x12\x1b\n\x13include_input_stage\x18\x06 \x01(\x08\x12\x1c\n\x14include_output_stage\x18\x07 \x01(\x08\x12\x18\n\x10protocol_version\x18\x08 \x01(\x05\"@\n\x14\x43reateSessionRequest\x12\x14\n\x0c\x65xecution_id\x18\x01 \x01(\t\x12\x12\n\nsession_id\x18\x02 \x01(\t\"0\n\x12\x43reateSessionReply\x12\n\n\x02ok\x18\x01 \x01(\x08\x12\x0e\n\x06\x64\x65tail\x18\x02 \x01(\t\"?\n\x13\x43loseSessionRequest\x12\x14\n\x0c\x65xecution_id\x18\x01 \x01(\t\x12\x12\n\nsession_id\x18\x02 \x01(\t\"/\n\x11\x43loseSessionReply\x12\n\n\x02ok\x18\x01 \x01(\x08\x12\x0e\n\x06\x64\x65tail\x18\x02 \x01(\t*C\n\x05Phase\x12\x15\n\x11PHASE_UNSPECIFIED\x10\x00\x12\x11\n\rPHASE_PREFILL\x10\x01\x12\x10\n\x0cPHASE_DECODE\x10\x02\x32\xb4\x03\n\x0cShardRuntime\x12X\n\x0eGetRuntimeInfo\x12#.edgeshard.proto.RuntimeInfoRequest\x1a!.edgeshard.proto.RuntimeInfoReply\x12[\n\rCreateSession\x12%.edgeshard.proto.CreateSessionRequest\x1a#.edgeshard.proto.CreateSessionReply\x12X\n\x0c\x43loseSession\x12$.edgeshard.proto.CloseSessionRequest\x1a\".edgeshard.proto.CloseSessionReply\x12I\n\x07Prefill\x12\x1f.edgeshard.proto.ForwardRequest\x1a\x1d.edgeshard.proto.ForwardReply\x12H\n\x06\x44\x65\x63ode\x12\x1f.edgeshard.proto.ForwardRequest\x1a\x1d.edgeshard.proto.ForwardReplyb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x13shard_runtime.proto\x12\x0f\x65\x64geshard.proto\"\xc8\x01\n\rMessageHeader\x12\x18\n\x10protocol_version\x18\x01 \x01(\x05\x12\x14\n\x0c\x65xecution_id\x18\x02 \x01(\t\x12\x12\n\nsession_id\x18\x03 \x01(\t\x12\x12\n\nrequest_id\x18\x04 \x01(\t\x12%\n\x05phase\x18\x05 \x01(\x0e\x32\x16.edgeshard.proto.Phase\x12\x0c\n\x04step\x18\x06 \x01(\x05\x12\x14\n\x0csource_stage\x18\x07 \x01(\x05\x12\x14\n\x0ctarget_stage\x18\x08 \x01(\x05\"\x8a\x01\n\x10\x45xecutionContext\x12%\n\x05phase\x18\x01 \x01(\x0e\x32\x16.edgeshard.proto.Phase\x12\x0c\n\x04step\x18\x02 \x01(\x05\x12\x12\n\nbatch_size\x18\x03 \x01(\x05\x12\x18\n\x10sequence_lengths\x18\x04 \x03(\x03\x12\x13\n\x0bpast_length\x18\x05 \x01(\x03\"!\n\x0cTokenPayload\x12\x11\n\ttoken_ids\x18\x01 \x03(\x03\"(\n\x12HiddenStatePayload\x12\x12\n\ntensor_key\x18\x01 \x01(\t\"#\n\rLogitsPayload\x12\x12\n\ntensor_key\x18\x01 \x01(\t\"\xb7\x01\n\x0cShardPayload\x12.\n\x05token\x18\x01 \x01(\x0b\x32\x1d.edgeshard.proto.TokenPayloadH\x00\x12<\n\rhidden_states\x18\x02 \x01(\x0b\x32#.edgeshard.proto.HiddenStatePayloadH\x00\x12\x30\n\x06logits\x18\x03 \x01(\x0b\x32\x1e.edgeshard.proto.LogitsPayloadH\x00\x42\x07\n\x05value\"\xbb\x01\n\x0e\x46orwardRequest\x12.\n\x06header\x18\x01 \x01(\x0b\x32\x1e.edgeshard.proto.MessageHeader\x12\x32\n\x07\x63ontext\x18\x02 \x01(\x0b\x32!.edgeshard.proto.ExecutionContext\x12.\n\x07payload\x18\x03 \x01(\x0b\x32\x1d.edgeshard.proto.ShardPayload\x12\x15\n\rtensor_bundle\x18\x04 \x01(\x0c\"\xb9\x01\n\x0c\x46orwardReply\x12.\n\x06header\x18\x01 \x01(\x0b\x32\x1e.edgeshard.proto.MessageHeader\x12\x32\n\x07\x63ontext\x18\x02 \x01(\x0b\x32!.edgeshard.proto.ExecutionContext\x12.\n\x07payload\x18\x03 \x01(\x0b\x32\x1d.edgeshard.proto.ShardPayload\x12\x15\n\rtensor_bundle\x18\x04 \x01(\x0c\"\x14\n\x12RuntimeInfoRequest\"\xdf\x01\n\x10RuntimeInfoReply\x12\x10\n\x08model_id\x18\x01 \x01(\t\x12\x13\n\x0bstage_index\x18\x02 \x01(\x05\x12\x13\n\x0bstage_count\x18\x03 \x01(\x05\x12\x13\n\x0b\x62lock_start\x18\x04 \x01(\x05\x12\x11\n\tblock_end\x18\x05 \x01(\x05\x12\x1b\n\x13include_input_stage\x18\x06 \x01(\x08\x12\x1c\n\x14include_output_stage\x18\x07 \x01(\x08\x12\x18\n\x10protocol_version\x18\x08 \x01(\x05\x12\x12\n\nruntime_id\x18\t \x01(\t\"@\n\x14\x43reateSessionRequest\x12\x14\n\x0c\x65xecution_id\x18\x01 \x01(\t\x12\x12\n\nsession_id\x18\x02 \x01(\t\"0\n\x12\x43reateSessionReply\x12\n\n\x02ok\x18\x01 \x01(\x08\x12\x0e\n\x06\x64\x65tail\x18\x02 \x01(\t\"?\n\x13\x43loseSessionRequest\x12\x14\n\x0c\x65xecution_id\x18\x01 \x01(\t\x12\x12\n\nsession_id\x18\x02 \x01(\t\"/\n\x11\x43loseSessionReply\x12\n\n\x02ok\x18\x01 \x01(\x08\x12\x0e\n\x06\x64\x65tail\x18\x02 \x01(\t*C\n\x05Phase\x12\x15\n\x11PHASE_UNSPECIFIED\x10\x00\x12\x11\n\rPHASE_PREFILL\x10\x01\x12\x10\n\x0cPHASE_DECODE\x10\x02\x32\xb4\x03\n\x0cShardRuntime\x12X\n\x0eGetRuntimeInfo\x12#.edgeshard.proto.RuntimeInfoRequest\x1a!.edgeshard.proto.RuntimeInfoReply\x12[\n\rCreateSession\x12%.edgeshard.proto.CreateSessionRequest\x1a#.edgeshard.proto.CreateSessionReply\x12X\n\x0c\x43loseSession\x12$.edgeshard.proto.CloseSessionRequest\x1a\".edgeshard.proto.CloseSessionReply\x12I\n\x07Prefill\x12\x1f.edgeshard.proto.ForwardRequest\x1a\x1d.edgeshard.proto.ForwardReply\x12H\n\x06\x44\x65\x63ode\x12\x1f.edgeshard.proto.ForwardRequest\x1a\x1d.edgeshard.proto.ForwardReplyb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
 _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'shard_runtime_pb2', _globals)
 if not _descriptor._USE_C_DESCRIPTORS:
   DESCRIPTOR._loaded_options = None
-  _globals['_PHASE']._serialized_start=1519
-  _globals['_PHASE']._serialized_end=1586
+  _globals['_PHASE']._serialized_start=1540
+  _globals['_PHASE']._serialized_end=1607
   _globals['_MESSAGEHEADER']._serialized_start=41
   _globals['_MESSAGEHEADER']._serialized_end=241
   _globals['_EXECUTIONCONTEXT']._serialized_start=244
   _globals['_EXECUTIONCONTEXT']._serialized_end=382
   _globals['_TOKENPAYLOAD']._serialized_start=384
-  _globals['_TOKENPAYLOAD']._serialized_end=416
-  _globals['_HIDDENSTATEPAYLOAD']._serialized_start=418
-  _globals['_HIDDENSTATEPAYLOAD']._serialized_end=458
-  _globals['_LOGITSPAYLOAD']._serialized_start=460
-  _globals['_LOGITSPAYLOAD']._serialized_end=495
-  _globals['_SHARDPAYLOAD']._serialized_start=498
-  _globals['_SHARDPAYLOAD']._serialized_end=681
-  _globals['_FORWARDREQUEST']._serialized_start=684
-  _globals['_FORWARDREQUEST']._serialized_end=871
-  _globals['_FORWARDREPLY']._serialized_start=874
-  _globals['_FORWARDREPLY']._serialized_end=1059
-  _globals['_RUNTIMEINFOREQUEST']._serialized_start=1061
-  _globals['_RUNTIMEINFOREQUEST']._serialized_end=1081
-  _globals['_RUNTIMEINFOREPLY']._serialized_start=1084
-  _globals['_RUNTIMEINFOREPLY']._serialized_end=1287
-  _globals['_CREATESESSIONREQUEST']._serialized_start=1289
-  _globals['_CREATESESSIONREQUEST']._serialized_end=1353
-  _globals['_CREATESESSIONREPLY']._serialized_start=1355
-  _globals['_CREATESESSIONREPLY']._serialized_end=1403
-  _globals['_CLOSESESSIONREQUEST']._serialized_start=1405
-  _globals['_CLOSESESSIONREQUEST']._serialized_end=1468
-  _globals['_CLOSESESSIONREPLY']._serialized_start=1470
-  _globals['_CLOSESESSIONREPLY']._serialized_end=1517
-  _globals['_SHARDRUNTIME']._serialized_start=1589
-  _globals['_SHARDRUNTIME']._serialized_end=2025
+  _globals['_TOKENPAYLOAD']._serialized_end=417
+  _globals['_HIDDENSTATEPAYLOAD']._serialized_start=419
+  _globals['_HIDDENSTATEPAYLOAD']._serialized_end=459
+  _globals['_LOGITSPAYLOAD']._serialized_start=461
+  _globals['_LOGITSPAYLOAD']._serialized_end=496
+  _globals['_SHARDPAYLOAD']._serialized_start=499
+  _globals['_SHARDPAYLOAD']._serialized_end=682
+  _globals['_FORWARDREQUEST']._serialized_start=685
+  _globals['_FORWARDREQUEST']._serialized_end=872
+  _globals['_FORWARDREPLY']._serialized_start=875
+  _globals['_FORWARDREPLY']._serialized_end=1060
+  _globals['_RUNTIMEINFOREQUEST']._serialized_start=1062
+  _globals['_RUNTIMEINFOREQUEST']._serialized_end=1082
+  _globals['_RUNTIMEINFOREPLY']._serialized_start=1085
+  _globals['_RUNTIMEINFOREPLY']._serialized_end=1308
+  _globals['_CREATESESSIONREQUEST']._serialized_start=1310
+  _globals['_CREATESESSIONREQUEST']._serialized_end=1374
+  _globals['_CREATESESSIONREPLY']._serialized_start=1376
+  _globals['_CREATESESSIONREPLY']._serialized_end=1424
+  _globals['_CLOSESESSIONREQUEST']._serialized_start=1426
+  _globals['_CLOSESESSIONREQUEST']._serialized_end=1489
+  _globals['_CLOSESESSIONREPLY']._serialized_start=1491
+  _globals['_CLOSESESSIONREPLY']._serialized_end=1538
+  _globals['_SHARDRUNTIME']._serialized_start=1610
+  _globals['_SHARDRUNTIME']._serialized_end=2046
 # @@protoc_insertion_point(module_scope)

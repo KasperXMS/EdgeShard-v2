@@ -144,7 +144,7 @@ def _context_from_wire(
 
 def _payload_to_wire(payload: ShardPayload) -> tuple[pb.ShardPayload, dict[str, torch.Tensor]]:
     if isinstance(payload, TokenPayload):
-        return pb.ShardPayload(token=pb.TokenPayload(token_id=payload.token_id)), {}
+        return pb.ShardPayload(token=pb.TokenPayload(token_ids=list(payload.token_ids))), {}
     if isinstance(payload, HiddenStatePayload):
         return (
             pb.ShardPayload(
@@ -165,7 +165,10 @@ def _payload_from_wire(
 ) -> ShardPayload:
     kind = wire.WhichOneof("value")
     if kind == "token":
-        return TokenPayload(token_id=wire.token.token_id)
+        token_ids = tuple(wire.token.token_ids)
+        if not token_ids:
+            raise ProtocolError("token payload carries no tokens")
+        return TokenPayload(token_ids=token_ids)
     if kind in ("hidden_states", "logits"):
         declared = wire.hidden_states if kind == "hidden_states" else wire.logits
         key = declared.tensor_key

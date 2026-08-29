@@ -79,13 +79,15 @@ class SerializedStageBoundary:
             source_stage=MASTER_STAGE,
             target_stage=0,
             context=context,
-            payload=TokenPayload(token_id=token_id),
+            payload=TokenPayload(token_ids=(token_id,)),
         )
         restored = self._roundtrip(message, target_stage=0, step=step)
         payload = restored.payload
         if not isinstance(payload, TokenPayload):
             raise ProtocolError("token hop restored a non-token payload")
-        return payload.token_id
+        if payload.token_ids != (token_id,):
+            raise ProtocolError("token hop changed the sampled token")
+        return payload.token_ids[0]
 
     def carry_reply(
         self,

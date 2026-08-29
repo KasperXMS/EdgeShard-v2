@@ -44,7 +44,11 @@ message ExecutionContext {
 }
 
 message TokenPayload {
-  int64 token_id = 1;
+  // Tokens consumed by the input stage: the prompt sequence for a prefill
+  // step, exactly one sampled token for a decode step (header.phase
+  // disambiguates). Field 1 stays wire-compatible with the earlier singular
+  // token_id (packed repeated int64 shares the singular varint encoding).
+  repeated int64 token_ids = 1;
 }
 
 // The hidden-state tensor travels in the tensor bundle under `tensor_key`.
@@ -96,6 +100,8 @@ message RuntimeInfoReply {
   bool include_output_stage = 7;
 
   int32 protocol_version = 8;
+
+  string runtime_id = 9;
 }
 
 message CreateSessionRequest {

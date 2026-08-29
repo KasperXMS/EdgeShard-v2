@@ -51,10 +51,10 @@ class ExecutionContext(_message.Message):
     def __init__(self, phase: _Optional[_Union[Phase, str]] = ..., step: _Optional[int] = ..., batch_size: _Optional[int] = ..., sequence_lengths: _Optional[_Iterable[int]] = ..., past_length: _Optional[int] = ...) -> None: ...
 
 class TokenPayload(_message.Message):
-    __slots__ = ("token_id",)
-    TOKEN_ID_FIELD_NUMBER: _ClassVar[int]
-    token_id: int
-    def __init__(self, token_id: _Optional[int] = ...) -> None: ...
+    __slots__ = ("token_ids",)
+    TOKEN_IDS_FIELD_NUMBER: _ClassVar[int]
+    token_ids: _containers.RepeatedScalarFieldContainer[int]
+    def __init__(self, token_ids: _Optional[_Iterable[int]] = ...) -> None: ...
 
 class HiddenStatePayload(_message.Message):
     __slots__ = ("tensor_key",)
@@ -107,7 +107,7 @@ class RuntimeInfoRequest(_message.Message):
     def __init__(self) -> None: ...
 
 class RuntimeInfoReply(_message.Message):
-    __slots__ = ("model_id", "stage_index", "stage_count", "block_start", "block_end", "include_input_stage", "include_output_stage", "protocol_version")
+    __slots__ = ("model_id", "stage_index", "stage_count", "block_start", "block_end", "include_input_stage", "include_output_stage", "protocol_version", "runtime_id")
     MODEL_ID_FIELD_NUMBER: _ClassVar[int]
     STAGE_INDEX_FIELD_NUMBER: _ClassVar[int]
     STAGE_COUNT_FIELD_NUMBER: _ClassVar[int]
@@ -116,6 +116,7 @@ class RuntimeInfoReply(_message.Message):
     INCLUDE_INPUT_STAGE_FIELD_NUMBER: _ClassVar[int]
     INCLUDE_OUTPUT_STAGE_FIELD_NUMBER: _ClassVar[int]
     PROTOCOL_VERSION_FIELD_NUMBER: _ClassVar[int]
+    RUNTIME_ID_FIELD_NUMBER: _ClassVar[int]
     model_id: str
     stage_index: int
     stage_count: int
@@ -124,7 +125,8 @@ class RuntimeInfoReply(_message.Message):
     include_input_stage: bool
     include_output_stage: bool
     protocol_version: int
-    def __init__(self, model_id: _Optional[str] = ..., stage_index: _Optional[int] = ..., stage_count: _Optional[int] = ..., block_start: _Optional[int] = ..., block_end: _Optional[int] = ..., include_input_stage: _Optional[bool] = ..., include_output_stage: _Optional[bool] = ..., protocol_version: _Optional[int] = ...) -> None: ...
+    runtime_id: str
+    def __init__(self, model_id: _Optional[str] = ..., stage_index: _Optional[int] = ..., stage_count: _Optional[int] = ..., block_start: _Optional[int] = ..., block_end: _Optional[int] = ..., include_input_stage: _Optional[bool] = ..., include_output_stage: _Optional[bool] = ..., protocol_version: _Optional[int] = ..., runtime_id: _Optional[str] = ...) -> None: ...
 
 class CreateSessionRequest(_message.Message):
     __slots__ = ("execution_id", "session_id")

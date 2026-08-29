@@ -42,9 +42,17 @@ class SequencingError(ProtocolError):
 
 @dataclass(frozen=True)
 class TokenPayload:
-    """Sampled token consumed by the input stage during decode."""
+    """Tokens consumed by the input stage.
 
-    token_id: int
+    A prefill step carries the prompt sequence; a decode step carries
+    exactly one sampled token. The header phase disambiguates.
+    """
+
+    token_ids: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        if not self.token_ids:
+            raise ValueError("token payload must carry at least one token")
 
 
 @dataclass(frozen=True)
