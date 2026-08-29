@@ -168,6 +168,27 @@ in Phase 0.
 - **`ShardModule` is device/dtype-parametrized.** All execution derives
   devices and dtypes from the module and its inputs (no hardcoded `cpu`),
   so the same code serves the CPU development tier and GPU containers.
+- **Wire DTOs are generated, committed, and never the domain model.**
+  `proto/shard_runtime.proto` is compiled by `scripts/generate_proto.py`
+  into `src/edgeshard/protocol/pb/` (grpcio-tools is a dev dependency only);
+  `protobuf_mapper.py` is the sole translation point between Python domain
+  dataclasses and wire DTOs (spec 17.2). Generated code is excluded from
+  lint and mypy error reporting; the pb2 `.pyi` stubs still type the mapper.
+- **Tensor bundles use fixed canonical keys.** Cross-shard tensors travel as
+  one safetensors bundle per message: payload tensors under `hidden_states`
+  or `logits` (the key is also declared in the payload DTO) and the
+  `positions` tensor alongside when present. dtype/shape/BF16 correctness
+  over performance (spec 5.5).
+- **Wire steps are 0-based; session counters are not.** The protocol step
+  index is `PREFILL step=0`, `DECODE step=1, 2, ...` (spec 16.2), while the
+  local `ShardSession.step` counts executed steps (1 after prefill); the
+  runtime maps between the two when validating inbound messages.
+- **Stage routing is strict and master-anchored.** `MASTER_STAGE = -1` is
+  the driver/Mock Master pseudo-stage: stage 0 accepts only
+  `source_stage == MASTER_STAGE`, stage `k` only `source_stage == k - 1`.
+  Protocol version is enforced both on wire reads and by message validation;
+  every spec 16.2 violation fails explicitly (`ProtocolError` /
+  `SequencingError`), never silently recovers.
 
 ---
 
