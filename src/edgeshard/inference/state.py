@@ -9,10 +9,24 @@ retained for later extension.
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
-from enum import StrEnum
 
 import torch
+
+# UP036 suppressed deliberately: the minimum *development* Python is 3.12,
+# but Jetson/L4T container bases (spec 21.4) ship Python 3.10 and still run
+# this code.
+if sys.version_info >= (3, 11):  # noqa: UP036
+    from enum import StrEnum
+else:  # pragma: no cover - Jetson/L4T bases ship Python 3.10 (spec 21.4)
+    from enum import Enum
+
+    class StrEnum(str, Enum):  # noqa: UP042 - minimal enum.StrEnum backport
+        """``enum.StrEnum`` semantics for pre-3.11 Pythons."""
+
+        def __str__(self) -> str:
+            return str(self.value)
 
 
 class InferencePhase(StrEnum):

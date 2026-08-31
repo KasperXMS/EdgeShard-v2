@@ -109,7 +109,7 @@ src/edgeshard/
   protocol/               canonical domain, protobuf mapper, tensor codec, gRPC
   runtime/                config, info, shard server, drivers/
   control/mock/           Mock Master, manifests, deployment
-containers/hf/            CPU / x86 NVIDIA / Jetson shard Dockerfiles (0G+)
+containers/hf/            CPU / x86 NVIDIA / Jetson shard Dockerfiles, README
 tests/unit|integration|container/
 examples/configs|manifests/
 ```
@@ -226,6 +226,33 @@ in Phase 0.
 - **Readiness is GetRuntimeInfo.** Phase 0 adds no health-checking
   dependency; clients poll `GetRuntimeInfo` until the runtime answers (also
   how deployment tooling reads runtime identity/topology, spec 17.1).
+- **Lifecycle normalization is a driver seam (0G).** `runtime/drivers/`
+  implements the spec 20 `RuntimeDriver` Protocol
+  (`start`/`wait_ready`/`info`/`stop`). `EdgeShardShardRuntimeDriver`
+  launches one container per stage through the Docker SDK (spec 5.6: never
+  shell out to `docker run`), validating the mounted config before launch:
+  loopback binds and spec/config identity mismatches fail explicitly. The
+  driver publishes the config's own `server.listen_port` and reuses the
+  GetRuntimeInfo readiness probe — the same signal for process and container
+  runtimes.
+- **Models mount at `/models:ro`; configs mount read-only** (spec 21.1).
+  Managed containers carry the spec 21.5 labels
+  (`io.edgeshard.managed/execution_id/runtime_id/backend`) so orphaned
+  Phase 0 containers can be found and cleaned.
+- **One image per target tier.** `containers/hf/Dockerfile.cpu` installs the
+  exact `uv.lock` set (`uv sync --frozen`), so pinned image + pinned config
+  reproduces a runtime environment (spec 4.10); `Dockerfile.cuda` starts
+  from the pinned official PyTorch CUDA runtime image — torch comes from the
+  base (same version as the lock), every other dependency from a hashed
+  `uv export` of the lock; `Dockerfile.jetson` is a pinned scaffold whose
+  non-torch pins mirror the lock, validated on target JetPack/L4T (Tier 3).
+  L4T bases ship Python 3.10, covered by a scoped `StrEnum` backport in
+  `inference/state.py` (the development floor stays 3.12).
+- **Container E2E is skip-gated, never silently dropped.** `tests/container/`
+  requires a reachable Docker daemon and skips explicitly without one (this
+  CPU development host has none; Tier 2/3 machines run them). The 0G
+  equivalence gate — container runtime vs untouched host HF reference —
+  rides the same driver lifecycle the Mock Master will use.
 
 ---
 

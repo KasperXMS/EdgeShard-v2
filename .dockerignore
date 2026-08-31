@@ -1,0 +1,14 @@
+# Keep the container build context minimal: only pyproject.toml, uv.lock,
+# src/, and proto/ are needed by the Dockerfiles under containers/hf/.
+.git
+.venv
+**/__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+tests/
+containers/
+examples/
+scripts/
+*.md

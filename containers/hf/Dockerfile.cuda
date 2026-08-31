@@ -1,0 +1,37 @@
+# EdgeShard x86 NVIDIA shard image (spec 21.3).
+#
+# Base: the official pinned PyTorch CUDA runtime image (a NVIDIA-compatible
+# PyTorch/CUDA stack; not built manually from Ubuntu). It ships torch 2.13.0
+# with CUDA — the same torch version uv.lock resolves — plus Python 3.12.
+# Every other dependency installs from uv.lock via `uv export`, with torch
+# excluded because the base image provides the CUDA build.
+#
+# Run with the NVIDIA Container Toolkit:
+#
+#   docker run --rm --gpus all \
+#     -v "$EDGESHARD_MODEL_CACHE:/models:ro" \
+#     -v "$PWD/stage.yaml:/runtime/config/runtime.yaml:ro" \
+#     -p 9100:9100 \
+#     edgeshard/hf-shard:cuda
+#
+# The mounted runtime config must use container-side paths:
+#   model.path under /models/...
+#   server.listen_host: 0.0.0.0
+#   device.type: cuda
+
+FROM pytorch/pytorch:2.13.0-cuda13.2-cudnn9-runtime
+
+COPY --from=ghcr.io/astral-sh/uv:0.12.7 /uv /uvx /usr/local/bin/
+
+WORKDIR /app
+
+COPY pyproject.toml uv.lock ./
+RUN uv export --frozen --no-dev --no-emit-project --no-emit-package torch \
+      --format requirements-txt --output-file /tmp/requirements.txt \
+ && pip install --no-cache-dir -r /tmp/requirements.txt
+
+COPY src ./src
+RUN pip install --no-cache-dir --no-deps .
+
+ENTRYPOINT ["edgeshard"]
+CMD ["--config", "/runtime/config/runtime.yaml"]

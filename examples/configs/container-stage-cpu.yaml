@@ -1,0 +1,23 @@
+# Example: one CPU shard runtime stage inside a container.
+#
+# Container-side paths and hosts: the model cache is mounted at /models
+# (spec 21.1) and the server must bind beyond loopback to be reachable
+# through the published port.
+runtime:
+  backend: edgeshard_shard
+  runtime_id: stage-0
+  execution_id: example-exec
+model:
+  id: tiny/llama
+  path: /models/tiny-llama
+shard:
+  start_block: 0
+  end_block: 4
+  include_input_stage: true
+  include_output_stage: true
+pipeline:
+  stage_index: 0
+  stage_count: 1
+server:
+  listen_host: 0.0.0.0
+  listen_port: 9100
