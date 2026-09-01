@@ -5,7 +5,12 @@ configs, containers, readiness, generation, cleanup. No scheduling, no
 profiling, no partition calculation.
 """
 
-from edgeshard.control.mock.client import RemoteGenerationDriver, RemotePipeline
+from edgeshard.control.mock.client import (
+    RemoteGenerationDriver,
+    RemotePipeline,
+    VLLMClient,
+    VLLMCompletion,
+)
 from edgeshard.control.mock.deployment import (
     SHARD_LISTEN_PORT,
     build_runtime_config_payload,
@@ -19,6 +24,7 @@ from edgeshard.control.mock.manifest import (
     ManifestModel,
     ManifestRuntime,
     ManifestShard,
+    ManifestVLLM,
 )
 from edgeshard.control.mock.master import Deployment, MockMaster, MockMasterError
 
@@ -30,10 +36,13 @@ __all__ = [
     "ManifestModel",
     "ManifestRuntime",
     "ManifestShard",
+    "ManifestVLLM",
     "MockMaster",
     "MockMasterError",
     "RemoteGenerationDriver",
     "RemotePipeline",
+    "VLLMClient",
+    "VLLMCompletion",
     "build_runtime_config_payload",
     "host_model_path",
     "network_name",

@@ -294,6 +294,41 @@ in Phase 0.
   final link and is skip-gated where Docker is absent; the first two run
   on every CPU development host. Shipped examples (configs and manifests)
   are themselves test-parsed so documentation cannot drift from schemas.
+- **Backend-neutral lifecycle extends to vLLM (0J).**
+  `runtime/drivers/vllm.py` implements the same `RuntimeDriver` seam for
+  independent full-model vLLM servers: the official pinned image
+  (`vllm/vllm-openai:<pinned-version>`) is driven with the native
+  `vllm serve` CLI and never modified to resemble a shard runtime (spec
+  20.2) — only lifecycle is normalized, the OpenAI-compatible data plane
+  stays untouched (spec 4.7). Readiness is `GET /v1/models` answering 200
+  (vLLM opens the API once weights are loaded); `info` derives full-model
+  coverage — one stage spanning every block — from `config.json`. Shared
+  driver plumbing (model-mount mapping, network-alias kwargs, stop/remove,
+  published-port probe) lives in `drivers/base.py`.
+- **The master stays backend-generic.** `MockMaster` holds a driver table
+  keyed by backend; launch, readiness, stop, and cleanup iterate
+  uniformly using `RuntimeHandle.backend` — per-backend knowledge is
+  confined to choosing the driver and translating manifest material into
+  that backend's spec (spec 19.2). Standalone (vLLM) runtimes start first
+  so their slow model load overlaps shard startup, always publish a host
+  port, and are exercised through `VLLMClient` — plain OpenAI-compatible
+  HTTP test requests, `temperature=0` for Phase 0 determinism (spec
+  22.1).
+- **Manifests order shards, not standalone runtimes.** `backend: vllm`
+  runtimes reject shard sections and never appear in `pipeline`; the
+  pipeline must contain exactly the `edgeshard_shard` runtimes, and
+  vLLM-only deployments (empty pipeline) are legal — `entry_endpoint` is
+  `None` there. The manifest's `vllm:` section carries optional engine
+  knobs (`max_model_len`, `tensor_parallel_size`) that the driver
+  translates to official CLI arguments; `device.index` maps to
+  `CUDA_VISIBLE_DEVICES`.
+- **vLLM E2E is double-gated, never silently dropped.**
+  `tests/container/test_vllm_runtime.py` requires both a Docker daemon
+  and `EDGESHARD_VLLM_IMAGE` (a pinned official image on a GPU host —
+  Tier 2); the mixed shard+vLLM deployment there is the 0J gate.
+  Everything beneath it — driver wiring, readiness polling, OpenAI test
+  requests, mixed-manifest orchestration — runs on the CPU development
+  host against fake Docker clients and in-process HTTP servers.
 
 ---
 

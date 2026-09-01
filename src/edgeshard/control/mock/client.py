@@ -1,17 +1,24 @@
-"""Master-side client for a deployed shard pipeline (spec 22.1).
+"""Master-side clients for deployed runtimes (spec 22.1).
 
-The Mock Master talks only to the entry runtime: token hops go in
-(master -> stage 0), final logits replies come out, and hidden states
-never pass through the master (spec 18). ``RemoteGenerationDriver`` runs
-the same deterministic greedy decoding as ``inference/generation.py`` —
-sampling stays outside the shard runtime, here in its async gRPC variant.
+``RemotePipeline``/``RemoteGenerationDriver`` drive the EdgeShard shard
+pipeline through its entry runtime: token hops go in (master -> stage 0),
+final logits replies come out, and hidden states never pass through the
+master (spec 18). Sampling stays outside the shard runtime, here in the
+async gRPC twin of ``inference/generation.py``.
+
+``VLLMClient`` issues plain OpenAI-compatible requests to an independent
+vLLM runtime (spec 5.7): the master never reshapes vLLM into a shard
+runtime (spec 20.2), and test requests stay deterministic greedy
+(temperature 0) like the rest of Phase 0.
 """
 
 from __future__ import annotations
 
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
 
+import httpx
 import torch
 
 from edgeshard.inference.state import ExecutionContext, InferencePhase, LogitsOutput
@@ -164,3 +171,65 @@ class RemoteGenerationDriver:
             token = int(output.logits[0, -1].argmax())
             generated.append(token)
         return generated[:max_new_tokens]
+
+
+@dataclass(frozen=True)
+class VLLMCompletion:
+    """One completion from vLLM's OpenAI-compatible API."""
+
+    text: str
+    finish_reason: str | None
+
+
+class VLLMClient:
+    """OpenAI-compatible test requests to an independent vLLM runtime.
+
+    The model name in requests is the value vLLM serves — the ``--model``
+    argument, i.e. the container-side model path for master-deployed
+    runtimes.
+    """
+
+    def __init__(self, endpoint: str, model: str, *, timeout_s: float = 60.0) -> None:
+        self._http = httpx.AsyncClient(base_url=f"http://{endpoint}", timeout=timeout_s)
+        self._model = model
+
+    @property
+    def model(self) -> str:
+        return self._model
+
+    async def __aenter__(self) -> VLLMClient:
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        await self.close()
+
+    async def close(self) -> None:
+        await self._http.aclose()
+
+    async def list_models(self) -> list[str]:
+        """IDs of the models this runtime serves (``GET /v1/models``)."""
+        response = await self._http.get("/v1/models")
+        response.raise_for_status()
+        payload = response.json()
+        return [str(item["id"]) for item in payload["data"]]
+
+    async def complete(
+        self, prompt_token_ids: Sequence[int], *, max_tokens: int
+    ) -> VLLMCompletion:
+        """One deterministic greedy completion (``temperature=0``)."""
+        if max_tokens < 1:
+            raise ValueError(f"max_tokens must be >= 1, got {max_tokens}")
+        response = await self._http.post(
+            "/v1/completions",
+            json={
+                "model": self._model,
+                "prompt": [int(token) for token in prompt_token_ids],
+                "max_tokens": max_tokens,
+                "temperature": 0.0,
+            },
+        )
+        response.raise_for_status()
+        choice = response.json()["choices"][0]
+        return VLLMCompletion(
+            text=str(choice["text"]), finish_reason=choice.get("finish_reason")
+        )

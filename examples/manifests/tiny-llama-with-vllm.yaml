@@ -1,0 +1,42 @@
+# Example: mixed deployment — two EdgeShard shard runtimes plus one
+# independent full-model vLLM runtime (specs 4.7, 19.2).
+#
+# The pipeline orders only the shard runtimes; the vLLM runtime is
+# managed standalone and answers OpenAI-compatible requests on its
+# published host port. Deployed end to end by the Mock Master (spec 22).
+execution_id: exec-example-vllm
+
+model:
+  id: tiny/llama
+  path: /models/tiny-llama
+
+runtimes:
+  - id: shard-0
+    backend: edgeshard_shard
+    shard:
+      start: 0
+      end: 2
+      include_input_stage: true
+
+  - id: shard-1
+    backend: edgeshard_shard
+    shard:
+      start: 2
+      end: 4
+      include_output_stage: true
+
+  # Independent full-model server: no shard section, never in the
+  # pipeline. The pinned official image is the default; uncomment to
+  # override. Engine knobs translate to official `vllm serve` arguments.
+  - id: vllm-0
+    backend: vllm
+    # image: vllm/vllm-openai:v0.28.0
+    device:
+      type: cuda
+      index: 0
+    vllm:
+      max_model_len: 2048
+
+pipeline:
+  - shard-0
+  - shard-1

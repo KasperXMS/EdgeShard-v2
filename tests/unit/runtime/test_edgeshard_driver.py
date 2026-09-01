@@ -145,6 +145,7 @@ async def test_start_wires_labels_volumes_and_ports(tmp_path: Path) -> None:
     handle = await driver.start(make_spec(config_path, host_port=55555))
 
     assert handle.runtime_id == RUNTIME_ID
+    assert handle.backend == "edgeshard_shard"
     assert handle.endpoint == "127.0.0.1:55555"
     (call,) = docker_client.containers.run_calls
     assert call["image"] == "edgeshard/hf-shard:cpu"
@@ -284,7 +285,12 @@ async def test_wait_ready_times_out_on_dead_endpoint() -> None:
         ready_timeout_s=0.5,
         poll_interval_s=0.05,
     )
-    dead = RuntimeHandle(runtime_id="gone", container_id="fake-x", endpoint="127.0.0.1:1")
+    dead = RuntimeHandle(
+        runtime_id="gone",
+        backend="edgeshard_shard",
+        container_id="fake-x",
+        endpoint="127.0.0.1:1",
+    )
     with pytest.raises(DriverError, match="not ready"):
         await driver.wait_ready(dead)
 

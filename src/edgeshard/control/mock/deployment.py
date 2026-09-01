@@ -16,12 +16,16 @@ import yaml
 
 from edgeshard.control.mock.manifest import DeploymentManifest, ManifestError
 from edgeshard.runtime.config import ShardRuntimeConfig
+from edgeshard.runtime.drivers.base import (
+    MODEL_MOUNT,
+    DriverError,
+)
+from edgeshard.runtime.drivers.base import (
+    host_model_path as container_host_model_path,
+)
 
 SHARD_LISTEN_PORT = 50051
 """In-network listen port of every deployed shard runtime (spec 23 example)."""
-
-MODEL_MOUNT = "/models"
-"""Container-side model mount that manifest paths are written against (spec 21.1)."""
 
 
 def network_name(execution_id: str) -> str:
@@ -36,13 +40,13 @@ def host_model_path(manifest: DeploymentManifest, model_cache_dir: Path) -> Path
     ``model_cache_dir/<rel>`` on the host (the driver mounts the cache
     directory at ``/models``).
     """
-    container_path = manifest.model.path
-    if not container_path.is_relative_to(MODEL_MOUNT):
+    try:
+        return container_host_model_path(manifest.model.path, model_cache_dir)
+    except DriverError as exc:
         raise ManifestError(
-            f"manifest model path {container_path.as_posix()!r} must live under "
-            f"the container model mount {MODEL_MOUNT!r}"
-        )
-    return Path(model_cache_dir) / container_path.relative_to(MODEL_MOUNT)
+            f"manifest model path {manifest.model.path.as_posix()!r} must live "
+            f"under the container model mount {MODEL_MOUNT!r}"
+        ) from exc
 
 
 def build_runtime_config_payload(
@@ -51,6 +55,9 @@ def build_runtime_config_payload(
     """One stage's runtime config as a plain YAML-ready dict (spec 19.1 shape)."""
     runtimes = manifest.pipeline_runtimes()
     runtime = runtimes[stage_index]
+    shard = runtime.shard
+    if shard is None:  # unreachable: manifests validate shard presence
+        raise ManifestError(f"runtime {runtime.id!r} has no shard section")
     stage_count = len(runtimes)
     pipeline: dict[str, Any] = {"stage_index": stage_index, "stage_count": stage_count}
     if stage_index + 1 < stage_count:
@@ -67,10 +74,10 @@ def build_runtime_config_payload(
         },
         "model": {"id": manifest.model.id, "path": manifest.model.path.as_posix()},
         "shard": {
-            "start_block": runtime.shard.start,
-            "end_block": runtime.shard.end,
-            "include_input_stage": runtime.shard.include_input_stage,
-            "include_output_stage": runtime.shard.include_output_stage,
+            "start_block": shard.start,
+            "end_block": shard.end,
+            "include_input_stage": shard.include_input_stage,
+            "include_output_stage": shard.include_output_stage,
         },
         "pipeline": pipeline,
         "device": device,

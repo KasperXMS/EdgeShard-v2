@@ -1,9 +1,11 @@
 """MockMaster orchestration tests without a Docker daemon.
 
-A fake Docker client records network management and a recording
-``RuntimeDriver`` double records container lifecycle, so deployment
+A fake Docker client records network management and recording
+``RuntimeDriver`` doubles record container lifecycle, so deployment
 wiring (network, generated configs, launch order, publish rules,
-cleanup) is fully exercised on the CPU development host.
+backend-neutral cleanup) is fully exercised on the CPU development
+host — for shard pipelines, standalone vLLM runtimes, and mixed
+deployments of both.
 """
 
 from __future__ import annotations
@@ -17,10 +19,11 @@ import pytest
 
 from edgeshard.control.mock.deployment import SHARD_LISTEN_PORT, network_name
 from edgeshard.control.mock.manifest import DeploymentManifest, ManifestError
-from edgeshard.control.mock.master import Deployment, MockMaster
+from edgeshard.control.mock.master import Deployment, MockMaster, MockMasterError
 from edgeshard.model.errors import ModelSourceError
 from edgeshard.runtime.config import ShardRuntimeConfig
 from edgeshard.runtime.drivers.base import DriverError, RuntimeHandle, RuntimeSpec
+from edgeshard.runtime.drivers.vllm import DEFAULT_VLLM_IMAGE, VLLMRuntimeSpec
 
 EXECUTION_ID = "exec-mock"
 NETWORK = network_name(EXECUTION_ID)
@@ -75,6 +78,7 @@ class RecordingDriver:
         port = 40000 + len(self.start_calls)
         return RuntimeHandle(
             runtime_id=spec.runtime_id,
+            backend=spec.backend,
             container_id=f"c-{len(self.start_calls)}",
             endpoint=f"127.0.0.1:{port}",
         )
@@ -115,9 +119,26 @@ def manifest_payload(
     }
 
 
+def mixed_manifest_payload(
+    model_dir_name: str, *, vllm_image: str | None = None
+) -> dict[str, Any]:
+    """Two shards plus one independent full-model vLLM runtime."""
+    payload = manifest_payload(model_dir_name)
+    vllm_runtime: dict[str, Any] = {
+        "id": "vllm-0",
+        "backend": "vllm",
+        "device": {"type": "cuda", "index": 0},
+        "vllm": {"max_model_len": 2048},
+    }
+    if vllm_image:
+        vllm_runtime["image"] = vllm_image
+    payload["runtimes"].append(vllm_runtime)
+    return payload
+
+
 def make_master(
     docker_client: FakeDockerClient,
-    driver: RecordingDriver,
+    drivers: dict[str, RecordingDriver],
     tiny_llama_dir: Path,
     tmp_path: Path,
 ) -> MockMaster:
@@ -126,7 +147,7 @@ def make_master(
         model_cache_dir=tiny_llama_dir.parent,
         work_dir=tmp_path / "work",
         default_image=DEFAULT_IMAGE,
-        driver=driver,
+        drivers=drivers,
     )
 
 
@@ -135,7 +156,9 @@ async def test_deploy_creates_network_configs_and_launches_in_reverse(
 ) -> None:
     docker_client = FakeDockerClient()
     driver = RecordingDriver()
-    master = make_master(docker_client, driver, tiny_llama_dir, tmp_path)
+    master = make_master(
+        docker_client, {"edgeshard_shard": driver}, tiny_llama_dir, tmp_path
+    )
     manifest = DeploymentManifest.model_validate(
         manifest_payload(tiny_llama_dir.name, second_image="custom/shard:v2")
     )
@@ -167,12 +190,128 @@ async def test_deploy_creates_network_configs_and_launches_in_reverse(
     assert driver.wait_ready_calls == [deployment.handles[0]]
 
 
+async def test_deploy_mixed_manifest_manages_vllm_and_shards(
+    tiny_llama_dir: Path, tmp_path: Path
+) -> None:
+    """0J gate: one generic lifecycle manages two different backends."""
+    docker_client = FakeDockerClient()
+    shard_driver = RecordingDriver()
+    vllm_driver = RecordingDriver()
+    master = make_master(
+        docker_client,
+        {"edgeshard_shard": shard_driver, "vllm": vllm_driver},
+        tiny_llama_dir,
+        tmp_path,
+    )
+    manifest = DeploymentManifest.model_validate(
+        mixed_manifest_payload(tiny_llama_dir.name, vllm_image="custom/vllm:v1")
+    )
+
+    deployment = await master.deploy(manifest)
+
+    # Standalone runtimes start first; shard stages still reverse.
+    assert [spec.runtime_id for spec in vllm_driver.start_calls] == ["vllm-0"]
+    assert [spec.runtime_id for spec in shard_driver.start_calls] == [
+        "shard-1",
+        "shard-0",
+    ]
+    (vllm_spec,) = vllm_driver.start_calls
+    assert isinstance(vllm_spec, VLLMRuntimeSpec)
+    assert vllm_spec.image == "custom/vllm:v1"
+    assert vllm_spec.model_id == "tiny/llama"
+    assert vllm_spec.model_path == Path(f"/models/{tiny_llama_dir.name}")
+    assert vllm_spec.device_index == 0
+    assert vllm_spec.max_model_len == 2048
+    assert vllm_spec.tensor_parallel_size is None
+    # Standalone runtimes always publish: test requests come from the host.
+    assert vllm_spec.host_port == 0
+    assert vllm_spec.network == NETWORK
+    # Readiness is waited for per backend: entry shard, then vLLM.
+    assert shard_driver.wait_ready_calls == [deployment.handles[0]]
+    assert vllm_driver.wait_ready_calls == [deployment.handle("vllm-0")]
+    # Handles: pipeline order first, then standalone runtimes.
+    assert [handle.runtime_id for handle in deployment.handles] == [
+        "shard-0",
+        "shard-1",
+        "vllm-0",
+    ]
+    assert deployment.entry_endpoint == deployment.handles[0].endpoint
+    with pytest.raises(KeyError):
+        deployment.handle("no-such-runtime")
+    # Only shard runtimes receive generated runtime configs.
+    config_dir = tmp_path / "work" / EXECUTION_ID
+    assert sorted(path.name for path in config_dir.glob("*.yaml")) == [
+        "shard-0.yaml",
+        "shard-1.yaml",
+    ]
+
+    # Shutdown goes through each runtime's own driver, in reverse.
+    await master.shutdown(deployment)
+    assert [handle.runtime_id for handle in vllm_driver.stop_calls] == ["vllm-0"]
+    assert [handle.runtime_id for handle in shard_driver.stop_calls] == [
+        "shard-1",
+        "shard-0",
+    ]
+    assert docker_client.networks.by_name[NETWORK].removed is True
+
+
+async def test_deploy_vllm_only_manifest(tiny_llama_dir: Path, tmp_path: Path) -> None:
+    docker_client = FakeDockerClient()
+    shard_driver = RecordingDriver()
+    vllm_driver = RecordingDriver()
+    master = make_master(
+        docker_client,
+        {"edgeshard_shard": shard_driver, "vllm": vllm_driver},
+        tiny_llama_dir,
+        tmp_path,
+    )
+    payload = mixed_manifest_payload(tiny_llama_dir.name)
+    payload["runtimes"] = [runtime for runtime in payload["runtimes"]
+                           if runtime["backend"] == "vllm"]
+    payload["pipeline"] = []
+    manifest = DeploymentManifest.model_validate(payload)
+
+    deployment = await master.deploy(manifest)
+
+    assert deployment.entry_endpoint is None
+    assert [handle.runtime_id for handle in deployment.handles] == ["vllm-0"]
+    assert shard_driver.start_calls == []
+    assert vllm_driver.wait_ready_calls == [deployment.handles[0]]
+    # Without shard runtimes the default vLLM image applies.
+    (vllm_spec,) = vllm_driver.start_calls
+    assert vllm_spec.image == DEFAULT_VLLM_IMAGE
+    config_dir = tmp_path / "work" / EXECUTION_ID
+    assert list(config_dir.glob("*.yaml")) == []
+
+    await master.shutdown(deployment)
+    assert [handle.runtime_id for handle in vllm_driver.stop_calls] == ["vllm-0"]
+
+
+async def test_deploy_fails_without_driver_for_backend(
+    tiny_llama_dir: Path, tmp_path: Path
+) -> None:
+    docker_client = FakeDockerClient()
+    master = make_master(
+        docker_client, {"edgeshard_shard": RecordingDriver()}, tiny_llama_dir, tmp_path
+    )
+    master._drivers.pop("vllm")
+    manifest = DeploymentManifest.model_validate(
+        mixed_manifest_payload(tiny_llama_dir.name)
+    )
+    with pytest.raises(MockMasterError, match="no driver registered"):
+        await master.deploy(manifest)
+    assert docker_client.networks.by_name[NETWORK].removed is True
+    assert not (tmp_path / "work" / EXECUTION_ID).exists()
+
+
 async def test_deploy_validates_partition_upper_bound(
     tiny_llama_dir: Path, tmp_path: Path
 ) -> None:
     docker_client = FakeDockerClient()
     driver = RecordingDriver()
-    master = make_master(docker_client, driver, tiny_llama_dir, tmp_path)
+    master = make_master(
+        docker_client, {"edgeshard_shard": driver}, tiny_llama_dir, tmp_path
+    )
     manifest = DeploymentManifest.model_validate(
         manifest_payload(tiny_llama_dir.name, end=5)
     )
@@ -187,7 +326,12 @@ async def test_deploy_validates_partition_upper_bound(
 async def test_deploy_rejects_model_path_outside_mount(
     tiny_llama_dir: Path, tmp_path: Path
 ) -> None:
-    master = make_master(FakeDockerClient(), RecordingDriver(), tiny_llama_dir, tmp_path)
+    master = make_master(
+        FakeDockerClient(),
+        {"edgeshard_shard": RecordingDriver()},
+        tiny_llama_dir,
+        tmp_path,
+    )
     payload = manifest_payload(tiny_llama_dir.name)
     payload["model"]["path"] = "/weights/tiny-llama"
     manifest = DeploymentManifest.model_validate(payload)
@@ -201,7 +345,7 @@ async def test_deploy_rejects_missing_model_dir(tmp_path: Path) -> None:
         model_cache_dir=tmp_path / "empty-cache",
         work_dir=tmp_path / "work",
         default_image=DEFAULT_IMAGE,
-        driver=RecordingDriver(),
+        drivers={"edgeshard_shard": RecordingDriver()},
     )
     manifest = DeploymentManifest.model_validate(manifest_payload("no-such-model"))
     with pytest.raises(ModelSourceError, match="no-such-model"):
@@ -213,7 +357,9 @@ async def test_failed_deploy_cleans_up_everything(
 ) -> None:
     docker_client = FakeDockerClient()
     driver = RecordingDriver(fail_start_number=2)  # the entry launch fails
-    master = make_master(docker_client, driver, tiny_llama_dir, tmp_path)
+    master = make_master(
+        docker_client, {"edgeshard_shard": driver}, tiny_llama_dir, tmp_path
+    )
     manifest = DeploymentManifest.model_validate(manifest_payload(tiny_llama_dir.name))
 
     with pytest.raises(DriverError, match="boom"):
@@ -226,12 +372,40 @@ async def test_failed_deploy_cleans_up_everything(
     assert driver.wait_ready_calls == []
 
 
+async def test_failed_deploy_stops_standalone_runtimes_too(
+    tiny_llama_dir: Path, tmp_path: Path
+) -> None:
+    docker_client = FakeDockerClient()
+    shard_driver = RecordingDriver(fail_start_number=1)  # first shard launch fails
+    vllm_driver = RecordingDriver()
+    master = make_master(
+        docker_client,
+        {"edgeshard_shard": shard_driver, "vllm": vllm_driver},
+        tiny_llama_dir,
+        tmp_path,
+    )
+    manifest = DeploymentManifest.model_validate(
+        mixed_manifest_payload(tiny_llama_dir.name)
+    )
+
+    with pytest.raises(DriverError, match="boom"):
+        await master.deploy(manifest)
+
+    # The already-started vLLM runtime is cleaned up through its own driver.
+    assert shard_driver.stop_calls == []
+    assert [handle.runtime_id for handle in vllm_driver.stop_calls] == ["vllm-0"]
+    assert docker_client.networks.by_name[NETWORK].removed is True
+    assert not (tmp_path / "work" / EXECUTION_ID).exists()
+
+
 async def test_shutdown_stops_runtimes_removes_network_and_configs(
     tiny_llama_dir: Path, tmp_path: Path
 ) -> None:
     docker_client = FakeDockerClient()
     driver = RecordingDriver()
-    master = make_master(docker_client, driver, tiny_llama_dir, tmp_path)
+    master = make_master(
+        docker_client, {"edgeshard_shard": driver}, tiny_llama_dir, tmp_path
+    )
     manifest = DeploymentManifest.model_validate(manifest_payload(tiny_llama_dir.name))
 
     deployment = await master.deploy(manifest)
@@ -248,7 +422,7 @@ async def test_shutdown_stops_runtimes_removes_network_and_configs(
 
 def test_deployment_is_frozen() -> None:
     deployment = Deployment(
-        execution_id=EXECUTION_ID, network=NETWORK, entry_endpoint="127.0.0.1:1", handles=()
+        execution_id=EXECUTION_ID, network=NETWORK, entry_endpoint=None, handles=()
     )
     with pytest.raises(dataclasses.FrozenInstanceError):
         deployment.network = "other"  # type: ignore[misc]

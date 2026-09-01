@@ -121,7 +121,7 @@ def test_from_yaml_rejects_non_mapping(tmp_path: Any) -> None:
         ({"execution_id": ""}, "execution_id"),
         ({"runtimes": []}, "at least one runtime"),
         ({"pipeline": []}, "pipeline"),
-        ({"pipeline": ["shard-0"]}, "not used by the pipeline"),
+        ({"pipeline": ["shard-0"]}, "not in the pipeline"),
         ({"pipeline": ["shard-0", "shard-1", "shard-2"]}, "unknown runtimes"),
         ({"pipeline": ["shard-0", "shard-0"]}, "more than once"),
     ],
@@ -152,7 +152,7 @@ def test_rejects_unknown_backend() -> None:
     runtimes = [
         {
             "id": "shard-0",
-            "backend": "vllm",
+            "backend": "sglang",
             "shard": {
                 "start": 0,
                 "end": 4,
@@ -165,6 +165,134 @@ def test_rejects_unknown_backend() -> None:
         DeploymentManifest.model_validate(
             make_payload(runtimes=runtimes, pipeline=["shard-0"])
         )
+
+
+def test_mixed_manifest_orders_only_shard_runtimes() -> None:
+    """The pipeline orders shard runtimes; vLLM runtimes stay standalone."""
+    payload = make_payload(
+        runtimes=[
+            {
+                "id": "shard-0",
+                "backend": "edgeshard_shard",
+                "shard": {"start": 0, "end": 2, "include_input_stage": True},
+            },
+            {"id": "vllm-0", "backend": "vllm"},
+            {
+                "id": "shard-1",
+                "backend": "edgeshard_shard",
+                "shard": {"start": 2, "end": 4, "include_output_stage": True},
+            },
+        ],
+        pipeline=["shard-0", "shard-1"],
+    )
+    manifest = DeploymentManifest.model_validate(payload)
+    assert [runtime.id for runtime in manifest.pipeline_runtimes()] == [
+        "shard-0",
+        "shard-1",
+    ]
+    assert [runtime.id for runtime in manifest.standalone_runtimes()] == ["vllm-0"]
+    assert manifest.runtime("vllm-0").shard is None
+
+
+def test_vllm_only_manifest_with_empty_pipeline() -> None:
+    payload = make_payload(
+        runtimes=[
+            {
+                "id": "vllm-0",
+                "backend": "vllm",
+                "device": {"type": "cuda", "index": 0},
+                "vllm": {"max_model_len": 2048},
+            }
+        ],
+        pipeline=[],
+    )
+    manifest = DeploymentManifest.model_validate(payload)
+    assert manifest.pipeline_runtimes() == []
+    (runtime,) = manifest.standalone_runtimes()
+    assert runtime.backend == "vllm"
+    assert runtime.vllm is not None
+    assert runtime.vllm.max_model_len == 2048
+    assert runtime.device.type == "cuda"
+
+
+@pytest.mark.parametrize(
+    ("override", "match"),
+    [
+        # vLLM serves the full model: a shard section is not allowed.
+        (
+            {
+                "runtimes": [{"id": "vllm-0", "backend": "vllm",
+                              "shard": {"start": 0, "end": 4}}],
+                "pipeline": [],
+            },
+            "shard section is not allowed",
+        ),
+        # Shard runtimes require their shard section.
+        (
+            {
+                "runtimes": [{"id": "shard-0", "backend": "edgeshard_shard"}],
+                "pipeline": ["shard-0"],
+            },
+            "requires a shard section",
+        ),
+        # The vllm section belongs to vllm runtimes only.
+        (
+            {
+                "runtimes": [
+                    {
+                        "id": "shard-0",
+                        "backend": "edgeshard_shard",
+                        "shard": {
+                            "start": 0,
+                            "end": 4,
+                            "include_input_stage": True,
+                            "include_output_stage": True,
+                        },
+                        "vllm": {"max_model_len": 512},
+                    }
+                ],
+                "pipeline": ["shard-0"],
+            },
+            "only valid on vllm runtimes",
+        ),
+        # Standalone runtimes never join the shard pipeline.
+        (
+            {
+                "runtimes": [
+                    {
+                        "id": "shard-0",
+                        "backend": "edgeshard_shard",
+                        "shard": {
+                            "start": 0,
+                            "end": 4,
+                            "include_input_stage": True,
+                            "include_output_stage": True,
+                        },
+                    },
+                    {"id": "vllm-0", "backend": "vllm"},
+                ],
+                "pipeline": ["shard-0", "vllm-0"],
+            },
+            "non-shard runtimes",
+        ),
+    ],
+)
+def test_rejects_bad_backend_sections(override: dict[str, Any], match: str) -> None:
+    with pytest.raises(ValueError, match=match):
+        DeploymentManifest.model_validate(make_payload(**override))
+
+
+@pytest.mark.parametrize(
+    "vllm_section",
+    [{"max_model_len": 0}, {"tensor_parallel_size": 0}],
+)
+def test_rejects_bad_vllm_knobs(vllm_section: dict[str, Any]) -> None:
+    payload = make_payload(
+        runtimes=[{"id": "vllm-0", "backend": "vllm", "vllm": vllm_section}],
+        pipeline=[],
+    )
+    with pytest.raises(ValueError, match="must be >= 1"):
+        DeploymentManifest.model_validate(payload)
 
 
 def _shard(

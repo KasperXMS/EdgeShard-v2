@@ -16,12 +16,18 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import docker
 import grpc
 
 from edgeshard.protocol.grpc_client import ShardRuntimeClient
 from edgeshard.runtime.config import ShardRuntimeConfig
-from edgeshard.runtime.drivers.base import DriverError, RuntimeHandle, RuntimeSpec
+from edgeshard.runtime.drivers.base import (
+    DriverError,
+    RuntimeHandle,
+    RuntimeSpec,
+    container_network_kwargs,
+    published_host_port,
+    stop_and_remove_container,
+)
 from edgeshard.runtime.info import RuntimeInfo, runtime_info_from_wire
 
 _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
@@ -110,16 +116,7 @@ class EdgeShardShardRuntimeDriver:
             if spec.host_port is not None:
                 kwargs["ports"] = {f"{container_port}/tcp": spec.host_port or None}
             if spec.network is not None:
-                # docker-py consumes the endpoint mapping as a plain dict
-                # alongside `network`; a pre-wrapped NetworkingConfig fails
-                # its sanity check there.
-                kwargs["network"] = spec.network
-                kwargs["networking_config"] = {
-                    spec.network: docker.types.EndpointConfig(
-                        docker.constants.DEFAULT_DOCKER_API_VERSION,
-                        aliases=[spec.runtime_id],
-                    )
-                }
+                kwargs.update(container_network_kwargs(spec.network, spec.runtime_id))
             return self._docker.containers.run(spec.image, **kwargs)
 
         container = await asyncio.to_thread(run)
@@ -128,10 +125,11 @@ class EdgeShardShardRuntimeDriver:
             # network via the runtime-ID alias (spec 23).
             endpoint = f"{spec.runtime_id}:{container_port}"
         else:
-            host_port = await self._published_port(container, container_port)
+            host_port = await published_host_port(container, container_port)
             endpoint = f"127.0.0.1:{host_port}"
         return RuntimeHandle(
             runtime_id=spec.runtime_id,
+            backend=spec.backend,
             container_id=str(container.id),
             endpoint=endpoint,
         )
@@ -159,37 +157,4 @@ class EdgeShardShardRuntimeDriver:
 
     async def stop(self, handle: RuntimeHandle) -> None:
         """Stop and remove the container; an already-gone container is not an error."""
-
-        def stop_and_remove() -> None:
-            try:
-                container = self._docker.containers.get(handle.container_id)
-            except docker.errors.NotFound:
-                return
-            try:
-                container.stop(timeout=10)
-            except docker.errors.NotFound:
-                return
-            container.remove()
-
-        try:
-            await asyncio.to_thread(stop_and_remove)
-        except docker.errors.APIError as exc:
-            raise DriverError(
-                f"failed to stop runtime {handle.runtime_id!r}: {exc}"
-            ) from exc
-
-    async def _published_port(self, container: Any, container_port: int) -> int:
-        def probe() -> int:
-            container.reload()
-            bindings = (
-                container.attrs.get("NetworkSettings", {})
-                .get("Ports", {})
-                .get(f"{container_port}/tcp")
-            )
-            if not bindings:
-                raise DriverError(
-                    f"container port {container_port} is not published"
-                )
-            return int(bindings[0]["HostPort"])
-
-        return await asyncio.to_thread(probe)
+        await stop_and_remove_container(self._docker, handle.container_id)
