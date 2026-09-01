@@ -253,6 +253,35 @@ in Phase 0.
   CPU development host has none; Tier 2/3 machines run them). The 0G
   equivalence gate — container runtime vs untouched host HF reference —
   rides the same driver lifecycle the Mock Master will use.
+- **Deployment is manifest-driven (0H).** `control/mock/` implements the spec
+  22 Mock Master: `DeploymentManifest` (manifest.py) carries execution ID,
+  model, runtimes, and pipeline order — the partition is *provided*, never
+  computed. Static topology (unique runtime IDs, pipeline/ runtime
+  bijection, contiguous partition from block 0, input/output stage roles)
+  validates at manifest parse; the partition's upper bound validates at
+  deploy time against the model layout (`inspect`, config.json only — never
+  weights). Generated artifacts land under `work_dir/<execution_id>/`.
+- **The master configures containers with aliases, never host IPs (spec
+  23).** `deployment.py` emits one runtime config per stage: every stage
+  binds the same in-network port, downstream hops are
+  `<next-runtime-id>:<port>` Docker-network aliases, and
+  `MockMaster` launches stages through the driver on the execution's
+  dedicated bridge network `edgeshard-exec-<execution_id>`, runtime IDs as
+  container aliases. Only the entry runtime publishes a host port.
+- **Readiness cascades down the pipeline.** A non-final stage waits for its
+  downstream `GetRuntimeInfo` before serving (`shard_server.py`), so
+  "entry ready" means the whole chain is ready — the Mock Master can probe
+  only the (solely published) entry endpoint. Stages launch in reverse
+  pipeline order so the cascade resolves bottom-up; a failed deploy stops
+  every started container, removes the network, and deletes generated
+  configs before re-raising. `shutdown` is idempotent.
+- **The master-side generation mirror.** `RemotePipeline` (control/mock/
+  client.py) is the master's view of the deployed pipeline: token hops go
+  to the entry, logits replies come back, hidden states never traverse the
+  master. It tracks each session's wire step/past length locally; the
+  runtimes validate them (spec 16.2). `RemoteGenerationDriver` runs the
+  same deterministic greedy loop as `inference/generation.py` — its async
+  gRPC twin — because sampling stays outside the shard runtime.
 
 ---
 

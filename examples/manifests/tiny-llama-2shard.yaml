@@ -1,0 +1,35 @@
+# Example: two EdgeShard shard runtimes forming one tiny Llama pipeline.
+#
+# The Mock Master deploys this manifest end to end (spec 22): it creates
+# the Docker network edgeshard-exec-<execution_id>, generates one runtime
+# config per stage, launches the containers, and waits for readiness — no
+# manual Docker commands. The partition is provided here; the master only
+# validates it.
+#
+# Model paths are container-side: the host model cache is mounted at
+# /models (spec 21.1), so /models/tiny-llama is <model-cache>/tiny-llama
+# on the host.
+execution_id: exec-example
+
+model:
+  id: tiny/llama
+  path: /models/tiny-llama
+
+runtimes:
+  - id: shard-0
+    backend: edgeshard_shard
+    shard:
+      start: 0
+      end: 2
+      include_input_stage: true
+
+  - id: shard-1
+    backend: edgeshard_shard
+    shard:
+      start: 2
+      end: 4
+      include_output_stage: true
+
+pipeline:
+  - shard-0
+  - shard-1

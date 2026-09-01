@@ -95,11 +95,15 @@ class FakeContainers:
 
     def run(self, image: str, **kwargs: Any) -> FakeContainer:
         self.run_calls.append({"image": image, **kwargs})
-        (port_key, host_port), = kwargs["ports"].items()
-        ephemeral = 49152 + len(self.by_id)
+        bindings: dict[str, int] = {}
+        ports = kwargs.get("ports")
+        if ports:
+            (port_key, host_port), = ports.items()
+            ephemeral = 49152 + len(self.by_id)
+            bindings = {port_key: int(host_port or ephemeral)}
         container = FakeContainer(
             container_id=f"fake-{len(self.by_id)}",
-            bindings={port_key: int(host_port or ephemeral)},
+            bindings=bindings,
         )
         self.by_id[container.id] = container
         return container
@@ -115,7 +119,11 @@ class FakeDockerClient:
         self.containers = FakeContainers()
 
 
-def make_spec(config_path: Path, host_port: int = 0) -> EdgeShardShardRuntimeSpec:
+def make_spec(
+    config_path: Path,
+    host_port: int | None = 0,
+    network: str | None = None,
+) -> EdgeShardShardRuntimeSpec:
     return EdgeShardShardRuntimeSpec(
         backend="edgeshard_shard",
         runtime_id=RUNTIME_ID,
@@ -123,6 +131,7 @@ def make_spec(config_path: Path, host_port: int = 0) -> EdgeShardShardRuntimeSpe
         image="edgeshard/hf-shard:cpu",
         config_path=config_path,
         host_port=host_port,
+        network=network,
     )
 
 
@@ -166,6 +175,35 @@ async def test_start_picks_ephemeral_host_port(tmp_path: Path) -> None:
     )
     handle = await driver.start(make_spec(write_container_config(tmp_path)))
     assert handle.endpoint == "127.0.0.1:49152"
+
+
+async def test_start_without_host_port_uses_network_endpoint(tmp_path: Path) -> None:
+    docker_client = FakeDockerClient()
+    driver = EdgeShardShardRuntimeDriver(
+        docker_client=docker_client, model_cache_dir=tmp_path
+    )
+    handle = await driver.start(
+        make_spec(write_container_config(tmp_path), host_port=None, network="edgeshard-exec-e")
+    )
+    # Not published: reachable only inside the Docker network via the alias.
+    assert handle.endpoint == f"{RUNTIME_ID}:{CONTAINER_PORT}"
+    (call,) = docker_client.containers.run_calls
+    assert "ports" not in call
+
+
+async def test_start_attaches_network_with_runtime_alias(tmp_path: Path) -> None:
+    docker_client = FakeDockerClient()
+    driver = EdgeShardShardRuntimeDriver(
+        docker_client=docker_client, model_cache_dir=tmp_path
+    )
+    await driver.start(
+        make_spec(write_container_config(tmp_path), network="edgeshard-exec-e")
+    )
+    (call,) = docker_client.containers.run_calls
+    assert call["network"] == "edgeshard-exec-e"
+    endpoints = call["networking_config"]
+    assert set(endpoints) == {"edgeshard-exec-e"}
+    assert endpoints["edgeshard-exec-e"]["Aliases"] == [RUNTIME_ID]
 
 
 async def test_start_rejects_foreign_spec(tmp_path: Path) -> None:

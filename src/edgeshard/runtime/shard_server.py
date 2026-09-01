@@ -12,6 +12,8 @@ is a correctness transport, not a performance commitment (spec 5.4).
 
 from __future__ import annotations
 
+import asyncio
+import time
 import uuid
 
 import grpc
@@ -19,6 +21,7 @@ import torch
 
 from edgeshard.inference.shard import ShardModule
 from edgeshard.inference.state import LogitsOutput, ShardState
+from edgeshard.model.errors import EdgeShardError
 from edgeshard.model.source import ModelSource
 from edgeshard.model.spec import ShardSpec
 from edgeshard.protocol.domain import (
@@ -37,6 +40,15 @@ from edgeshard.protocol.grpc_client import ShardRuntimeClient
 from edgeshard.protocol.grpc_server import start_shard_runtime_server
 from edgeshard.runtime.config import ShardRuntimeConfig
 from edgeshard.runtime.info import runtime_info_from_config, runtime_info_to_wire
+
+DOWNSTREAM_READY_TIMEOUT_S = 300.0
+"""Default time a stage waits for its downstream stage before serving."""
+
+DOWNSTREAM_POLL_INTERVAL_S = 0.25
+
+
+class RuntimeStartupError(EdgeShardError):
+    """The shard runtime could not reach a serving state."""
 
 
 class ShardRuntimeHandler:
@@ -189,6 +201,28 @@ def build_shard_module(config: ShardRuntimeConfig) -> ShardModule:
     )
 
 
+async def _wait_for_downstream_ready(
+    downstream: ShardRuntimeClient,
+    *,
+    runtime_id: str,
+    timeout_s: float,
+    poll_interval_s: float = DOWNSTREAM_POLL_INTERVAL_S,
+) -> None:
+    """Poll the downstream stage's GetRuntimeInfo until it answers."""
+    deadline = time.monotonic() + timeout_s
+    while True:
+        try:
+            await downstream.get_runtime_info()
+            return
+        except grpc.aio.AioRpcError:
+            if time.monotonic() > deadline:
+                raise RuntimeStartupError(
+                    f"runtime {runtime_id!r}: downstream stage at "
+                    f"{downstream.endpoint} not ready within {timeout_s}s"
+                ) from None
+            await asyncio.sleep(poll_interval_s)
+
+
 class ShardRuntimeServer:
     """One running shard stage: module + handler + gRPC server."""
 
@@ -206,7 +240,12 @@ class ShardRuntimeServer:
         self._downstream = downstream
 
     @classmethod
-    async def create(cls, config: ShardRuntimeConfig) -> ShardRuntimeServer:
+    async def create(
+        cls,
+        config: ShardRuntimeConfig,
+        *,
+        downstream_ready_timeout_s: float = DOWNSTREAM_READY_TIMEOUT_S,
+    ) -> ShardRuntimeServer:
         module = build_shard_module(config)
         downstream = (
             ShardRuntimeClient(config.pipeline.next_endpoint)
@@ -214,6 +253,15 @@ class ShardRuntimeServer:
             else None
         )
         handler = ShardRuntimeHandler(config=config, module=module, downstream=downstream)
+        if downstream is not None:
+            # Readiness is transitive (spec 23): only the entry runtime is
+            # reachable from the host, so a stage must not serve until its
+            # whole downstream chain answers GetRuntimeInfo.
+            await _wait_for_downstream_ready(
+                downstream,
+                runtime_id=config.runtime.runtime_id,
+                timeout_s=downstream_ready_timeout_s,
+            )
         info_wire = runtime_info_to_wire(runtime_info_from_config(config))
         grpc_server, port = await start_shard_runtime_server(
             handler,

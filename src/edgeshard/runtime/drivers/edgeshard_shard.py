@@ -34,11 +34,16 @@ class EdgeShardShardRuntimeSpec(RuntimeSpec):
     ``config_path`` is a host path: the driver validates it, then mounts it
     read-only into the container. The container binds the config's own
     ``server.listen_port``; the driver publishes it on ``host_port``
-    (0 lets Docker pick an ephemeral port).
+    (0 lets Docker pick an ephemeral port, ``None`` publishes nothing —
+    spec 23: only the entry runtime needs a host port). When ``network``
+    is set, the container joins that Docker network with the runtime ID as
+    its alias, so shard configs can name downstream stages as
+    ``<runtime-id>:<port>`` without any host IP (spec 23).
     """
 
     config_path: Path
-    host_port: int = 0
+    host_port: int | None = 0
+    network: str | None = None
 
 
 class EdgeShardShardRuntimeDriver:
@@ -85,32 +90,50 @@ class EdgeShardShardRuntimeDriver:
         container_port = config.server.listen_port
 
         def run() -> Any:
-            return self._docker.containers.run(
-                spec.image,
-                detach=True,
-                name=f"edgeshard-{spec.execution_id}-{spec.runtime_id}",
-                ports={f"{container_port}/tcp": spec.host_port or None},
-                volumes={
+            kwargs: dict[str, Any] = {
+                "detach": True,
+                "name": f"edgeshard-{spec.execution_id}-{spec.runtime_id}",
+                "volumes": {
                     str(self._model_cache_dir): {"bind": self.MODEL_MOUNT, "mode": "ro"},
                     str(Path(spec.config_path).resolve()): {
                         "bind": self.CONTAINER_CONFIG_PATH,
                         "mode": "ro",
                     },
                 },
-                labels={
+                "labels": {
                     "io.edgeshard.managed": "true",
                     "io.edgeshard.execution_id": spec.execution_id,
                     "io.edgeshard.runtime_id": spec.runtime_id,
                     "io.edgeshard.backend": spec.backend,
                 },
-            )
+            }
+            if spec.host_port is not None:
+                kwargs["ports"] = {f"{container_port}/tcp": spec.host_port or None}
+            if spec.network is not None:
+                # docker-py consumes the endpoint mapping as a plain dict
+                # alongside `network`; a pre-wrapped NetworkingConfig fails
+                # its sanity check there.
+                kwargs["network"] = spec.network
+                kwargs["networking_config"] = {
+                    spec.network: docker.types.EndpointConfig(
+                        docker.constants.DEFAULT_DOCKER_API_VERSION,
+                        aliases=[spec.runtime_id],
+                    )
+                }
+            return self._docker.containers.run(spec.image, **kwargs)
 
         container = await asyncio.to_thread(run)
-        host_port = await self._published_port(container, container_port)
+        if spec.host_port is None:
+            # Not published to the host: addressable only inside the Docker
+            # network via the runtime-ID alias (spec 23).
+            endpoint = f"{spec.runtime_id}:{container_port}"
+        else:
+            host_port = await self._published_port(container, container_port)
+            endpoint = f"127.0.0.1:{host_port}"
         return RuntimeHandle(
             runtime_id=spec.runtime_id,
             container_id=str(container.id),
-            endpoint=f"127.0.0.1:{host_port}",
+            endpoint=endpoint,
         )
 
     async def wait_ready(self, handle: RuntimeHandle) -> None:

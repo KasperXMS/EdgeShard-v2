@@ -31,7 +31,12 @@ class RuntimeSpec:
 
 @dataclass(frozen=True)
 class RuntimeHandle:
-    """A started runtime, addressable from the host."""
+    """A started runtime and its primary endpoint.
+
+    The endpoint is host-addressable when the driver published a port; for
+    network-only runtimes (spec 23) it is resolvable only inside the
+    deployment's Docker network.
+    """
 
     runtime_id: str
     container_id: str
