@@ -282,6 +282,18 @@ in Phase 0.
   runtimes validate them (spec 16.2). `RemoteGenerationDriver` runs the
   same deterministic greedy loop as `inference/generation.py` — its async
   gRPC twin — because sampling stays outside the shard runtime.
+- **Partition invariance is enforced at every transport tier (0I, the
+  primary Phase 0 gate).** Invariant 9 — a valid partition change does not
+  change deterministic output — is asserted by cross-partition token
+  equivalence plus reference equivalence at the local serialized pipeline
+  (0E, three mandatory partitions), the multi-process gRPC tier
+  (`tests/integration/test_partition_invariance.py`, two clusters with
+  different partitions running simultaneously), and the container tier
+  (`tests/container/test_multi_container_pipeline.py`, three-stage vs
+  two-stage Mock Master deployments). The container form is the gate's
+  final link and is skip-gated where Docker is absent; the first two run
+  on every CPU development host. Shipped examples (configs and manifests)
+  are themselves test-parsed so documentation cannot drift from schemas.
 
 ---
 
