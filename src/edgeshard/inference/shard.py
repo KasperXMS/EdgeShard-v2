@@ -222,6 +222,13 @@ class ShardModule:
             positions=positions,
         )
         if self._shard.include_output_stage:
+            if logits_mode is LogitsMode.LAST_TOKEN and hidden.shape[1] > 1:
+                # Generation consumes only the final position, so trim the
+                # hidden states BEFORE the output stage (norm + LM head):
+                # the head projects one position, not the whole context,
+                # keeping prefill replies at [batch, 1, vocab] regardless
+                # of prompt length. This is not a transport-layer slice.
+                hidden = hidden[:, -1:, :]
             with torch.no_grad():
                 logits = self._adapter.finalize(self._module, hidden)
             return LogitsOutput(logits=logits, context=context)

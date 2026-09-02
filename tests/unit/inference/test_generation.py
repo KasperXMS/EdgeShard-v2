@@ -88,3 +88,22 @@ def test_negative_max_new_tokens_is_rejected(tiny_llama_source: ModelSource) -> 
     driver = GenerationDriver(pipeline)
     with pytest.raises(ValueError, match="max_new_tokens"):
         driver.generate("s", torch.tensor([[1]]), max_new_tokens=-1)
+
+
+def test_128_token_generation_matches_reference(
+    tiny_llama_source: ModelSource, tiny_llama_dir: Path
+) -> None:
+    """Long greedy runs stay on the reference trajectory.
+
+    The driver prefills with LAST_TOKEN logits and then decodes 128 times;
+    every sampled token must match the untouched HF reference.
+    """
+    pipeline = build_three_stage_pipeline(tiny_llama_source, "exec-gen-128")
+    reference = LlamaForCausalLM.from_pretrained(tiny_llama_dir).eval()
+    prompt = torch.tensor([[3, 11, 29]])
+
+    pipeline.create_session("s")
+    driver = GenerationDriver(pipeline)
+    generated = driver.generate("s", prompt, max_new_tokens=128)
+
+    assert generated == reference_greedy_tokens(reference, prompt, 128)

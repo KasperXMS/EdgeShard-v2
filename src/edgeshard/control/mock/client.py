@@ -183,10 +183,17 @@ class RemoteGenerationDriver:
     async def generate(
         self, session_id: str, input_ids: torch.Tensor, *, max_new_tokens: int
     ) -> list[int]:
-        """Prefill the prompt, then sample ``max_new_tokens`` greedy tokens."""
+        """Prefill the prompt, then sample ``max_new_tokens`` greedy tokens.
+
+        Prefill runs with ``LAST_TOKEN`` logits so long-context prompts
+        answer with a single-position projection; the full-logits mode
+        stays available for validation clients.
+        """
         if max_new_tokens < 0:
             raise ValueError(f"max_new_tokens must be >= 0, got {max_new_tokens}")
-        output = await self._pipeline.prefill(session_id, input_ids)
+        output = await self._pipeline.prefill(
+            session_id, input_ids, logits_mode=LogitsMode.LAST_TOKEN
+        )
         generated: list[int] = []
         token = int(output.logits[0, -1].argmax())
         generated.append(token)

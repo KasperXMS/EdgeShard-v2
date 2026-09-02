@@ -14,7 +14,7 @@ import torch
 from transformers import LlamaForCausalLM, Qwen2ForCausalLM
 
 from edgeshard.inference.shard import ShardModule
-from edgeshard.inference.state import InferencePhase, LogitsOutput
+from edgeshard.inference.state import InferencePhase, LogitsMode, LogitsOutput
 from edgeshard.model.source import ModelSource
 from edgeshard.model.spec import BlockRange, ShardSpec
 
@@ -124,3 +124,25 @@ def test_qwen2_prefill_matches_reference(
     output = shard.prefill("s", input_ids=prompt_ids)
     assert isinstance(output, LogitsOutput)
     assert torch.allclose(output.logits, reference(prompt_ids).logits, **TOLERANCE)
+
+
+def test_last_token_prefill_projects_only_the_final_position(
+    full_llama_shard: ShardModule, prompt_ids: torch.Tensor
+) -> None:
+    """LAST_TOKEN trims before the LM head, not in transport.
+
+    The norm and head are per-position, so the single-position projection
+    must reproduce the final slice of a FULL prefill exactly.
+    """
+    full_llama_shard.create_session("full")
+    full_llama_shard.create_session("last")
+    full = full_llama_shard.prefill("full", input_ids=prompt_ids)
+    last = full_llama_shard.prefill(
+        "last", input_ids=prompt_ids, logits_mode=LogitsMode.LAST_TOKEN
+    )
+
+    assert isinstance(full, LogitsOutput)
+    assert isinstance(last, LogitsOutput)
+    assert full.logits.shape == (1, prompt_ids.shape[1], 128)
+    assert last.logits.shape == (1, 1, 128)
+    assert torch.allclose(last.logits, full.logits[:, -1:, :], **TOLERANCE)
