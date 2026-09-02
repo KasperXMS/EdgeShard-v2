@@ -12,12 +12,19 @@ class Phase(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     PHASE_UNSPECIFIED: _ClassVar[Phase]
     PHASE_PREFILL: _ClassVar[Phase]
     PHASE_DECODE: _ClassVar[Phase]
+
+class LogitsMode(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    LOGITS_FULL: _ClassVar[LogitsMode]
+    LOGITS_LAST_TOKEN: _ClassVar[LogitsMode]
 PHASE_UNSPECIFIED: Phase
 PHASE_PREFILL: Phase
 PHASE_DECODE: Phase
+LOGITS_FULL: LogitsMode
+LOGITS_LAST_TOKEN: LogitsMode
 
 class MessageHeader(_message.Message):
-    __slots__ = ("protocol_version", "execution_id", "session_id", "request_id", "phase", "step", "source_stage", "target_stage")
+    __slots__ = ("protocol_version", "execution_id", "session_id", "request_id", "phase", "step", "source_stage", "target_stage", "logits_mode")
     PROTOCOL_VERSION_FIELD_NUMBER: _ClassVar[int]
     EXECUTION_ID_FIELD_NUMBER: _ClassVar[int]
     SESSION_ID_FIELD_NUMBER: _ClassVar[int]
@@ -26,6 +33,7 @@ class MessageHeader(_message.Message):
     STEP_FIELD_NUMBER: _ClassVar[int]
     SOURCE_STAGE_FIELD_NUMBER: _ClassVar[int]
     TARGET_STAGE_FIELD_NUMBER: _ClassVar[int]
+    LOGITS_MODE_FIELD_NUMBER: _ClassVar[int]
     protocol_version: int
     execution_id: str
     session_id: str
@@ -34,7 +42,8 @@ class MessageHeader(_message.Message):
     step: int
     source_stage: int
     target_stage: int
-    def __init__(self, protocol_version: _Optional[int] = ..., execution_id: _Optional[str] = ..., session_id: _Optional[str] = ..., request_id: _Optional[str] = ..., phase: _Optional[_Union[Phase, str]] = ..., step: _Optional[int] = ..., source_stage: _Optional[int] = ..., target_stage: _Optional[int] = ...) -> None: ...
+    logits_mode: LogitsMode
+    def __init__(self, protocol_version: _Optional[int] = ..., execution_id: _Optional[str] = ..., session_id: _Optional[str] = ..., request_id: _Optional[str] = ..., phase: _Optional[_Union[Phase, str]] = ..., step: _Optional[int] = ..., source_stage: _Optional[int] = ..., target_stage: _Optional[int] = ..., logits_mode: _Optional[_Union[LogitsMode, str]] = ...) -> None: ...
 
 class ExecutionContext(_message.Message):
     __slots__ = ("phase", "step", "batch_size", "sequence_lengths", "past_length")

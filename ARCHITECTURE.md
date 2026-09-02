@@ -361,7 +361,10 @@ one requires updating its tests and this document in the same change.
   `PROTOCOL_VERSION = 1`) — `GetRuntimeInfo` (readiness + identity),
   `CreateSession`, `Prefill`, `Decode`, `CloseSession`; safetensors
   tensor bundles under canonical keys (`hidden_states`/`logits`,
-  `positions` alongside); 512 MiB message ceiling.
+  `positions` alongside); 512 MiB message ceiling. The message header
+  carries a request-scoped `LogitsMode` (`FULL`/`LAST_TOKEN`) forwarded
+  stage to stage untouched: generation requests last-token-only prefill
+  logits, validation keeps full logits.
 - **`RuntimeDriver` protocol** (`runtime/drivers/base.py`) —
   `start`/`wait_ready`/`info`/`stop` over `RuntimeSpec`/`RuntimeHandle`
   (with `backend`); a new backend registers a driver with the Mock

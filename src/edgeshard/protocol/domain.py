@@ -14,7 +14,7 @@ from dataclasses import dataclass
 
 import torch
 
-from edgeshard.inference.state import ExecutionContext, InferencePhase
+from edgeshard.inference.state import ExecutionContext, InferencePhase, LogitsMode
 from edgeshard.model.errors import EdgeShardError
 
 PROTOCOL_VERSION: int = 1
@@ -88,6 +88,14 @@ class ShardMessageHeader:
 
     source_stage: int
     target_stage: int
+
+    logits_mode: LogitsMode = LogitsMode.FULL
+    """Request-scoped directive for the final shard's prefill logits.
+
+    Forwarded unchanged stage to stage so the final shard knows what to
+    compute. Defaults to full logits, the original Phase 0 semantics and
+    the wire default (``LOGITS_FULL = 0``).
+    """
 
 
 @dataclass(frozen=True)

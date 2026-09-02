@@ -16,6 +16,7 @@ from edgeshard.inference.session import SessionError, ShardSession
 from edgeshard.inference.state import (
     ExecutionContext,
     InferencePhase,
+    LogitsMode,
     LogitsOutput,
     ShardState,
 )
@@ -89,6 +90,7 @@ class StubModule:
         )
         self.sessions: dict[str, ShardSession] = {}
         self.executed: list[str] = []
+        self.prefill_kwargs: list[dict[str, object]] = []
 
     def create_session(self, session_id: str) -> ShardSession:
         if session_id in self.sessions:
@@ -122,6 +124,7 @@ class StubModule:
 
     def prefill(self, session_id: str, **kwargs: object) -> ShardState | LogitsOutput:
         self.executed.append("prefill")
+        self.prefill_kwargs.append(kwargs)
         self.sessions[session_id].step += 1
         return self._output(InferencePhase.PREFILL)
 
@@ -181,6 +184,7 @@ def make_message(
     source_stage: int,
     target_stage: int,
     execution_id: str = EXECUTION_ID,
+    logits_mode: LogitsMode = LogitsMode.FULL,
 ) -> ShardMessage:
     return ShardMessage(
         header=ShardMessageHeader(
@@ -192,6 +196,7 @@ def make_message(
             step=step,
             source_stage=source_stage,
             target_stage=target_stage,
+            logits_mode=logits_mode,
         ),
         context=ExecutionContext(
             phase=phase,
@@ -333,6 +338,44 @@ async def test_middle_stage_forwards_and_returns_downstream_reply() -> None:
     assert reply.header.source_stage == 2
     assert reply.header.target_stage == MASTER_STAGE
     assert isinstance(reply.payload, LogitsPayload)
+
+
+async def test_logits_mode_is_forwarded_downstream_untouched() -> None:
+    handler, module, downstream = middle_handler()
+    await handler.create_session(EXECUTION_ID, SESSION_ID)
+    message = make_message(
+        phase=InferencePhase.PREFILL,
+        step=0,
+        payload=HiddenStatePayload(hidden_states=torch.zeros(1, 2, 4)),
+        source_stage=0,
+        target_stage=1,
+        logits_mode=LogitsMode.LAST_TOKEN,
+    )
+    await handler.prefill(message)
+
+    # The directive reaches the local module ...
+    (prefill_kwargs,) = module.prefill_kwargs
+    assert prefill_kwargs["logits_mode"] is LogitsMode.LAST_TOKEN
+    # ... and is forwarded stage to stage unchanged.
+    (forwarded,) = downstream.forwarded
+    assert forwarded.header.logits_mode is LogitsMode.LAST_TOKEN
+
+
+async def test_default_logits_mode_is_full() -> None:
+    handler, module, downstream = middle_handler()
+    await handler.create_session(EXECUTION_ID, SESSION_ID)
+    message = make_message(
+        phase=InferencePhase.PREFILL,
+        step=0,
+        payload=HiddenStatePayload(hidden_states=torch.zeros(1, 2, 4)),
+        source_stage=0,
+        target_stage=1,
+    )
+    await handler.prefill(message)
+    (prefill_kwargs,) = module.prefill_kwargs
+    assert prefill_kwargs["logits_mode"] is LogitsMode.FULL
+    (forwarded,) = downstream.forwarded
+    assert forwarded.header.logits_mode is LogitsMode.FULL
 
 
 async def test_final_stage_replies_with_logits() -> None:

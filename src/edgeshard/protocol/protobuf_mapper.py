@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import torch
 
-from edgeshard.inference.state import ExecutionContext, InferencePhase
+from edgeshard.inference.state import ExecutionContext, InferencePhase, LogitsMode
 from edgeshard.protocol import domain
 from edgeshard.protocol.domain import (
     HiddenStatePayload,
@@ -30,6 +30,14 @@ _PHASE_TO_WIRE: dict[InferencePhase, pb.Phase] = {
     InferencePhase.DECODE: pb.PHASE_DECODE,
 }
 _WIRE_TO_PHASE: dict[int, InferencePhase] = {int(v): k for k, v in _PHASE_TO_WIRE.items()}
+
+_LOGITS_MODE_TO_WIRE: dict[LogitsMode, pb.LogitsMode] = {
+    LogitsMode.FULL: pb.LOGITS_FULL,
+    LogitsMode.LAST_TOKEN: pb.LOGITS_LAST_TOKEN,
+}
+_WIRE_TO_LOGITS_MODE: dict[int, LogitsMode] = {
+    int(v): k for k, v in _LOGITS_MODE_TO_WIRE.items()
+}
 
 
 def message_to_forward_request(message: ShardMessage) -> pb.ForwardRequest:
@@ -97,6 +105,7 @@ def _header_to_wire(header: ShardMessageHeader) -> pb.MessageHeader:
         step=header.step,
         source_stage=header.source_stage,
         target_stage=header.target_stage,
+        logits_mode=_LOGITS_MODE_TO_WIRE[header.logits_mode],
     )
 
 
@@ -104,6 +113,9 @@ def _header_from_wire(wire: pb.MessageHeader) -> ShardMessageHeader:
     phase = _WIRE_TO_PHASE.get(int(wire.phase))
     if phase is None:
         raise ProtocolError(f"unknown wire phase: {int(wire.phase)}")
+    logits_mode = _WIRE_TO_LOGITS_MODE.get(int(wire.logits_mode))
+    if logits_mode is None:
+        raise ProtocolError(f"unknown wire logits mode: {int(wire.logits_mode)}")
     return ShardMessageHeader(
         protocol_version=wire.protocol_version,
         execution_id=wire.execution_id,
@@ -113,6 +125,7 @@ def _header_from_wire(wire: pb.MessageHeader) -> ShardMessageHeader:
         step=wire.step,
         source_stage=wire.source_stage,
         target_stage=wire.target_stage,
+        logits_mode=logits_mode,
     )
 
 

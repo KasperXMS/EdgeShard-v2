@@ -26,6 +26,7 @@ from edgeshard.inference.shard import ShardModule
 from edgeshard.inference.state import (
     ExecutionContext,
     InferencePhase,
+    LogitsMode,
     LogitsOutput,
     ShardState,
 )
@@ -123,10 +124,20 @@ class LocalPipeline:
         for shard in self._stages:
             shard.close_session(session_id)
 
-    def prefill(self, session_id: str, input_ids: torch.Tensor) -> LogitsOutput:
-        """Run the prompt through every stage; wire step for prefill is 0."""
+    def prefill(
+        self,
+        session_id: str,
+        input_ids: torch.Tensor,
+        *,
+        logits_mode: LogitsMode = LogitsMode.FULL,
+    ) -> LogitsOutput:
+        """Run the prompt through every stage; wire step for prefill is 0.
+
+        ``logits_mode`` is a request-scoped directive for the final stage;
+        middle stages pass it through untouched.
+        """
         result: ShardState | LogitsOutput = self._stages[0].prefill(
-            session_id, input_ids=input_ids
+            session_id, input_ids=input_ids, logits_mode=logits_mode
         )
         for target in range(1, len(self._stages)):
             if isinstance(result, LogitsOutput):
@@ -140,7 +151,9 @@ class LocalPipeline:
                 state=result,
             )
             result = self._stages[target].prefill(
-                session_id, hidden_states=result.hidden_states
+                session_id,
+                hidden_states=result.hidden_states,
+                logits_mode=logits_mode,
             )
         if not isinstance(result, LogitsOutput):
             raise PipelineError("final stage produced no logits")

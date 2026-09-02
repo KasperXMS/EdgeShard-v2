@@ -18,6 +18,7 @@ from edgeshard.inference.session import SessionError, ShardSession
 from edgeshard.inference.state import (
     ExecutionContext,
     InferencePhase,
+    LogitsMode,
     LogitsOutput,
     ShardState,
 )
@@ -127,12 +128,14 @@ class ShardModule:
         *,
         input_ids: torch.Tensor | None = None,
         hidden_states: torch.Tensor | None = None,
+        logits_mode: LogitsMode = LogitsMode.FULL,
     ) -> ShardResult:
         """Run the first step on a prompt.
 
         Input shards consume ``input_ids``; middle/last shards consume
         ``hidden_states`` from the preceding shard. Exactly one must match
-        the shard's role.
+        the shard's role. Only the output shard acts on ``logits_mode``;
+        middle shards forward the request unchanged.
         """
         session = self.session(session_id)
         if session.step != 0:
@@ -140,7 +143,7 @@ class ShardModule:
                 f"prefill on session {session_id!r} after step {session.step}"
             )
         hidden = self._enter(session, input_ids=input_ids, hidden_states=hidden_states)
-        return self._advance(session, hidden, InferencePhase.PREFILL)
+        return self._advance(session, hidden, InferencePhase.PREFILL, logits_mode)
 
     def decode(
         self,
@@ -190,6 +193,7 @@ class ShardModule:
         session: ShardSession,
         hidden: torch.Tensor,
         phase: InferencePhase,
+        logits_mode: LogitsMode = LogitsMode.FULL,
     ) -> ShardResult:
         q_len = int(hidden.shape[1])
         past_length = session.sequence_length

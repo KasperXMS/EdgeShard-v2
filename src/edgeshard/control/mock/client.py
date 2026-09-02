@@ -21,7 +21,12 @@ from dataclasses import dataclass
 import httpx
 import torch
 
-from edgeshard.inference.state import ExecutionContext, InferencePhase, LogitsOutput
+from edgeshard.inference.state import (
+    ExecutionContext,
+    InferencePhase,
+    LogitsMode,
+    LogitsOutput,
+)
 from edgeshard.protocol.domain import (
     MASTER_STAGE,
     PROTOCOL_VERSION,
@@ -81,8 +86,20 @@ class RemotePipeline:
         await self._client.close_session(self._execution_id, session_id)
         self._clocks.pop(session_id, None)
 
-    async def prefill(self, session_id: str, input_ids: torch.Tensor) -> LogitsOutput:
-        """Send the prompt as the master -> stage-0 TokenPayload hop."""
+    async def prefill(
+        self,
+        session_id: str,
+        input_ids: torch.Tensor,
+        *,
+        logits_mode: LogitsMode = LogitsMode.FULL,
+    ) -> LogitsOutput:
+        """Send the prompt as the master -> stage-0 TokenPayload hop.
+
+        ``logits_mode`` rides in the message header and is forwarded stage
+        to stage; generation passes ``LAST_TOKEN`` so long-context prefills
+        answer with a single-position projection instead of full
+        ``[batch, seq, vocab]`` logits.
+        """
         if input_ids.ndim != 2 or input_ids.shape[0] != 1:
             raise ValueError(
                 "Phase 0 is batch_size=1: expected input_ids of shape [1, L], "
@@ -90,7 +107,12 @@ class RemotePipeline:
             )
         token_ids = [int(token) for token in input_ids[0].tolist()]
         message = self._token_message(
-            session_id, token_ids, phase=InferencePhase.PREFILL, step=0, past_length=0
+            session_id,
+            token_ids,
+            phase=InferencePhase.PREFILL,
+            step=0,
+            past_length=0,
+            logits_mode=logits_mode,
         )
         reply = await self._client.prefill(message)
         self._clocks[session_id] = _SessionClock(step=1, past_length=len(token_ids))
@@ -121,6 +143,7 @@ class RemotePipeline:
         phase: InferencePhase,
         step: int,
         past_length: int,
+        logits_mode: LogitsMode = LogitsMode.FULL,
     ) -> ShardMessage:
         return ShardMessage(
             header=ShardMessageHeader(
@@ -132,6 +155,7 @@ class RemotePipeline:
                 step=step,
                 source_stage=MASTER_STAGE,
                 target_stage=0,
+                logits_mode=logits_mode,
             ),
             context=ExecutionContext(
                 phase=phase,

@@ -121,12 +121,20 @@ class ShardRuntimeHandler:
                     raise ProtocolError("decode expects exactly one token")
                 return self._module.decode(session_id, token_id=payload.token_ids[0])
             input_ids = torch.tensor([list(payload.token_ids)], dtype=torch.long)
-            return self._module.prefill(session_id, input_ids=input_ids)
+            return self._module.prefill(
+                session_id,
+                input_ids=input_ids,
+                logits_mode=message.header.logits_mode,
+            )
         if not isinstance(payload, HiddenStatePayload):
             raise ProtocolError("non-input stage expects a hidden-state payload")
         if decode:
             return self._module.decode(session_id, hidden_states=payload.hidden_states)
-        return self._module.prefill(session_id, hidden_states=payload.hidden_states)
+        return self._module.prefill(
+            session_id,
+            hidden_states=payload.hidden_states,
+            logits_mode=message.header.logits_mode,
+        )
 
     async def _emit(
         self,
@@ -148,6 +156,7 @@ class ShardRuntimeHandler:
                 step=header.step,
                 source_stage=self.stage_index,
                 target_stage=MASTER_STAGE,
+                logits_mode=header.logits_mode,
             )
             return ShardMessage(
                 header=reply_header,
@@ -166,6 +175,7 @@ class ShardRuntimeHandler:
             step=header.step,
             source_stage=self.stage_index,
             target_stage=self.stage_index + 1,
+            logits_mode=header.logits_mode,
         )
         next_message = ShardMessage(
             header=next_header,

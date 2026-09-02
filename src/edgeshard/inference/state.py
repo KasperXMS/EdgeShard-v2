@@ -36,6 +36,22 @@ class InferencePhase(StrEnum):
     DECODE = "decode"
 
 
+class LogitsMode(StrEnum):
+    """Which positions the final shard projects to vocabulary logits.
+
+    A prefill computes ``sequence_length`` positions; projecting every one
+    of them through the LM head produces ``[batch, seq, vocab]`` logits,
+    which grows with context length. Generation only ever consumes the last
+    position, so it requests :attr:`LAST_TOKEN` and the final shard trims
+    its hidden states *before* the LM head. :attr:`FULL` remains for local
+    numerical validation and profiling. Decode is single-position either
+    way.
+    """
+
+    FULL = "full"
+    LAST_TOKEN = "last_token"
+
+
 @dataclass(frozen=True)
 class ExecutionContext:
     """Canonical sequence/position metadata (spec 14).

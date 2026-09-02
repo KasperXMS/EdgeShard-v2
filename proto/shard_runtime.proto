@@ -15,6 +15,15 @@ enum Phase {
   PHASE_DECODE = 2;
 }
 
+// How many positions the final shard projects to vocabulary logits on a
+// prefill. FULL is 0 so that unset wire messages keep the original
+// full-logits semantics. LAST_TOKEN projects only the final position
+// (trimming happens before the LM head, never in transport).
+enum LogitsMode {
+  LOGITS_FULL = 0;
+  LOGITS_LAST_TOKEN = 1;
+}
+
 // ShardMessageHeader (spec 16). execution_id, session_id and request_id are
 // distinct identity scopes and are not interchangeable (spec 16.1).
 message MessageHeader {
@@ -29,6 +38,11 @@ message MessageHeader {
 
   int32 source_stage = 7;
   int32 target_stage = 8;
+
+  // Request-scoped directive, forwarded unchanged stage to stage: which
+  // logits the final shard computes on prefill (FULL for validation,
+  // LAST_TOKEN for generation). Decode is always single-position anyway.
+  LogitsMode logits_mode = 9;
 }
 
 // Scalar part of the canonical ExecutionContext (spec 14). The positions

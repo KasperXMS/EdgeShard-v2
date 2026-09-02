@@ -17,6 +17,7 @@ from edgeshard.inference.shard import ShardModule
 from edgeshard.inference.state import (
     ExecutionContext,
     InferencePhase,
+    LogitsMode,
     LogitsOutput,
     ShardState,
 )
@@ -166,6 +167,40 @@ def test_unknown_wire_phase_is_rejected() -> None:
     wire = mapper.message_to_forward_request(message)
     wire.header.phase = 99
     with pytest.raises(ProtocolError, match="unknown wire phase"):
+        mapper.forward_request_to_message(wire)
+
+
+def test_logits_mode_roundtrips_through_the_header() -> None:
+    message = ShardMessage(
+        header=make_header(logits_mode=LogitsMode.LAST_TOKEN),
+        context=make_context(),
+        payload=TokenPayload(token_ids=(1,)),
+    )
+    restored = roundtrip_request(message)
+    assert restored.header.logits_mode is LogitsMode.LAST_TOKEN
+
+
+def test_unset_wire_logits_mode_is_full() -> None:
+    # LOGITS_FULL is wire value 0: messages without the field keep the
+    # original full-logits semantics.
+    message = ShardMessage(
+        header=make_header(), context=make_context(), payload=TokenPayload(token_ids=(1,))
+    )
+    wire = mapper.message_to_forward_request(message)
+    assert wire.header.logits_mode == pb.LOGITS_FULL
+    restored = mapper.forward_request_to_message(
+        pb.ForwardRequest.FromString(wire.SerializeToString())
+    )
+    assert restored.header.logits_mode is LogitsMode.FULL
+
+
+def test_unknown_wire_logits_mode_is_rejected() -> None:
+    message = ShardMessage(
+        header=make_header(), context=make_context(), payload=TokenPayload(token_ids=(1,))
+    )
+    wire = mapper.message_to_forward_request(message)
+    wire.header.logits_mode = 99
+    with pytest.raises(ProtocolError, match="unknown wire logits mode"):
         mapper.forward_request_to_message(wire)
 
 
