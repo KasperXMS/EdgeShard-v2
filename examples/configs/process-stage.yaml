@@ -1,0 +1,25 @@
+# Example: one shard runtime stage as a plain host process (spec 19.1).
+#
+# Loopback bind, host-side model path: run one process per stage with
+# matching pipeline fields to form a local pipeline without containers.
+# For containerized deployments see examples/manifests/ and the Mock
+# Master (spec 22). The companion container example is
+# container-stage-cpu.yaml.
+runtime:
+  backend: edgeshard_shard
+  runtime_id: stage-0
+  execution_id: example-exec
+model:
+  id: tiny/llama
+  path: /models/tiny-llama  # plain host filesystem path (no mount rules)
+shard:
+  start_block: 0
+  end_block: 4
+  include_input_stage: true
+  include_output_stage: true
+pipeline:
+  stage_index: 0
+  stage_count: 1
+server:
+  listen_host: 127.0.0.1
+  listen_port: 9000

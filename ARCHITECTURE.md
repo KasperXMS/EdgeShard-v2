@@ -112,6 +112,7 @@ src/edgeshard/
 containers/hf/            CPU / x86 NVIDIA / Jetson shard Dockerfiles, README
 tests/unit|integration|container/
 examples/configs|manifests/
+README.md, KNOWN_LIMITATIONS.md  root documentation (0K)
 ```
 
 No future-phase modules (`scheduler/`, `worker/`, production `master/`) exist
@@ -329,6 +330,53 @@ in Phase 0.
   Everything beneath it — driver wiring, readiness polling, OpenAI test
   requests, mixed-manifest orchestration — runs on the CPU development
   host against fake Docker clients and in-process HTTP servers.
+- **0K freezes the Phase 0 surface.** Known limitations are documented
+  honestly (`KNOWN_LIMITATIONS.md`); shipped examples stay test-parsed;
+  and `tests/unit/test_phase0_scope.py` automates the gate's third
+  clause — the package tree contains exactly the Phase 0 packages,
+  `edgeshard.control` holds only the Mock Master, and scheduler/worker/
+  profiling/production-master modules do not exist anywhere. The stable
+  interfaces below are the extension points later phases build on.
+
+---
+
+## Stable Phase 0 public interfaces (frozen at 0K)
+
+These are the surfaces Phase 1+ may extend — not silently break. Changing
+one requires updating its tests and this document in the same change.
+
+- **Runtime process CLI** — `edgeshard --config <runtime.yaml>` (console
+  script) or `python -m edgeshard --config ...`; on success prints
+  `READY runtime=<id> endpoint=<host:port>` and serves; errors exit
+  non-zero with an explicit message.
+- **`ShardRuntimeConfig` YAML** (`runtime/config.py`, spec 19.1) —
+  strict sections `runtime`/`model`/`shard`/`pipeline`/`device`/
+  `inference`/`server` (`extra="forbid"`), half-open block bounds,
+  stage-routing rules for `next_endpoint`.
+- **`DeploymentManifest` YAML** (`control/mock/manifest.py`, spec 22.2) —
+  `execution_id`, `model`, `runtimes` (`backend: edgeshard_shard | vllm`
+  with per-backend `shard:`/`vllm:`/`device:`/`image` sections), and
+  `pipeline` ordering exactly the shard runtimes.
+- **ShardRuntime gRPC service** (`proto/shard_runtime.proto`,
+  `PROTOCOL_VERSION = 1`) — `GetRuntimeInfo` (readiness + identity),
+  `CreateSession`, `Prefill`, `Decode`, `CloseSession`; safetensors
+  tensor bundles under canonical keys (`hidden_states`/`logits`,
+  `positions` alongside); 512 MiB message ceiling.
+- **`RuntimeDriver` protocol** (`runtime/drivers/base.py`) —
+  `start`/`wait_ready`/`info`/`stop` over `RuntimeSpec`/`RuntimeHandle`
+  (with `backend`); a new backend registers a driver with the Mock
+  Master and nothing else in the lifecycle changes.
+- **`ModelAdapter` hooks** (`model/adapters/`) — `new_cache`,
+  `embed_tokens`, `forward_blocks`, `finalize`: the only
+  architecture-specific surface; supporting a new HF family means a new
+  adapter, nothing else.
+- **Canonical domain ↔ wire mapping** (`protocol/`) — domain dataclasses
+  in `protocol/domain.py`, one translation point in
+  `protobuf_mapper.py`, `StageTransport` port implemented by
+  `SerializedStageBoundary`.
+- **Master-side clients** (`control/mock/client.py`) — `RemotePipeline`/
+  `RemoteGenerationDriver` for the shard pipeline, `VLLMClient` for
+  OpenAI-compatible test requests.
 
 ---
 
@@ -353,3 +401,5 @@ HF models (e.g. 4-layer Llama/Qwen2 with small hidden sizes).
 0D canonical shard protocol → 0E local/loopback pipeline → 0F runtime server →
 0G containerized shard runtime → 0H Mock Master → 0I multi-container pipeline
 (primary Phase 0 gate) → 0J vLLM runtime integration → 0K regression & freeze.
+
+**Status: Phase 0 complete (0K freeze).**
