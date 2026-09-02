@@ -102,6 +102,20 @@ def container_network_kwargs(network: str, runtime_id: str) -> dict[str, Any]:
     }
 
 
+def nvidia_gpu_device_request() -> docker.types.DeviceRequest:
+    """The NVIDIA DeviceRequest equivalent of ``docker run --gpus all``.
+
+    ``count=-1`` with the ``gpu`` capability hands every host GPU to the
+    container through the NVIDIA Container Toolkit — the same wiring that
+    was validated manually before the drivers gained GPU support. Which
+    visible device a runtime actually uses stays its own concern
+    (``config.device.index`` inside shard runtimes,
+    ``CUDA_VISIBLE_DEVICES`` for vLLM); Phase 0 does no physical GPU
+    remapping or placement here.
+    """
+    return docker.types.DeviceRequest(count=-1, capabilities=[["gpu"]])
+
+
 async def stop_and_remove_container(
     docker_client: Any, container_id: str, *, timeout_s: int = 10
 ) -> None:

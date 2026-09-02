@@ -185,7 +185,34 @@ async def test_start_translates_optional_knobs(tmp_path: Path) -> None:
         "--tensor-parallel-size",
         "2",
     ]
+    # device_index keeps its meaning via CUDA_VISIBLE_DEVICES; the GPU
+    # DeviceRequest is attached alongside, no physical remapping.
     assert call["environment"] == {"CUDA_VISIBLE_DEVICES": "1"}
+    (request,) = call["device_requests"]
+    assert request == docker.types.DeviceRequest(
+        count=-1, capabilities=[["gpu"]]
+    )
+
+
+async def test_start_always_attaches_nvidia_gpus_and_host_ipc(
+    tmp_path: Path,
+) -> None:
+    """vLLM is GPU-bound: every launch gets `--gpus all` + host IPC."""
+    docker_client = FakeDockerClient()
+    driver = VLLMRuntimeDriver(
+        docker_client=docker_client, model_cache_dir=tmp_path
+    )
+
+    await driver.start(make_spec())
+
+    (call,) = docker_client.containers.run_calls
+    (request,) = call["device_requests"]
+    assert request == docker.types.DeviceRequest(
+        count=-1, capabilities=[["gpu"]]
+    )
+    assert call["ipc_mode"] == "host"
+    # No device_index set -> no CUDA_VISIBLE_DEVICES pinning.
+    assert "environment" not in call
 
 
 async def test_start_without_host_port_uses_network_endpoint(tmp_path: Path) -> None:

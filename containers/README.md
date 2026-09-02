@@ -39,7 +39,12 @@ docker run --rm \
 ```
 
 CUDA adds `--gpus all` (NVIDIA Container Toolkit); Jetson adds
-`--runtime nvidia`.
+`--runtime nvidia`. Driver-launched containers get the same wiring through
+the Docker SDK: `EdgeShardShardRuntimeDriver` attaches an NVIDIA
+`DeviceRequest` (`count=-1`, `[["gpu"]]` — the `--gpus all` equivalent)
+whenever the mounted config sets `device.type: cuda`, and
+`VLLMRuntimeDriver` always attaches it (plus `ipc_mode=host`), so GPU
+launches behave exactly like the manually validated `docker run` forms.
 
 Container-side config requirements (the driver rejects configs that violate
 them before launch):

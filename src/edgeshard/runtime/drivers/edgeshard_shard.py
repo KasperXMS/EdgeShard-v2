@@ -5,7 +5,9 @@ The driver launches one container per shard stage via the Docker SDK (spec
 read-only, never baked (spec 21.1); managed containers carry the spec 21.5
 labels so orphaned Phase 0 containers can be found and cleaned up.
 Readiness is the ShardRuntime ``GetRuntimeInfo`` RPC (spec 17.1), matching
-the process-level runtime from 0F.
+the process-level runtime from 0F. Configs with ``device.type: cuda``
+launch with every host GPU attached (NVIDIA DeviceRequest, the SDK
+equivalent of ``--gpus all``); CPU configs launch without one.
 """
 
 from __future__ import annotations
@@ -25,6 +27,7 @@ from edgeshard.runtime.drivers.base import (
     RuntimeHandle,
     RuntimeSpec,
     container_network_kwargs,
+    nvidia_gpu_device_request,
     published_host_port,
     stop_and_remove_container,
 )
@@ -117,6 +120,11 @@ class EdgeShardShardRuntimeDriver:
                 kwargs["ports"] = {f"{container_port}/tcp": spec.host_port or None}
             if spec.network is not None:
                 kwargs.update(container_network_kwargs(spec.network, spec.runtime_id))
+            if config.device.type == "cuda":
+                # All host GPUs, like the manually validated `--gpus all`;
+                # the runtime process itself picks `cuda:{device.index}`
+                # (no physical remapping here). CPU configs get nothing.
+                kwargs["device_requests"] = [nvidia_gpu_device_request()]
             return self._docker.containers.run(spec.image, **kwargs)
 
         container = await asyncio.to_thread(run)

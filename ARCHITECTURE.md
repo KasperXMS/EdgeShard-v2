@@ -242,7 +242,13 @@ in Phase 0.
   loopback binds and spec/config identity mismatches fail explicitly. The
   driver publishes the config's own `server.listen_port` and reuses the
   GetRuntimeInfo readiness probe — the same signal for process and container
-  runtimes.
+  runtimes. GPU wiring lives in the shared driver helper
+  `nvidia_gpu_device_request()` (`docker.types.DeviceRequest`, `count=-1`
+  with the `gpu` capability — the SDK equivalent of the manually validated
+  `docker run --gpus all`): configs with `device.type: cuda` launch with
+  every host GPU attached, CPU configs launch without; `device.index` keeps
+  its existing meaning inside the runtime process (its torch device), with
+  no physical GPU remapping in Phase 0.
 - **Models mount at `/models:ro`; configs mount read-only** (spec 21.1).
   Managed containers carry the spec 21.5 labels
   (`io.edgeshard.managed/execution_id/runtime_id/backend`) so orphaned
@@ -329,7 +335,10 @@ in Phase 0.
   `None` there. The manifest's `vllm:` section carries optional engine
   knobs (`max_model_len`, `tensor_parallel_size`) that the driver
   translates to official CLI arguments; `device.index` maps to
-  `CUDA_VISIBLE_DEVICES`.
+  `CUDA_VISIBLE_DEVICES`. vLLM is GPU-bound: every launch attaches the
+  same NVIDIA DeviceRequest (`--gpus all` equivalent) and runs with
+  `ipc_mode="host"`, matching the manually validated launch; the image
+  itself stays manifest-configurable (`RuntimeSpec.image`).
 - **vLLM E2E is double-gated, never silently dropped.**
   `tests/container/test_vllm_runtime.py` requires both a Docker daemon
   and `EDGESHARD_VLLM_IMAGE` (a pinned official image on a GPU host —

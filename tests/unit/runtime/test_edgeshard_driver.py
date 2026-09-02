@@ -41,7 +41,7 @@ RUNTIME_INFO = RuntimeInfo(
 
 def write_container_config(
     tmp_path: Path, *, listen_host: str = "0.0.0.0", execution_id: str = EXECUTION_ID,
-    runtime_id: str = RUNTIME_ID,
+    runtime_id: str = RUNTIME_ID, device: dict[str, Any] | None = None,
 ) -> Path:
     payload = {
         "runtime": {
@@ -59,6 +59,8 @@ def write_container_config(
         "pipeline": {"stage_index": 0, "stage_count": 1},
         "server": {"listen_host": listen_host, "listen_port": CONTAINER_PORT},
     }
+    if device is not None:
+        payload["device"] = device
     path = tmp_path / "runtime.yaml"
     path.write_text(yaml.safe_dump(payload), encoding="utf-8")
     return path
@@ -205,6 +207,38 @@ async def test_start_attaches_network_with_runtime_alias(tmp_path: Path) -> None
     endpoints = call["networking_config"]
     assert set(endpoints) == {"edgeshard-exec-e"}
     assert endpoints["edgeshard-exec-e"]["Aliases"] == [RUNTIME_ID]
+
+
+async def test_start_cuda_config_attaches_nvidia_gpus(tmp_path: Path) -> None:
+    """A CUDA shard config launches with the `--gpus all` DeviceRequest."""
+    docker_client = FakeDockerClient()
+    config_path = write_container_config(
+        tmp_path, device={"type": "cuda", "index": 0}
+    )
+    driver = EdgeShardShardRuntimeDriver(
+        docker_client=docker_client, model_cache_dir=tmp_path
+    )
+
+    await driver.start(make_spec(config_path))
+
+    (call,) = docker_client.containers.run_calls
+    (request,) = call["device_requests"]
+    assert request == docker.types.DeviceRequest(
+        count=-1, capabilities=[["gpu"]]
+    )
+
+
+async def test_start_cpu_config_attaches_no_gpus(tmp_path: Path) -> None:
+    """The default CPU config launches without any device request."""
+    docker_client = FakeDockerClient()
+    driver = EdgeShardShardRuntimeDriver(
+        docker_client=docker_client, model_cache_dir=tmp_path
+    )
+
+    await driver.start(make_spec(write_container_config(tmp_path)))
+
+    (call,) = docker_client.containers.run_calls
+    assert "device_requests" not in call
 
 
 async def test_start_rejects_foreign_spec(tmp_path: Path) -> None:

@@ -9,6 +9,11 @@ never modified to look like an EdgeShard shard runtime (spec 20.2).
 
 Readiness is ``GET /v1/models`` answering 200: vLLM opens its API server
 only once the model weights are loaded.
+
+vLLM is GPU-bound: every launch attaches all host GPUs (NVIDIA
+DeviceRequest, the SDK equivalent of ``--gpus all``) and uses the host
+IPC namespace, the same wiring that was validated manually. Which GPU a
+runtime serves on stays ``CUDA_VISIBLE_DEVICES`` (``device_index``).
 """
 
 from __future__ import annotations
@@ -34,6 +39,7 @@ from edgeshard.runtime.drivers.base import (
     RuntimeSpec,
     container_network_kwargs,
     host_model_path,
+    nvidia_gpu_device_request,
     published_host_port,
     stop_and_remove_container,
 )
@@ -112,6 +118,13 @@ class VLLMRuntimeDriver:
                     "io.edgeshard.runtime_id": spec.runtime_id,
                     "io.edgeshard.backend": spec.backend,
                 },
+                # vLLM is GPU-bound in Phase 0: every container gets all
+                # host GPUs (the SDK equivalent of `--gpus all`) and the
+                # host IPC namespace, matching the manually validated
+                # launch. `device_index` still narrows visibility via
+                # CUDA_VISIBLE_DEVICES — no physical remapping.
+                "device_requests": [nvidia_gpu_device_request()],
+                "ipc_mode": "host",
             }
             if spec.device_index is not None:
                 kwargs["environment"] = {"CUDA_VISIBLE_DEVICES": str(spec.device_index)}
