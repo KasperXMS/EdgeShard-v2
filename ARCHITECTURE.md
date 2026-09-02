@@ -150,23 +150,30 @@ in Phase 0.
   fields for later extension. Sampling is deterministic greedy, driven outside
   the shard runtime (`GenerationDriver`).
 - **Canonical execution state lives in `inference/`** (`InferencePhase`,
-  `ExecutionContext`, `ShardState`, `LogitsOutput`). Backends reconstruct
-  whatever they need (attention masks, RoPE inputs) from this metadata;
+  `ExecutionContext`, `ShardState`, `LogitsOutput`). Backends derive
+  whatever they need (positions, cache placement) from this metadata;
   backend-specific masks never cross shard boundaries (spec 14.1).
 - **Execution is split adapter hooks + canonical orchestration.** The spec 9.2
   sketch shows `execute_prefill/decode` on the adapter; that would invert the
   dependency direction (`model` → `inference`). Instead the adapter exposes
-  native hooks (`new_cache`, `embed_tokens`, `forward_blocks`, `finalize`)
-  containing every HF-version-specific detail — layer call signature, rotary
-  invocation, cache API, causal mask reconstruction, skeleton-local
-  `self_attn.layer_idx` repair — while `ShardModule` orchestrates sessions,
-  positions, and canonical outputs.
-- **Direct layer execution reconstructs causal masking.** Layers called
-  outside the full HF model get no model-level mask, so the adapter builds a
-  4D additive dense causal mask from canonical position metadata and cache
-  length (`finfo(dtype).min` fill; decode uses an all-keep mask). Phase 0 test
-  sequences stay within any sliding window, so windowed attention models
-  behave identically; window-specific masks are later work.
+  native hooks (`new_cache`, `embed_tokens`, `forward_blocks`, `finalize`,
+  `restore_high_precision_buffers`) containing every HF-version-specific
+  detail — backbone delegation, cache API, skeleton-local
+  `self_attn.layer_idx` repair, float32 rotary tables — while `ShardModule`
+  orchestrates sessions, positions, and canonical outputs.
+- **Block execution delegates to the HF backbone forward.** `forward_blocks`
+  calls the shard's trimmed backbone at model level
+  (`inputs_embeds=hidden_states`, `position_ids`, `cache_position`,
+  `past_key_values`), so Hugging Face handles rotary embeddings, causal
+  masking, attention dispatch, and the layer loop — shards run the same
+  kernels as the untouched reference model, which is what makes FP32
+  equivalence and bitwise BF16 alignment hold. Norm ownership: the backbone
+  ends with `model.norm`; the output shard keeps the real norm, so
+  `finalize` runs only the LM head (non-final skeletons replace the norm
+  with `Identity`, so no norm runs twice). Reduced-precision shards
+  recompute the rotary inverse-frequency table in float32 after placement
+  (`restore_high_precision_buffers`), matching what `from_pretrained`
+  keeps in float32.
 - **`ShardModule` is device/dtype-parametrized.** All execution derives
   devices and dtypes from the module and its inputs (no hardcoded `cpu`),
   so the same code serves the CPU development tier and GPU containers.
@@ -370,9 +377,11 @@ one requires updating its tests and this document in the same change.
   (with `backend`); a new backend registers a driver with the Mock
   Master and nothing else in the lifecycle changes.
 - **`ModelAdapter` hooks** (`model/adapters/`) — `new_cache`,
-  `embed_tokens`, `forward_blocks`, `finalize`: the only
-  architecture-specific surface; supporting a new HF family means a new
-  adapter, nothing else.
+  `embed_tokens`, `forward_blocks` (HF backbone delegation), `finalize`
+  (LM head only; the backbone pass owns the final norm),
+  `restore_high_precision_buffers` (float32 rotary tables under reduced
+  precision): the only architecture-specific surface; supporting a new HF
+  family means a new adapter, nothing else.
 - **Canonical domain ↔ wire mapping** (`protocol/`) — domain dataclasses
   in `protocol/domain.py`, one translation point in
   `protobuf_mapper.py`, `StageTransport` port implemented by
@@ -386,10 +395,12 @@ one requires updating its tests and this document in the same change.
 ## Test tiers
 
 - **Tier 1 (every PR, CPU):** adapters, selective loading, shard execution,
-  KV/session behavior, protobuf mapping, tensor codec, gRPC, CPU
-  multi-container pipeline with locally generated tiny models, lint/types.
-- **Tier 2 (x86 NVIDIA, nightly/on demand):** CUDA shard runtime, FP16/BF16,
-  host/container equivalence, real small HF model smoke tests, vLLM driver.
+  KV/session behavior, protobuf mapping, tensor codec, gRPC, bitwise BF16
+  alignment with the HF reference, CPU multi-container pipeline with locally
+  generated tiny models, lint/types.
+- **Tier 2 (x86 NVIDIA, nightly/on demand):** CUDA shard runtime, FP16/BF16
+  on GPU, host/container equivalence, real small HF model smoke tests,
+  vLLM driver.
 - **Tier 3 (Jetson runner):** Jetson container build/run, GPU access,
   selective loading, prefill/decode, basic multi-runtime compatibility.
 

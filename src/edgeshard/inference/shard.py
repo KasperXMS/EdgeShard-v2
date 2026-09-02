@@ -77,6 +77,7 @@ class ShardModule:
         SafetensorsWeightLoader().load_shard(module, source, layout, shard)
         device_obj = torch.device(device)
         module.to(device=device_obj, dtype=dtype)
+        adapter.restore_high_precision_buffers(module)
         module.eval()
         return cls(
             adapter=adapter,

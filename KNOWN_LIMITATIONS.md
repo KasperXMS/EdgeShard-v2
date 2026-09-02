@@ -10,10 +10,11 @@ unsupported inputs fail explicitly.
 - Development and Tier 1 run CPU-only. Docker, CUDA, and Jetson coverage
   live in skip-gated tests (`tests/container/`, `integration` marker); on a
   host without Docker they skip with an explicit reason, never run.
-- GPU and half-precision (fp16/bf16) equivalence are Tier 2/3 work and are
-  **not** verified on the CPU development host. The default dtype is fp32;
-  fp16/bf16 are configurable (`inference.dtype`) but their equivalence
-  evidence comes from GPU tiers.
+- GPU and container half-precision runs are Tier 2/3 work. On the CPU
+  development host, BF16 shard equivalence is verified **bitwise** against
+  `from_pretrained(..., torch_dtype=bfloat16)` (Tier 1: single shard,
+  two-shard split, local pipeline, and remote gRPC runtime); fp16 and CUDA
+  evidence come from the GPU tiers. The default dtype is fp32.
 - The vLLM E2E (`tests/container/test_vllm_runtime.py`) is double-gated:
   Docker **and** `EDGESHARD_VLLM_IMAGE` (a pinned official image, e.g.
   `vllm/vllm-openai:v0.28.0`) on a GPU host. vLLM itself is GPU-bound.
@@ -26,8 +27,8 @@ unsupported inputs fail explicitly.
   later extension, but no batched path is implemented or tested.
 - Sampling is deterministic greedy only (temperature 0 for vLLM test
   requests). Sampling lives outside the shard runtimes entirely.
-- Sliding-window-attention models are validated only with prompts inside a
-  single window; window-specific masks are later work.
+- Sliding-window-attention masking is delegated to the HF backbone like any
+  other masking, but tests only validate prompts inside a single window.
 - No streaming: each Prefill/Decode is one request/reply.
 
 ## Protocol and transport

@@ -39,29 +39,20 @@ def keep_layer_range(layers: nn.ModuleList, blocks: BlockRange) -> None:
     del layers[: blocks.start]
 
 
-def causal_attention_mask(q_len: int, kv_len: int, reference: torch.Tensor) -> torch.Tensor:
-    """Build the 4D additive dense causal mask for direct layer execution.
+def _rope_base(config: PretrainedConfig) -> float:
+    """Read the rotary base frequency, preferring the canonical rope table."""
+    rope_parameters = getattr(config, "rope_parameters", None)
+    if isinstance(rope_parameters, dict) and "rope_theta" in rope_parameters:
+        return float(rope_parameters["rope_theta"])
+    return float(getattr(config, "rope_theta", 10000.0))
 
-    Layers called outside the full HF model receive no model-level causal
-    masking, so it is reconstructed here from canonical position metadata
-    (spec 14.1): query position ``i`` attends to key positions
-    ``j <= i + (kv_len - q_len)``. Entries are ``0`` where attention is kept
-    and ``finfo(dtype).min`` elsewhere. Shape is ``(1, 1, q_len, kv_len)``;
-    device and dtype follow ``reference`` so the same code serves CPU and
-    GPU runtimes.
 
-    Phase 0 uses dense causal masks: test sequences stay within any sliding
-    window, so windowed variants are observationally identical here.
-    """
-    if q_len == 1:
-        # A single decode query attends to every cached key plus itself.
-        return reference.new_zeros((1, 1, 1, kv_len))
-    i = torch.arange(q_len, device=reference.device).unsqueeze(1)
-    j = torch.arange(kv_len, device=reference.device).unsqueeze(0)
-    keep = j <= i + (kv_len - q_len)
-    mask = reference.new_zeros((q_len, kv_len))
-    mask = mask.masked_fill(~keep, torch.finfo(reference.dtype).min)
-    return mask.unsqueeze(0).unsqueeze(0)
+def _rope_head_dim(config: PretrainedConfig) -> int:
+    """Rotary dimension per head: ``head_dim`` when set, else derived."""
+    head_dim = getattr(config, "head_dim", None)
+    if head_dim:
+        return int(head_dim)
+    return int(config.hidden_size // config.num_attention_heads)
 
 
 class ModelAdapter(Protocol):
@@ -106,7 +97,19 @@ class ModelAdapter(Protocol):
         ...
 
     def finalize(self, module: nn.Module, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Run the output stage (final norm + LM head) producing logits."""
+        """Run the output stage (LM head) producing logits.
+
+        The final norm is applied by ``forward_blocks`` as part of the HF
+        backbone pass; this hook must not apply it again.
+        """
+        ...
+
+    def restore_high_precision_buffers(self, module: nn.Module) -> None:
+        """Re-materialize buffers HF keeps in float32 after dtype placement.
+
+        Called after the blanket ``module.to(device, dtype)`` so reduced
+        precision shards still reproduce the reference model's numerics.
+        """
         ...
 
 
@@ -199,33 +202,67 @@ class StandardDecoderLMAdapter:
         positions: torch.Tensor,
         cache: Any,
     ) -> torch.Tensor:
-        """Run the retained layers with locally reconstructed causal masking.
+        """Run the shard's Transformer blocks via the HF backbone forward.
 
-        Direct layer calls bypass the HF model-level mask (spec 14.1), so the
-        dense causal mask is rebuilt from ``positions`` and the cache's current
-        sequence length. Rotary embeddings are produced once and passed to
-        every layer via ``position_embeddings``.
+        ``forward_blocks`` delegates to the backbone's model-level forward
+        with ``inputs_embeds=hidden_states``: Hugging Face handles rotary
+        embeddings, causal masking, attention dispatch, ``cache_position``
+        bookkeeping, and the loop over the shard's retained (skeleton-local)
+        layers, so shards execute with the same kernels as the untouched
+        reference model. The session cache is updated in place.
+
+        Norm ownership: the backbone's final operation is ``model.norm``.
+        The output shard's skeleton keeps the real norm, so its backbone
+        pass already normalizes; non-final skeletons replace the norm with
+        ``Identity``, so their output stays pre-norm. ``finalize`` runs the
+        LM head only.
         """
         backbone: Any = module.model
-        position_embeddings = backbone.rotary_emb(hidden_states, positions)
         q_len = int(hidden_states.shape[1])
         past_length: int = int(cache.get_seq_length())
-        mask = causal_attention_mask(q_len, past_length + q_len, hidden_states)
-        hidden = hidden_states
-        for layer in backbone.layers:
-            hidden = layer(
-                hidden,
-                attention_mask=mask,
-                position_ids=positions,
-                past_key_values=cache,
-                use_cache=True,
-                position_embeddings=position_embeddings,
-            )
-        result: torch.Tensor = hidden
+        cache_position = torch.arange(
+            past_length, past_length + q_len, device=hidden_states.device
+        )
+        output = backbone(
+            inputs_embeds=hidden_states,
+            position_ids=positions,
+            cache_position=cache_position,
+            past_key_values=cache,
+            use_cache=True,
+        )
+        result: torch.Tensor = output.last_hidden_state
         return result
 
     def finalize(self, module: nn.Module, hidden_states: torch.Tensor) -> torch.Tensor:
-        backbone: Any = module.model
+        """Run the LM head only; the backbone pass already applied the norm."""
         head: Any = module.lm_head
-        logits: torch.Tensor = head(backbone.norm(hidden_states))
+        logits: torch.Tensor = head(hidden_states)
         return logits
+
+    def restore_high_precision_buffers(self, module: nn.Module) -> None:
+        """Recompute rotary inverse frequencies in float32 after placement.
+
+        Hugging Face keeps ``rotary_emb.inv_freq`` in float32 even for
+        reduced-precision checkpoints and casts only the cos/sin tables to
+        the compute dtype inside the rotary forward. A blanket
+        ``module.to(dtype)`` would round the frequency table itself,
+        perturbing every attention phase and breaking BF16 alignment with the
+        reference. Recomputing the table in float32 restores the exact HF
+        values. FP32 shards are left untouched.
+        """
+        backbone: Any = module.model
+        rotary = getattr(backbone, "rotary_emb", None)
+        if rotary is None:
+            return
+        inv_freq = getattr(rotary, "inv_freq", None)
+        if not isinstance(inv_freq, torch.Tensor) or inv_freq.dtype == torch.float32:
+            return
+        config: PretrainedConfig = module.config
+        head_dim = _rope_head_dim(config)
+        base = _rope_base(config)
+        arange = torch.arange(0, head_dim, 2, dtype=torch.float32)
+        table = 1.0 / (base ** (arange / head_dim))
+        table = table.to(inv_freq.device)
+        rotary.inv_freq = table
+        if hasattr(rotary, "original_inv_freq"):
+            rotary.original_inv_freq = table.clone()
