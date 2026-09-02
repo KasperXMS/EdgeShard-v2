@@ -19,7 +19,9 @@
 #   server.listen_host: 0.0.0.0
 #   device.type: cuda
 
-FROM pytorch/pytorch:2.13.0-cuda13.2-cudnn9-runtime
+FROM pytorch/pytorch:2.13.0-cuda12.6-cudnn9-runtime
+
+ENV PIP_BREAK_SYSTEM_PACKAGES=1
 
 COPY --from=ghcr.io/astral-sh/uv:0.12.7 /uv /uvx /usr/local/bin/
 
