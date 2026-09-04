@@ -6,14 +6,15 @@
 # manual Docker commands. The partition is provided here; the master only
 # validates it.
 #
-# Model paths are container-side: the host model cache is mounted at
-# /models (spec 21.1), so /models/tiny-llama is <model-cache>/tiny-llama
-# on the host.
+# Model identity is plan-level only: the manifest carries the model id and
+# a local name, never a host path. Each worker resolves the local name
+# against its own model store root (mounted at /models, spec 21.1), so
+# /models/tiny-llama is <model_root>/tiny-llama on every worker.
 execution_id: exec-example
 
 model:
   id: tiny/llama
-  path: /models/tiny-llama
+  local_name: tiny-llama
 
 runtimes:
   - id: shard-0

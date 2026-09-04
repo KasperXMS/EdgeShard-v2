@@ -24,6 +24,7 @@ from edgeshard.model.errors import ModelSourceError
 from edgeshard.runtime.config import ShardRuntimeConfig
 from edgeshard.runtime.drivers.base import DriverError, RuntimeHandle, RuntimeSpec
 from edgeshard.runtime.drivers.vllm import DEFAULT_VLLM_IMAGE, VLLMRuntimeSpec
+from edgeshard.runtime.model_store import ModelStore
 
 EXECUTION_ID = "exec-mock"
 NETWORK = network_name(EXECUTION_ID)
@@ -106,7 +107,7 @@ def manifest_payload(
         second["image"] = second_image
     return {
         "execution_id": EXECUTION_ID,
-        "model": {"id": "tiny/llama", "path": f"/models/{model_dir_name}"},
+        "model": {"id": "tiny/llama", "local_name": model_dir_name},
         "runtimes": [
             {
                 "id": "shard-0",
@@ -144,7 +145,7 @@ def make_master(
 ) -> MockMaster:
     return MockMaster(
         docker_client=docker_client,
-        model_cache_dir=tiny_llama_dir.parent,
+        model_store=ModelStore(model_root=tiny_llama_dir.parent),
         work_dir=tmp_path / "work",
         default_image=DEFAULT_IMAGE,
         drivers=drivers,
@@ -323,26 +324,21 @@ async def test_deploy_validates_partition_upper_bound(
     assert driver.start_calls == []
 
 
-async def test_deploy_rejects_model_path_outside_mount(
+def test_manifest_rejects_local_name_escaping_the_store(
     tiny_llama_dir: Path, tmp_path: Path
 ) -> None:
-    master = make_master(
-        FakeDockerClient(),
-        {"edgeshard_shard": RecordingDriver()},
-        tiny_llama_dir,
-        tmp_path,
-    )
+    # Plans carry only a local name; anything but a single safe segment is
+    # rejected at parse time, before any deployment work starts.
     payload = manifest_payload(tiny_llama_dir.name)
-    payload["model"]["path"] = "/weights/tiny-llama"
-    manifest = DeploymentManifest.model_validate(payload)
-    with pytest.raises(ManifestError, match="model mount"):
-        await master.deploy(manifest)
+    payload["model"]["local_name"] = "../escape"
+    with pytest.raises(ValueError, match="single path segment"):
+        DeploymentManifest.model_validate(payload)
 
 
 async def test_deploy_rejects_missing_model_dir(tmp_path: Path) -> None:
     master = MockMaster(
         docker_client=FakeDockerClient(),
-        model_cache_dir=tmp_path / "empty-cache",
+        model_store=ModelStore(model_root=tmp_path / "empty-cache"),
         work_dir=tmp_path / "work",
         default_image=DEFAULT_IMAGE,
         drivers={"edgeshard_shard": RecordingDriver()},

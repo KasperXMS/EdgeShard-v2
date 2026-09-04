@@ -39,7 +39,11 @@ docker run --rm \
 ```
 
 CUDA adds `--gpus all` (NVIDIA Container Toolkit); Jetson adds
-`--runtime nvidia`. Driver-launched containers get the same wiring through
+`--runtime nvidia`. `$EDGESHARD_MODEL_CACHE` is a convention for manual
+launches; driver-launched (managed) deploys mount each worker's own
+`ModelStore.model_root` (default `/data/edgeshard-models`) read-only at
+`/models`, so containers see the same model paths on every host.
+Driver-launched containers get the same wiring through
 the Docker SDK: `EdgeShardShardRuntimeDriver` attaches an NVIDIA
 `DeviceRequest` (`count=-1`, `[["gpu"]]` — the `--gpus all` equivalent)
 whenever the mounted config sets `device.type: cuda`, and

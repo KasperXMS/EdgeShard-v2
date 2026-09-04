@@ -51,6 +51,7 @@ from edgeshard.runtime.drivers.vllm import (
     VLLMRuntimeDriver,
     VLLMRuntimeSpec,
 )
+from edgeshard.runtime.model_store import ModelStore
 
 
 class MockMasterError(EdgeShardError):
@@ -86,21 +87,21 @@ class MockMaster:
         self,
         *,
         docker_client: Any,
-        model_cache_dir: Path,
+        model_store: ModelStore | None = None,
         work_dir: Path,
         default_image: str,
         drivers: Mapping[str, RuntimeDriver] | None = None,
     ) -> None:
         self._docker = docker_client
-        self._model_cache_dir = Path(model_cache_dir)
+        self._model_store = model_store if model_store is not None else ModelStore()
         self._work_dir = Path(work_dir)
         self._default_image = default_image
         self._drivers: dict[str, RuntimeDriver] = {
             "edgeshard_shard": EdgeShardShardRuntimeDriver(
-                docker_client=docker_client, model_cache_dir=self._model_cache_dir
+                docker_client=docker_client, model_store=self._model_store
             ),
             "vllm": VLLMRuntimeDriver(
-                docker_client=docker_client, model_cache_dir=self._model_cache_dir
+                docker_client=docker_client, model_store=self._model_store
             ),
         }
         if drivers:
@@ -201,7 +202,9 @@ class MockMaster:
             execution_id=manifest.execution_id,
             image=runtime.image or DEFAULT_VLLM_IMAGE,
             model_id=manifest.model.id,
-            model_path=manifest.model.path,
+            model_path=self._model_store.container_path(
+                manifest.model.resolved_local_name
+            ),
             host_port=0,
             network=network,
             device_index=runtime.device.index,
@@ -220,7 +223,7 @@ class MockMaster:
         reads the model's ``config.json`` — never its weights.
         """
         source = ModelSource(
-            path=host_model_path(manifest, self._model_cache_dir),
+            path=host_model_path(manifest, self._model_store),
             model_id=manifest.model.id,
         )
         source.ensure_local()

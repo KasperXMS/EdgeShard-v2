@@ -4,7 +4,10 @@ The master never writes host IP addresses into shard configs (spec 23):
 downstream endpoints are Docker-network aliases
 (``<runtime-id>:SHARD_LISTEN_PORT``), every generated config binds the
 same in-network listen port, and only the entry runtime ever gets a
-published host port.
+published host port. It never writes host model paths either: plans
+identify models by id and local name, generated configs carry the uniform
+container path under ``/models``, and each worker's ModelStore resolves
+the local name to its own host directory.
 """
 
 from __future__ import annotations
@@ -16,13 +19,7 @@ import yaml
 
 from edgeshard.control.mock.manifest import DeploymentManifest, ManifestError
 from edgeshard.runtime.config import ShardRuntimeConfig
-from edgeshard.runtime.drivers.base import (
-    MODEL_MOUNT,
-    DriverError,
-)
-from edgeshard.runtime.drivers.base import (
-    host_model_path as container_host_model_path,
-)
+from edgeshard.runtime.model_store import ModelStore, container_model_path
 
 SHARD_LISTEN_PORT = 50051
 """In-network listen port of every deployed shard runtime (spec 23 example)."""
@@ -33,20 +30,14 @@ def network_name(execution_id: str) -> str:
     return f"edgeshard-exec-{execution_id}"
 
 
-def host_model_path(manifest: DeploymentManifest, model_cache_dir: Path) -> Path:
-    """Resolve the manifest's container model path on the host model cache.
+def host_model_path(manifest: DeploymentManifest, model_store: ModelStore) -> Path:
+    """Resolve the manifest's model on the host against a worker's store.
 
-    ``/models/<rel>`` inside the container corresponds to
-    ``model_cache_dir/<rel>`` on the host (the driver mounts the cache
-    directory at ``/models``).
+    The plan carries only the model's local name; the worker-local store
+    maps it to ``model_root/<local-name>`` (the driver mounts ``model_root``
+    at ``/models``).
     """
-    try:
-        return container_host_model_path(manifest.model.path, model_cache_dir)
-    except DriverError as exc:
-        raise ManifestError(
-            f"manifest model path {manifest.model.path.as_posix()!r} must live "
-            f"under the container model mount {MODEL_MOUNT!r}"
-        ) from exc
+    return model_store.host_path(manifest.model.resolved_local_name)
 
 
 def build_runtime_config_payload(
@@ -72,7 +63,10 @@ def build_runtime_config_payload(
             "runtime_id": runtime.id,
             "execution_id": manifest.execution_id,
         },
-        "model": {"id": manifest.model.id, "path": manifest.model.path.as_posix()},
+        "model": {
+            "id": manifest.model.id,
+            "path": container_model_path(manifest.model.resolved_local_name).as_posix(),
+        },
         "shard": {
             "start_block": shard.start,
             "end_block": shard.end,

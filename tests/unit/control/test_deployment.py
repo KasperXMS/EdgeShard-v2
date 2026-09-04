@@ -10,8 +10,6 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-import pytest
-
 from edgeshard.control.mock.deployment import (
     SHARD_LISTEN_PORT,
     build_runtime_config_payload,
@@ -19,16 +17,17 @@ from edgeshard.control.mock.deployment import (
     network_name,
     write_runtime_configs,
 )
-from edgeshard.control.mock.manifest import DeploymentManifest, ManifestError
+from edgeshard.control.mock.manifest import DeploymentManifest
 from edgeshard.runtime.config import ShardRuntimeConfig
+from edgeshard.runtime.model_store import ModelStore
 
 
 def make_manifest(
-    *, model_path: str = "/models/tiny-llama", runtimes: list[dict[str, Any]] | None = None
+    *, local_name: str = "tiny-llama", runtimes: list[dict[str, Any]] | None = None
 ) -> DeploymentManifest:
     payload: dict[str, Any] = {
         "execution_id": "exec-gen",
-        "model": {"id": "tiny/llama", "path": model_path},
+        "model": {"id": "tiny/llama", "local_name": local_name},
         "runtimes": runtimes
         or [
             {
@@ -118,32 +117,15 @@ def test_generated_payloads_round_trip(tmp_path: Path) -> None:
     assert (tmp_path / "shard-1.yaml").exists()
 
 
-def test_host_model_path_maps_container_mount(tmp_path: Path) -> None:
-    manifest = make_manifest(model_path="/models/tiny-llama")
-    assert host_model_path(manifest, tmp_path) == tmp_path / "tiny-llama"
+def test_host_model_path_maps_local_name_into_the_store(tmp_path: Path) -> None:
+    manifest = make_manifest(local_name="tiny-llama")
+    store = ModelStore(model_root=tmp_path)
+    assert host_model_path(manifest, store) == tmp_path / "tiny-llama"
 
 
-def test_host_model_path_supports_root_mount(tmp_path: Path) -> None:
-    manifest = make_manifest(
-        model_path="/models",
-        runtimes=[
-            {
-                "id": "shard-0",
-                "backend": "edgeshard_shard",
-                "shard": {
-                    "start": 0,
-                    "end": 4,
-                    "include_input_stage": True,
-                    "include_output_stage": True,
-                },
-            }
-        ],
-    )
-    assert host_model_path(manifest, tmp_path) == tmp_path
-
-
-def test_host_model_path_rejects_paths_outside_mount(tmp_path: Path) -> None:
-    manifest = make_manifest(model_path="/models/tiny-llama")
-    manifest.model.path = Path("/weights/tiny-llama")
-    with pytest.raises(ManifestError, match="model mount"):
-        host_model_path(manifest, tmp_path)
+def test_host_model_path_follows_each_store_root(tmp_path: Path) -> None:
+    manifest = make_manifest(local_name="tiny-llama")
+    store_a = ModelStore(model_root=tmp_path / "worker-a")
+    store_b = ModelStore(model_root=tmp_path / "worker-b")
+    assert host_model_path(manifest, store_a) == tmp_path / "worker-a" / "tiny-llama"
+    assert host_model_path(manifest, store_b) == tmp_path / "worker-b" / "tiny-llama"

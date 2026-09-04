@@ -131,8 +131,10 @@ in Phase 0.
   performance in Phase 0).
 - **Phase 0 gRPC is a correctness/reference transport**, with an explicit
   message-size ceiling above the default (512 MiB).
-- **Models are mounted, not baked.** Containers mount the host model cache
-  read-only (`/models:ro`); runtime containers never download models.
+- **Models are mounted, not baked.** Containers mount the worker-local
+  model store root (`ModelStore.model_root`, default
+  `/data/edgeshard-models`) read-only at `/models`; runtime containers
+  never download models.
 - **Skeleton-local layer indexing.** `build_skeleton` trims the meta-device HF
   skeleton to the shard's modules; skeleton layer index `i` corresponds to
   global block `shard.blocks.start + i`. Weight loading maps checkpoint names
@@ -250,6 +252,9 @@ in Phase 0.
   its existing meaning inside the runtime process (its torch device), with
   no physical GPU remapping in Phase 0.
 - **Models mount at `/models:ro`; configs mount read-only** (spec 21.1).
+  Each driver mounts its own worker-local model store root
+  (`ModelStore.model_root`) at the same `/models` mount, so containers
+  see identical model paths no matter where the host stores weights.
   Managed containers carry the spec 21.5 labels
   (`io.edgeshard.managed/execution_id/runtime_id/backend`) so orphaned
   Phase 0 containers can be found and cleaned.
@@ -317,8 +322,10 @@ in Phase 0.
   stays untouched (spec 4.7). Readiness is `GET /v1/models` answering 200
   (vLLM opens the API once weights are loaded); `info` derives full-model
   coverage — one stage spanning every block — from `config.json`. Shared
-  driver plumbing (model-mount mapping, network-alias kwargs, stop/remove,
-  published-port probe) lives in `drivers/base.py`.
+  driver plumbing (network-alias kwargs, stop/remove, published-port
+  probe) lives in `drivers/base.py`; the container model mount point
+  (`/models`) and worker-local model path resolution live in
+  `runtime/model_store.py` (`ModelStore`, re-exported mount constant).
 - **The master stays backend-generic.** `MockMaster` holds a driver table
   keyed by backend; launch, readiness, stop, and cleanup iterate
   uniformly using `RuntimeHandle.backend` — per-backend knowledge is
@@ -370,8 +377,11 @@ one requires updating its tests and this document in the same change.
   `inference`/`server` (`extra="forbid"`), half-open block bounds,
   stage-routing rules for `next_endpoint`.
 - **`DeploymentManifest` YAML** (`control/mock/manifest.py`, spec 22.2) —
-  `execution_id`, `model`, `runtimes` (`backend: edgeshard_shard | vllm`
-  with per-backend `shard:`/`vllm:`/`device:`/`image` sections), and
+  `execution_id`, `model` (`id` plus optional `local_name`, defaulted by
+  replacing `/` in the id; no host paths — every worker resolves the
+  model against its own store root), `runtimes` (`backend:
+  edgeshard_shard | vllm` with per-backend
+  `shard:`/`vllm:`/`device:`/`image` sections), and
   `pipeline` ordering exactly the shard runtimes.
 - **ShardRuntime gRPC service** (`proto/shard_runtime.proto`,
   `PROTOCOL_VERSION = 1`) — `GetRuntimeInfo` (readiness + identity),
@@ -385,6 +395,16 @@ one requires updating its tests and this document in the same change.
   `start`/`wait_ready`/`info`/`stop` over `RuntimeSpec`/`RuntimeHandle`
   (with `backend`); a new backend registers a driver with the Mock
   Master and nothing else in the lifecycle changes.
+- **`ModelStore`** (`runtime/model_store.py`) — the worker-local model
+  storage root (`model_root`, default `/data/edgeshard-models`) and the
+  path resolution rules: `local_name` → host path
+  (`model_root/<local_name>`) and container path
+  (`/models/<local_name>`, independent of the root). Deployment plans
+  carry only `model.id`/`local_name`; each driver mounts its store root
+  read-only at `/models`, so inference and adapters never see host-path
+  differences. This is the seam for later cached-model discovery —
+  download, eviction, and multi-disk ownership move to the worker in a
+  later phase and are deliberately not implemented here.
 - **`ModelAdapter` hooks** (`model/adapters/`) — `new_cache`,
   `embed_tokens`, `forward_blocks` (HF backbone delegation), `finalize`
   (LM head only; the backbone pass owns the final norm),

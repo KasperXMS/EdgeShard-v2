@@ -25,6 +25,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from edgeshard.model.errors import EdgeShardError
 from edgeshard.runtime.config import DeviceSection, InferenceSection
+from edgeshard.runtime.model_store import ModelStoreError, validate_local_name
 
 
 class ManifestError(EdgeShardError):
@@ -76,18 +77,38 @@ class ManifestVLLM(BaseModel):
 
 
 class ManifestModel(BaseModel):
-    """Model identity; ``path`` is container-side (under ``/models``)."""
+    """Model identity of the deployment plan.
+
+    Plans carry the model id and an optional local name — never a host
+    path. Each worker resolves the local name against its own
+    :class:`~edgeshard.runtime.model_store.ModelStore`; when omitted, the
+    local name derives from the id (``tiny/llama`` -> ``tiny-llama``).
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     id: str
-    path: Path
+    local_name: str | None = None
 
     @model_validator(mode="after")
-    def _check_id(self) -> Self:
+    def _check_model(self) -> Self:
         if not self.id:
             raise ValueError("model id must be non-empty")
+        if self.local_name is None:
+            self.local_name = self.id.replace("/", "-")
+        try:
+            validate_local_name(self.local_name)
+        except ModelStoreError as exc:
+            raise ValueError(str(exc)) from exc
         return self
+
+    @property
+    def resolved_local_name(self) -> str:
+        """The local name; ``_check_model`` fills it when omitted."""
+        local_name = self.local_name
+        if local_name is None:  # unreachable: the validator above fills it
+            raise ValueError("manifest model has no local name")
+        return local_name
 
 
 class ManifestRuntime(BaseModel):

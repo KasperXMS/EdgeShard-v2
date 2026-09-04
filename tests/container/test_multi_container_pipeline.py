@@ -22,6 +22,7 @@ from transformers import LlamaForCausalLM
 from edgeshard.control.mock.client import RemoteGenerationDriver, RemotePipeline
 from edgeshard.control.mock.manifest import DeploymentManifest
 from edgeshard.control.mock.master import MockMaster
+from edgeshard.runtime.model_store import ModelStore
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 IMAGE_TAG = "edgeshard/hf-shard:cpu-phase0-test"
@@ -111,7 +112,7 @@ def make_manifest(
             "execution_id": execution_id,
             "model": {
                 "id": "tiny/llama",
-                "path": f"/models/{tiny_llama_dir.name}",
+                "local_name": tiny_llama_dir.name,
             },
             "runtimes": runtimes,
             "pipeline": [f"shard-{index}" for index in range(len(blocks))],
@@ -128,7 +129,7 @@ async def test_multi_container_pipeline_reference_and_partition_invariance(
     work_dir = tmp_path_factory.mktemp("multi-container")
     master = MockMaster(
         docker_client=docker_sdk.from_env(),
-        model_cache_dir=tiny_llama_dir.parent,
+        model_store=ModelStore(model_root=tiny_llama_dir.parent),
         work_dir=work_dir,
         default_image=cpu_image,
     )

@@ -17,9 +17,7 @@ import docker
 
 from edgeshard.model.errors import EdgeShardError
 from edgeshard.runtime.info import RuntimeInfo
-
-MODEL_MOUNT = "/models"
-"""Container-side model mount; models are mounted, never baked (spec 21.1)."""
+from edgeshard.runtime.model_store import MODEL_MOUNT as MODEL_MOUNT
 
 
 class DriverError(EdgeShardError):

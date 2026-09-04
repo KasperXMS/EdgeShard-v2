@@ -23,6 +23,7 @@ from edgeshard.runtime.drivers.edgeshard_shard import (
     EdgeShardShardRuntimeSpec,
 )
 from edgeshard.runtime.info import RuntimeInfo, runtime_info_to_wire
+from edgeshard.runtime.model_store import ModelStore
 
 EXECUTION_ID = "exec-driver"
 RUNTIME_ID = "stage-0"
@@ -141,7 +142,7 @@ async def test_start_wires_labels_volumes_and_ports(tmp_path: Path) -> None:
     docker_client = FakeDockerClient()
     config_path = write_container_config(tmp_path)
     driver = EdgeShardShardRuntimeDriver(
-        docker_client=docker_client, model_cache_dir=tmp_path / "model-cache"
+        docker_client=docker_client, model_store=ModelStore(model_root=tmp_path / "model-cache")
     )
 
     handle = await driver.start(make_spec(config_path, host_port=55555))
@@ -174,7 +175,7 @@ async def test_start_wires_labels_volumes_and_ports(tmp_path: Path) -> None:
 
 async def test_start_picks_ephemeral_host_port(tmp_path: Path) -> None:
     driver = EdgeShardShardRuntimeDriver(
-        docker_client=FakeDockerClient(), model_cache_dir=tmp_path
+        docker_client=FakeDockerClient(), model_store=ModelStore(model_root=tmp_path)
     )
     handle = await driver.start(make_spec(write_container_config(tmp_path)))
     assert handle.endpoint == "127.0.0.1:49152"
@@ -183,7 +184,7 @@ async def test_start_picks_ephemeral_host_port(tmp_path: Path) -> None:
 async def test_start_without_host_port_uses_network_endpoint(tmp_path: Path) -> None:
     docker_client = FakeDockerClient()
     driver = EdgeShardShardRuntimeDriver(
-        docker_client=docker_client, model_cache_dir=tmp_path
+        docker_client=docker_client, model_store=ModelStore(model_root=tmp_path)
     )
     handle = await driver.start(
         make_spec(write_container_config(tmp_path), host_port=None, network="edgeshard-exec-e")
@@ -197,7 +198,7 @@ async def test_start_without_host_port_uses_network_endpoint(tmp_path: Path) -> 
 async def test_start_attaches_network_with_runtime_alias(tmp_path: Path) -> None:
     docker_client = FakeDockerClient()
     driver = EdgeShardShardRuntimeDriver(
-        docker_client=docker_client, model_cache_dir=tmp_path
+        docker_client=docker_client, model_store=ModelStore(model_root=tmp_path)
     )
     await driver.start(
         make_spec(write_container_config(tmp_path), network="edgeshard-exec-e")
@@ -216,7 +217,7 @@ async def test_start_cuda_config_attaches_nvidia_gpus(tmp_path: Path) -> None:
         tmp_path, device={"type": "cuda", "index": 0}
     )
     driver = EdgeShardShardRuntimeDriver(
-        docker_client=docker_client, model_cache_dir=tmp_path
+        docker_client=docker_client, model_store=ModelStore(model_root=tmp_path)
     )
 
     await driver.start(make_spec(config_path))
@@ -232,7 +233,7 @@ async def test_start_cpu_config_attaches_no_gpus(tmp_path: Path) -> None:
     """The default CPU config launches without any device request."""
     docker_client = FakeDockerClient()
     driver = EdgeShardShardRuntimeDriver(
-        docker_client=docker_client, model_cache_dir=tmp_path
+        docker_client=docker_client, model_store=ModelStore(model_root=tmp_path)
     )
 
     await driver.start(make_spec(write_container_config(tmp_path)))
@@ -243,7 +244,7 @@ async def test_start_cpu_config_attaches_no_gpus(tmp_path: Path) -> None:
 
 async def test_start_rejects_foreign_spec(tmp_path: Path) -> None:
     driver = EdgeShardShardRuntimeDriver(
-        docker_client=FakeDockerClient(), model_cache_dir=tmp_path
+        docker_client=FakeDockerClient(), model_store=ModelStore(model_root=tmp_path)
     )
     foreign = RuntimeSpec(
         backend="edgeshard_shard",
@@ -257,7 +258,7 @@ async def test_start_rejects_foreign_spec(tmp_path: Path) -> None:
 
 async def test_start_rejects_loopback_config(tmp_path: Path) -> None:
     driver = EdgeShardShardRuntimeDriver(
-        docker_client=FakeDockerClient(), model_cache_dir=tmp_path
+        docker_client=FakeDockerClient(), model_store=ModelStore(model_root=tmp_path)
     )
     config_path = write_container_config(tmp_path, listen_host="127.0.0.1")
     with pytest.raises(DriverError, match="loopback"):
@@ -266,7 +267,7 @@ async def test_start_rejects_loopback_config(tmp_path: Path) -> None:
 
 async def test_start_rejects_identity_mismatch(tmp_path: Path) -> None:
     driver = EdgeShardShardRuntimeDriver(
-        docker_client=FakeDockerClient(), model_cache_dir=tmp_path
+        docker_client=FakeDockerClient(), model_store=ModelStore(model_root=tmp_path)
     )
     config_path = write_container_config(tmp_path, execution_id="exec-other")
     with pytest.raises(DriverError, match="execution ID"):
@@ -303,7 +304,7 @@ async def test_wait_ready_and_info_against_live_server(tmp_path: Path) -> None:
         docker_client = FakeDockerClient()
         config_path = write_container_config(tmp_path)
         driver = EdgeShardShardRuntimeDriver(
-            docker_client=docker_client, model_cache_dir=tmp_path
+            docker_client=docker_client, model_store=ModelStore(model_root=tmp_path)
         )
         handle = await driver.start(make_spec(config_path, host_port=port))
         await driver.wait_ready(handle)
@@ -315,7 +316,7 @@ async def test_wait_ready_and_info_against_live_server(tmp_path: Path) -> None:
 async def test_wait_ready_times_out_on_dead_endpoint() -> None:
     driver = EdgeShardShardRuntimeDriver(
         docker_client=FakeDockerClient(),
-        model_cache_dir=Path("."),
+        model_store=ModelStore(model_root=Path(".")),
         ready_timeout_s=0.5,
         poll_interval_s=0.05,
     )
@@ -332,7 +333,7 @@ async def test_wait_ready_times_out_on_dead_endpoint() -> None:
 async def test_stop_stops_and_removes_container(tmp_path: Path) -> None:
     docker_client = FakeDockerClient()
     driver = EdgeShardShardRuntimeDriver(
-        docker_client=docker_client, model_cache_dir=tmp_path
+        docker_client=docker_client, model_store=ModelStore(model_root=tmp_path)
     )
     handle = await driver.start(
         make_spec(write_container_config(tmp_path), host_port=55555)

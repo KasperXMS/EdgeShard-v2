@@ -19,7 +19,7 @@ execution_id: exec-001
 
 model:
   id: tiny-qwen
-  path: /models/tiny-qwen
+  local_name: tiny-qwen
 
 runtimes:
   - id: shard-0
@@ -45,7 +45,7 @@ pipeline:
 def make_payload(**overrides: Any) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "execution_id": "exec-1",
-        "model": {"id": "tiny/llama", "path": "/models/tiny-llama"},
+        "model": {"id": "tiny/llama", "local_name": "tiny-llama"},
         "runtimes": [
             {
                 "id": "shard-0",
@@ -68,7 +68,7 @@ def test_spec_example_parses() -> None:
     manifest = DeploymentManifest.model_validate(yaml.safe_load(SPEC_EXAMPLE))
     assert manifest.execution_id == "exec-001"
     assert manifest.model.id == "tiny-qwen"
-    assert manifest.model.path.as_posix() == "/models/tiny-qwen"
+    assert manifest.model.resolved_local_name == "tiny-qwen"
     assert [runtime.id for runtime in manifest.pipeline_runtimes()] == [
         "shard-0",
         "shard-1",
@@ -397,3 +397,30 @@ def test_rejects_bad_shard_bounds(shard: dict[str, Any], match: str) -> None:
 def test_rejects_extra_fields() -> None:
     with pytest.raises(ValueError, match="scheduler"):
         DeploymentManifest.model_validate(make_payload(scheduler="round-robin"))
+
+
+def test_local_name_defaults_from_model_id() -> None:
+    manifest = DeploymentManifest.model_validate(make_payload(model={"id": "tiny/llama"}))
+    assert manifest.model.resolved_local_name == "tiny-llama"
+
+
+@pytest.mark.parametrize(
+    "bad_name",
+    ["", "a/b", "../cache", "tiny llama"],
+)
+def test_rejects_bad_local_names(bad_name: str) -> None:
+    payload = make_payload(model={"id": "tiny/llama", "local_name": bad_name})
+    with pytest.raises(ValueError):
+        DeploymentManifest.model_validate(payload)
+
+
+def test_rejects_empty_model_id() -> None:
+    with pytest.raises(ValueError, match="model id"):
+        DeploymentManifest.model_validate(make_payload(model={"id": ""}))
+
+
+def test_rejects_legacy_model_path_field() -> None:
+    # Plans carry id + local name only; a path field is no longer accepted.
+    payload = make_payload(model={"id": "tiny/llama", "path": "/models/tiny-llama"})
+    with pytest.raises(ValueError, match="path"):
+        DeploymentManifest.model_validate(payload)

@@ -35,6 +35,7 @@ from edgeshard.runtime.drivers.edgeshard_shard import (
     EdgeShardShardRuntimeDriver,
     EdgeShardShardRuntimeSpec,
 )
+from edgeshard.runtime.model_store import ModelStore
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 IMAGE_TAG = "edgeshard/hf-shard:cpu-phase0-test"
@@ -139,7 +140,7 @@ async def test_container_runtime_matches_host_reference(
 
     driver = EdgeShardShardRuntimeDriver(
         docker_client=docker_sdk.from_env(),
-        model_cache_dir=tiny_llama_dir,
+        model_store=ModelStore(model_root=tiny_llama_dir),
     )
     spec = EdgeShardShardRuntimeSpec(
         backend="edgeshard_shard",

@@ -44,6 +44,7 @@ from edgeshard.runtime.drivers.base import (
     stop_and_remove_container,
 )
 from edgeshard.runtime.info import RuntimeInfo
+from edgeshard.runtime.model_store import ModelStore
 
 DEFAULT_VLLM_IMAGE = "vllm/vllm-openai:v0.28.0"
 """Pinned official vLLM OpenAI image (specs 5.7, 4.10); manifests may override."""
@@ -84,12 +85,12 @@ class VLLMRuntimeDriver:
         self,
         *,
         docker_client: Any,
-        model_cache_dir: Path,
+        model_store: ModelStore,
         ready_timeout_s: float = 600.0,
         poll_interval_s: float = 1.0,
     ) -> None:
         self._docker = docker_client
-        self._model_cache_dir = Path(model_cache_dir)
+        self._model_store = model_store
         self._ready_timeout_s = ready_timeout_s
         self._poll_interval_s = poll_interval_s
         self._started: dict[str, VLLMRuntimeSpec] = {}
@@ -98,7 +99,7 @@ class VLLMRuntimeDriver:
         if not isinstance(spec, VLLMRuntimeSpec):
             raise DriverError("VLLMRuntimeDriver requires a VLLMRuntimeSpec")
         # Fail before launch when the model path escapes the model mount.
-        host_model_path(spec.model_path, self._model_cache_dir)
+        host_model_path(spec.model_path, self._model_store.model_root)
         command = self._serve_command(spec)
 
         def run() -> Any:
@@ -110,7 +111,10 @@ class VLLMRuntimeDriver:
                 "entrypoint": ["vllm"],
                 "command": command,
                 "volumes": {
-                    str(self._model_cache_dir): {"bind": MODEL_MOUNT, "mode": "ro"},
+                    str(self._model_store.model_root): {
+                        "bind": MODEL_MOUNT,
+                        "mode": "ro",
+                    },
                 },
                 "labels": {
                     "io.edgeshard.managed": "true",
@@ -185,7 +189,7 @@ class VLLMRuntimeDriver:
                 f"runtime {handle.runtime_id!r} was not started by this driver"
             )
         source = ModelSource(
-            path=host_model_path(spec.model_path, self._model_cache_dir),
+            path=host_model_path(spec.model_path, self._model_store.model_root),
             model_id=spec.model_id,
         )
         source.ensure_local()

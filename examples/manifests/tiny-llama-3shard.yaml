@@ -7,7 +7,7 @@ execution_id: exec-example-3shard
 
 model:
   id: tiny/llama
-  path: /models/tiny-llama
+  local_name: tiny-llama
 
 runtimes:
   - id: shard-0

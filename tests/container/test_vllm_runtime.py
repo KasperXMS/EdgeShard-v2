@@ -39,6 +39,7 @@ from edgeshard.control.mock.client import (
 )
 from edgeshard.control.mock.manifest import DeploymentManifest
 from edgeshard.control.mock.master import MockMaster
+from edgeshard.runtime.model_store import ModelStore, container_model_path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 IMAGE_TAG = "edgeshard/hf-shard:cpu-phase0-test"
@@ -129,7 +130,7 @@ def make_manifest(
             "execution_id": "exec-0j-vllm",
             "model": {
                 "id": "tiny/llama",
-                "path": f"/models/{tiny_llama_dir.name}",
+                "local_name": tiny_llama_dir.name,
             },
             "runtimes": [
                 {
@@ -167,7 +168,7 @@ async def test_mock_master_manages_shards_and_vllm(
     work_dir = tmp_path_factory.mktemp("vllm-mixed")
     master = MockMaster(
         docker_client=docker_sdk.from_env(),
-        model_cache_dir=model_cache_dir,
+        model_store=ModelStore(model_root=model_cache_dir),
         work_dir=work_dir,
         default_image=cpu_image,
     )
@@ -206,12 +207,15 @@ async def test_mock_master_manages_shards_and_vllm(
             await pipeline.close_session("g")
         assert tokens == reference_tokens
 
-        # The vLLM runtime answers OpenAI-compatible test requests.
+        # The vLLM runtime answers OpenAI-compatible test requests. The
+        # served name is the container-side model path, identical on
+        # every worker regardless of its host model store root.
         vllm_endpoint = deployment.handle("vllm-0").endpoint
-        async with VLLMClient(
-            vllm_endpoint, model=manifest.model.path.as_posix()
-        ) as client:
-            assert manifest.model.path.as_posix() in await client.list_models()
+        served_name = container_model_path(
+            manifest.model.resolved_local_name
+        ).as_posix()
+        async with VLLMClient(vllm_endpoint, model=served_name) as client:
+            assert served_name in await client.list_models()
             completion = await client.complete(PROMPT, max_tokens=MAX_NEW_TOKENS)
             assert completion.text
             # temperature=0 keeps vLLM test requests deterministic greedy.

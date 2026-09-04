@@ -54,10 +54,17 @@ unsupported inputs fail explicitly.
 
 - Supported adapters: Llama and Qwen2 families. Other HF architectures
   fail explicitly at adaptation, not approximately.
-- Models must already exist in the host model cache (mounted at `/models`);
-  runtime containers and drivers never download models.
-- The vLLM driver's `info` reads the host model cache's `config.json`
-  (never weights); it requires the model directory on the host.
+- Models must already exist under the worker-local model store root
+  (`ModelStore.model_root`, default `/data/edgeshard-models`, mounted
+  read-only at `/models`); runtime containers and drivers never download,
+  evict, or relocate models. Cached-model discovery (download, eviction,
+  multi-disk placement) moves to the worker in a later phase.
+- When a manifest omits `local_name` it defaults to the `model.id` with
+  `/` replaced by `-`; two ids mapping to the same name (e.g.
+  `tiny/llama` and `tiny-llama`) collide inside one store. Set an
+  explicit `local_name` to disambiguate.
+- The vLLM driver's `info` reads `config.json` from the worker's model
+  store root (never weights); it requires the model directory on the host.
 - vLLM numerical equivalence with the shard pipeline is **not** asserted —
   vLLM dtypes/kernels differ. The 0J E2E asserts lifecycle management plus
   deterministic smoke completions only.

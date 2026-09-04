@@ -24,6 +24,7 @@ from edgeshard.runtime.drivers.vllm import (
     VLLMRuntimeDriver,
     VLLMRuntimeSpec,
 )
+from edgeshard.runtime.model_store import ModelStore
 
 EXECUTION_ID = "exec-vllm"
 RUNTIME_ID = "vllm-0"
@@ -132,7 +133,7 @@ def make_spec(**overrides: Any) -> VLLMRuntimeSpec:
 async def test_start_wires_vllm_cli_labels_volumes_and_ports(tmp_path: Path) -> None:
     docker_client = FakeDockerClient()
     driver = VLLMRuntimeDriver(
-        docker_client=docker_client, model_cache_dir=tmp_path / "model-cache"
+        docker_client=docker_client, model_store=ModelStore(model_root=tmp_path / "model-cache")
     )
 
     handle = await driver.start(make_spec(host_port=55555))
@@ -173,7 +174,7 @@ async def test_start_wires_vllm_cli_labels_volumes_and_ports(tmp_path: Path) -> 
 async def test_start_translates_optional_knobs(tmp_path: Path) -> None:
     docker_client = FakeDockerClient()
     driver = VLLMRuntimeDriver(
-        docker_client=docker_client, model_cache_dir=tmp_path
+        docker_client=docker_client, model_store=ModelStore(model_root=tmp_path)
     )
     await driver.start(
         make_spec(device_index=1, max_model_len=2048, tensor_parallel_size=2)
@@ -200,7 +201,7 @@ async def test_start_always_attaches_nvidia_gpus_and_host_ipc(
     """vLLM is GPU-bound: every launch gets `--gpus all` + host IPC."""
     docker_client = FakeDockerClient()
     driver = VLLMRuntimeDriver(
-        docker_client=docker_client, model_cache_dir=tmp_path
+        docker_client=docker_client, model_store=ModelStore(model_root=tmp_path)
     )
 
     await driver.start(make_spec())
@@ -218,7 +219,7 @@ async def test_start_always_attaches_nvidia_gpus_and_host_ipc(
 async def test_start_without_host_port_uses_network_endpoint(tmp_path: Path) -> None:
     docker_client = FakeDockerClient()
     driver = VLLMRuntimeDriver(
-        docker_client=docker_client, model_cache_dir=tmp_path
+        docker_client=docker_client, model_store=ModelStore(model_root=tmp_path)
     )
     handle = await driver.start(make_spec(host_port=None, network="edgeshard-exec-e"))
     assert handle.endpoint == f"{RUNTIME_ID}:{VLLM_API_PORT}"
@@ -230,7 +231,7 @@ async def test_start_without_host_port_uses_network_endpoint(tmp_path: Path) -> 
 
 async def test_start_rejects_path_outside_model_mount(tmp_path: Path) -> None:
     driver = VLLMRuntimeDriver(
-        docker_client=FakeDockerClient(), model_cache_dir=tmp_path
+        docker_client=FakeDockerClient(), model_store=ModelStore(model_root=tmp_path)
     )
     with pytest.raises(DriverError, match="model mount"):
         await driver.start(make_spec(model_path=Path("/weights/tiny-llama")))
@@ -238,7 +239,7 @@ async def test_start_rejects_path_outside_model_mount(tmp_path: Path) -> None:
 
 async def test_start_rejects_foreign_spec(tmp_path: Path) -> None:
     driver = VLLMRuntimeDriver(
-        docker_client=FakeDockerClient(), model_cache_dir=tmp_path
+        docker_client=FakeDockerClient(), model_store=ModelStore(model_root=tmp_path)
     )
     foreign = RuntimeSpec(
         backend="vllm",
@@ -254,7 +255,7 @@ async def test_wait_ready_polls_openai_models_endpoint(
     http_models_server: str, tmp_path: Path
 ) -> None:
     driver = VLLMRuntimeDriver(
-        docker_client=FakeDockerClient(), model_cache_dir=tmp_path
+        docker_client=FakeDockerClient(), model_store=ModelStore(model_root=tmp_path)
     )
     handle = RuntimeHandle(
         runtime_id=RUNTIME_ID,
@@ -268,7 +269,7 @@ async def test_wait_ready_polls_openai_models_endpoint(
 async def test_wait_ready_times_out_on_dead_endpoint(tmp_path: Path) -> None:
     driver = VLLMRuntimeDriver(
         docker_client=FakeDockerClient(),
-        model_cache_dir=tmp_path,
+        model_store=ModelStore(model_root=tmp_path),
         ready_timeout_s=0.5,
         poll_interval_s=0.05,
     )
@@ -284,7 +285,9 @@ async def test_info_reports_full_model_coverage(
 ) -> None:
     cache_dir = tiny_llama_dir.parent
     docker_client = FakeDockerClient()
-    driver = VLLMRuntimeDriver(docker_client=docker_client, model_cache_dir=cache_dir)
+    driver = VLLMRuntimeDriver(
+        docker_client=docker_client, model_store=ModelStore(model_root=cache_dir)
+    )
     handle = await driver.start(
         make_spec(model_path=Path(f"/models/{tiny_llama_dir.name}"))
     )
@@ -301,7 +304,7 @@ async def test_info_reports_full_model_coverage(
 
 async def test_info_rejects_unknown_container(tmp_path: Path) -> None:
     driver = VLLMRuntimeDriver(
-        docker_client=FakeDockerClient(), model_cache_dir=tmp_path
+        docker_client=FakeDockerClient(), model_store=ModelStore(model_root=tmp_path)
     )
     unknown = RuntimeHandle(
         runtime_id=RUNTIME_ID, backend="vllm", container_id="nope", endpoint="x:1"
@@ -313,7 +316,7 @@ async def test_info_rejects_unknown_container(tmp_path: Path) -> None:
 async def test_stop_stops_and_removes_container(tmp_path: Path) -> None:
     docker_client = FakeDockerClient()
     driver = VLLMRuntimeDriver(
-        docker_client=docker_client, model_cache_dir=tmp_path
+        docker_client=docker_client, model_store=ModelStore(model_root=tmp_path)
     )
     handle = await driver.start(make_spec(host_port=55555))
     container = docker_client.containers.by_id[handle.container_id]
