@@ -187,23 +187,32 @@ name = "edgeshard"
 version = "0.0.1"
 source = { editable = "." }
 dependencies = [
-    { name = "accelerate" },
     { name = "docker" },
     { name = "grpcio" },
     { name = "httpx" },
-    { name = "huggingface-hub" },
     { name = "protobuf" },
     { name = "pydantic" },
     { name = "pyyaml" },
+    { name = "typer" },
+]
+
+[package.optional-dependencies]
+inference = [
+    { name = "accelerate" },
+    { name = "huggingface-hub" },
     { name = "safetensors" },
     { name = "torch", version = "2.13.0", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform == 'darwin'" },
     { name = "torch", version = "2.13.0+cpu", source = { registry = "https://download.pytorch.org/whl/cpu" }, marker = "sys_platform != 'darwin'" },
     { name = "transformers" },
-    { name = "typer" },
+]
+worker = [
+    { name = "nvidia-ml-py" },
+    { name = "psutil" },
 ]
 
 [package.dev-dependencies]
 dev = [
+    { name = "edgeshard", extra = ["inference", "worker"] },
     { name = "grpcio-tools" },
     { name = "hypothesis" },
     { name = "mypy" },
@@ -215,22 +224,26 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "accelerate", specifier = ">=0.34" },
+    { name = "accelerate", marker = "extra == 'inference'", specifier = ">=0.34" },
     { name = "docker", specifier = ">=7.1" },
     { name = "grpcio", specifier = ">=1.66" },
     { name = "httpx", specifier = ">=0.27" },
-    { name = "huggingface-hub", specifier = ">=0.25" },
+    { name = "huggingface-hub", marker = "extra == 'inference'", specifier = ">=0.25" },
+    { name = "nvidia-ml-py", marker = "extra == 'worker'", specifier = ">=13,<14" },
     { name = "protobuf", specifier = ">=5.28" },
+    { name = "psutil", marker = "extra == 'worker'", specifier = ">=7,<8" },
     { name = "pydantic", specifier = ">=2.9" },
     { name = "pyyaml", specifier = ">=6.0.2" },
-    { name = "safetensors", specifier = ">=0.4.5" },
-    { name = "torch", specifier = ">=2.4", index = "https://download.pytorch.org/whl/cpu" },
-    { name = "transformers", specifier = ">=4.45" },
+    { name = "safetensors", marker = "extra == 'inference'", specifier = ">=0.4.5" },
+    { name = "torch", marker = "extra == 'inference'", specifier = ">=2.4", index = "https://download.pytorch.org/whl/cpu" },
+    { name = "transformers", marker = "extra == 'inference'", specifier = ">=4.45" },
     { name = "typer", specifier = ">=0.12" },
 ]
+provides-extras = ["inference", "worker"]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "edgeshard", extras = ["inference", "worker"] },
     { name = "grpcio-tools", specifier = ">=1.66" },
     { name = "hypothesis", specifier = ">=6.112" },
     { name = "mypy", specifier = ">=1.11" },
@@ -584,6 +597,15 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/36/33/29208b8b075bde62d26a81d14b358c42b0f69b6cabd98d4ff97f37f22b05/numpy-2.5.2-cp312-cp312-win32.whl", hash = "sha256:d6a48072864e3324e194a8fbb3c657bcc5b5c869dbc64c9537b1d5c862572c0a", size = 6072817, upload-time = "2026-08-09T13:45:17.867Z" },
     { url = "https://files.pythonhosted.org/packages/7f/b9/87fea2769fe1c47c1b5b01d8310772c9d1a85d485de7cf386ef7a3332b02/numpy-2.5.2-cp312-cp312-win_amd64.whl", hash = "sha256:28ac63476ec7651484215ee7fa15a1f78b57c14621f01e392afe17b9a1390ce4", size = 12464674, upload-time = "2026-08-09T13:45:20.734Z" },
     { url = "https://files.pythonhosted.org/packages/14/52/032b97e00461ab0809bbe4c588b035620e5a14b8cdee47ecddefc7b17d33/numpy-2.5.2-cp312-cp312-win_arm64.whl", hash = "sha256:27650bb0e7140fa3d37b9923b4803645e0b125d190f326eecfd3f4dad8e8ade1", size = 10397131, upload-time = "2026-08-09T13:45:23.73Z" },
+]
+
+[[package]]
+name = "nvidia-ml-py"
+version = "13.610.43"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/f0/b5/a8fbc356f768fa5c9cfd646668fd7d34bf55bdd1c6e20754642a64d930d4/nvidia_ml_py-13.610.43.tar.gz", hash = "sha256:65437eb73d68d0c62c931ca4d45038472faff03bd0b8729abba4b899f70d60f2", size = 52109, upload-time = "2026-06-01T18:54:08.829Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/23/45/caa600acfab94560807a20a64b5830d2cd3c3202b7f1328644d70b7d6bd8/nvidia_ml_py-13.610.43-py3-none-any.whl", hash = "sha256:f13c72698edef492f985cc225f14faafe68ae065a2e407f45bdf6f4b9b43fde8", size = 53163, upload-time = "2026-06-01T18:54:07.704Z" },
 ]
 
 [[package]]

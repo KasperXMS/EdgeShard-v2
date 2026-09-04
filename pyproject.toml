@@ -1,26 +1,34 @@
 [project]
 name = "edgeshard"
 version = "0.0.1"
-description = "EdgeShard v2 Phase 0: containerized inference runtime foundation"
+description = "EdgeShard v2: containerized shard inference runtimes and cluster control plane"
 requires-python = ">=3.12,<3.13"
 dependencies = [
-    # Model execution
+    # Control-plane core (Phase 1 §6): schemas, configuration, RPC, runtime
+    # lifecycle, CLI. The heavy inference stack and host telemetry probes are
+    # optional extras so worker/master control stays lightweight.
+    "pydantic>=2.9",
+    "pyyaml>=6.0.2",
+    "grpcio>=1.66",
+    "protobuf>=5.28",
+    "docker>=7.1",
+    "typer>=0.12",
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+# Model execution (Phase 0 inference substrate).
+inference = [
     "torch>=2.4",
     "transformers>=4.45",
     "accelerate>=0.34",
     "safetensors>=0.4.5",
     "huggingface-hub>=0.25",
-    # Schemas and configuration
-    "pydantic>=2.9",
-    "pyyaml>=6.0.2",
-    # Shard RPC baseline (correctness/reference transport)
-    "grpcio>=1.66",
-    "protobuf>=5.28",
-    # Runtime container lifecycle
-    "docker>=7.1",
-    # CLI and HTTP clients
-    "typer>=0.12",
-    "httpx>=0.27",
+]
+# Worker-side host telemetry and device discovery (Phase 1).
+worker = [
+    "psutil>=7,<8",
+    "nvidia-ml-py>=13,<14",
 ]
 
 [project.scripts]
@@ -28,6 +36,9 @@ edgeshard = "edgeshard.cli:app"
 
 [dependency-groups]
 dev = [
+    # Keep the full development environment (inference + worker extras) on a
+    # plain `uv sync`; the control-plane core alone is the installable base.
+    "edgeshard[inference,worker]",
     "pytest>=8.3",
     "pytest-asyncio>=0.24",
     "hypothesis>=6.112",
@@ -120,4 +131,6 @@ asyncio_default_fixture_loop_scope = "function"
 markers = [
     "integration: multi-process pipeline tests",
     "container: tests that require Docker",
+    "rtx: tests that require a physical NVIDIA discrete GPU (Phase 1)",
+    "jetson: tests that require physical Jetson hardware (Phase 1)",
 ]

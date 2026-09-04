@@ -24,6 +24,13 @@ PyTorch resolves from the pinned CPU wheel index (`tool.uv.sources`).
 Docker and NVIDIA GPUs are exercised by skip-gated tests only — nothing
 requires them to develop or run Tier 1.
 
+Dependencies are layered (Phase 1 §6): the installable base is the
+lightweight control-plane core (config, RPC, container lifecycle, CLI); the
+`inference` extra adds the torch/transformers model-execution stack and the
+`worker` extra adds host telemetry probes (psutil, nvidia-ml-py). A plain
+`uv sync` installs everything needed for development, including both
+extras.
+
 ## Setup and gate
 
 ```sh
