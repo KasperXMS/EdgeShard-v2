@@ -39,10 +39,12 @@ RUN uv export \
       --no-dev \
       --no-emit-project \
       --no-emit-package torch \
+      --no-emit-package numpy \
       --format requirements-txt \
       --output-file /tmp/requirements.txt \
  && pip install \
       --no-cache-dir \
+      --no-deps \
       -r /tmp/requirements.txt
 
 COPY src ./src
