@@ -125,7 +125,6 @@ def test_revision_is_sha256_hex() -> None:
                 *c.memory_pools[1:],
             ),
         ),
-        lambda c: dataclasses.replace(c, devices=(*c.devices[1:], *c.devices[:1])),
         lambda c: dataclasses.replace(
             c,
             network_interfaces=(
@@ -136,12 +135,50 @@ def test_revision_is_sha256_hex() -> None:
             ),
         ),
     ],
-    ids=["architecture", "pool_size", "device_order", "extra_interface"],
+    ids=["architecture", "pool_size", "extra_interface"],
 )
 def test_modified_capability_different_revision(mutate) -> None:
     capability = make_rtx_capability()
     mutated = mutate(capability)
     assert compute_capability_revision(mutated) != capability.capability_revision
+
+
+def test_revision_is_insensitive_to_collection_order() -> None:
+    """Same facts in a different enumeration order give the same revision."""
+    base = make_rtx_capability()
+    base_revision = compute_capability_revision(base)
+
+    reversed_pools = dataclasses.replace(base, memory_pools=base.memory_pools[::-1])
+    assert compute_capability_revision(reversed_pools) == base_revision
+
+    reversed_platforms = dataclasses.replace(
+        base, runtime_platforms=base.runtime_platforms[::-1]
+    )
+    assert compute_capability_revision(reversed_platforms) == base_revision
+
+    gpu = base.devices[1]
+    reordered_gpu = dataclasses.replace(
+        gpu,
+        supported_dtypes=gpu.supported_dtypes[::-1],
+        platform_tags=gpu.platform_tags[::-1],
+    )
+    reordered_devices = dataclasses.replace(base, devices=(reordered_gpu, base.devices[0]))
+    assert compute_capability_revision(reordered_devices) == base_revision
+
+    nic = base.network_interfaces[0]
+    nic_forward = dataclasses.replace(nic, addresses=("192.168.1.100", "10.0.0.5"))
+    nic_backward = dataclasses.replace(nic, addresses=("10.0.0.5", "192.168.1.100"))
+    assert compute_capability_revision(
+        dataclasses.replace(base, network_interfaces=(nic_forward,))
+    ) == compute_capability_revision(dataclasses.replace(base, network_interfaces=(nic_backward,)))
+
+    nic_a = nic
+    nic_b = dataclasses.replace(nic, interface_id="nic-1", name="eth1")
+    assert compute_capability_revision(
+        dataclasses.replace(base, network_interfaces=(nic_a, nic_b))
+    ) == compute_capability_revision(
+        dataclasses.replace(base, network_interfaces=(nic_b, nic_a))
+    )
 
 
 def test_rtx_and_jetson_revisions_differ() -> None:

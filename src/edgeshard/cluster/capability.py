@@ -189,14 +189,42 @@ class WorkerCapability:
                 )
 
 
+# Capability collections whose enumeration order carries no meaning (spec
+# §16): two capabilities holding the same devices/pools/interfaces/tags must
+# fingerprint identically no matter which order the probes emitted them in.
+_ORDER_INSENSITIVE_FIELDS = frozenset(
+    {
+        "network_interfaces",
+        "devices",
+        "memory_pools",
+        "runtime_platforms",
+        "addresses",
+        "supported_dtypes",
+        "platform_tags",
+    }
+)
+
+
+def _canonical_sort_key(item: object) -> str:
+    return json.dumps(item, sort_keys=True, separators=(",", ":"))
+
+
 def _canonical_value(value: object) -> object:
     """Convert a capability structure to plain JSON-serializable data.
 
     Dataclasses become mappings, tuples become arrays, enums become their
-    values; tuple ordering is preserved so it participates in the revision.
+    values. Fields listed in ``_ORDER_INSENSITIVE_FIELDS`` are additionally
+    sorted by their canonical encoding so enumeration order never leaks
+    into the revision.
     """
     if is_dataclass(value) and not isinstance(value, type):
-        return {field.name: _canonical_value(getattr(value, field.name)) for field in fields(value)}
+        mapping: dict[str, object] = {}
+        for field in fields(value):
+            item = _canonical_value(getattr(value, field.name))
+            if field.name in _ORDER_INSENSITIVE_FIELDS and isinstance(item, list):
+                item = sorted(item, key=_canonical_sort_key)
+            mapping[field.name] = item
+        return mapping
     if isinstance(value, StrEnum):
         return value.value
     if isinstance(value, tuple):
@@ -209,8 +237,9 @@ def compute_capability_revision(capability: WorkerCapability) -> str:
 
     The ``capability_revision`` field itself is excluded so the revision can
     fingerprint a capability built with a placeholder revision. Identical
-    canonical capabilities always yield the same revision; any content change
-    yields a different one.
+    canonical capabilities always yield the same revision — including under
+    different enumeration orders of devices, pools, interfaces, addresses,
+    dtypes, and tags; any content change yields a different one.
     """
     mapping = cast("dict[str, object]", _canonical_value(capability))
     mapping.pop("capability_revision", None)

@@ -66,7 +66,12 @@ class MemoryPoolState:
 
 
 class WorkerStatus(StrEnum):
-    """Master-assigned liveness status of a Worker (spec §18, §32)."""
+    """Master-assigned liveness status of a Worker (spec §32).
+
+    Derived by the Master from heartbeat receipt; it is carried on
+    Master-side records such as ``edgeshard.cluster.snapshot.WorkerSnapshot``
+    and never on Worker-reported state.
+    """
 
     ONLINE = "online"
     SUSPECT = "suspect"
@@ -75,10 +80,14 @@ class WorkerStatus(StrEnum):
 
 @dataclass(frozen=True)
 class WorkerState:
-    """Latest Worker-reported dynamic state (spec §18)."""
+    """Latest Worker-reported dynamic state (spec §18).
+
+    Worker-reported facts only. Master-assigned bookkeeping — liveness
+    status, registration session, receive timestamps — lives in Master-side
+    records (see ``edgeshard.cluster.snapshot.WorkerSnapshot``), never here.
+    """
 
     worker_id: str
-    status: WorkerStatus
 
     device_states: tuple[DeviceState, ...]
     memory_states: tuple[MemoryPoolState, ...]

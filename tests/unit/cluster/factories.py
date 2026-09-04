@@ -1,10 +1,13 @@
 """Shared builders for cluster domain tests (Phase 1 spec §13-14).
 
 ``make_rtx_capability`` and ``make_jetson_capability`` model the two
-reference platforms of Phase 1 — a discrete-GPU host with independent VRAM
+reference platforms of Phase 1 - a discrete-GPU host with independent VRAM
 pools, and a Jetson host whose CPU and GPU share one system-memory pool.
 The integration suite reuses the same shapes for fake Worker fixtures
 (spec §52 Test B).
+
+``make_worker_state`` defaults to ids drawn from the RTX capability so
+capability and state compose into a consistent ``WorkerSnapshot``.
 """
 
 from __future__ import annotations
@@ -35,10 +38,16 @@ from edgeshard.cluster.state import (
     DeviceState,
     MemoryPoolState,
     WorkerState,
-    WorkerStatus,
 )
 
 PLACEHOLDER_REVISION = ""
+
+# Reference identifiers of the RTX-like capability, shared with the state
+# factory below so snapshots stay internally consistent.
+RTX_CPU_DEVICE_ID = "cpu-host"
+RTX_GPU_DEVICE_ID = "GPU-69c27179-5df5-d790-4b75-6cf18a4d2b1c"
+RTX_HOST_POOL_ID = "host-memory"
+RTX_GPU_POOL_ID = f"gpu-{RTX_GPU_DEVICE_ID}-vram"
 
 
 def make_worker_identity(worker_id: str | None = None) -> WorkerIdentity:
@@ -66,26 +75,24 @@ def make_rtx_capability() -> WorkerCapability:
         devices=(
             DeviceCapability(
                 identity=DeviceIdentity(
-                    device_id="cpu-host", kind=DeviceKind.CPU, local_locator="cpu"
+                    device_id=RTX_CPU_DEVICE_ID, kind=DeviceKind.CPU, local_locator="cpu"
                 ),
                 vendor="GenuineIntel",
                 model="x86_64 host CPU",
                 compute_capability=None,
-                memory_pool_id="host-memory",
+                memory_pool_id=RTX_HOST_POOL_ID,
                 supported_dtypes=(),
                 driver_version=None,
                 platform_tags=("x86_64",),
             ),
             DeviceCapability(
                 identity=DeviceIdentity(
-                    device_id="GPU-69c27179-5df5-d790-4b75-6cf18a4d2b1c",
-                    kind=DeviceKind.GPU,
-                    local_locator="cuda:0",
+                    device_id=RTX_GPU_DEVICE_ID, kind=DeviceKind.GPU, local_locator="cuda:0"
                 ),
                 vendor="NVIDIA",
                 model="NVIDIA GeForce RTX 4090",
                 compute_capability="8.9",
-                memory_pool_id="gpu-GPU-69c27179-5df5-d790-4b75-6cf18a4d2b1c-vram",
+                memory_pool_id=RTX_GPU_POOL_ID,
                 supported_dtypes=("fp32", "fp16", "bf16"),
                 driver_version="550.90",
                 platform_tags=("cuda", "sm89"),
@@ -93,10 +100,10 @@ def make_rtx_capability() -> WorkerCapability:
         ),
         memory_pools=(
             MemoryPoolCapability(
-                memory_pool_id="host-memory", model=MemoryModel.SHARED, total_bytes=64 * 2**30
+                memory_pool_id=RTX_HOST_POOL_ID, model=MemoryModel.SHARED, total_bytes=64 * 2**30
             ),
             MemoryPoolCapability(
-                memory_pool_id="gpu-GPU-69c27179-5df5-d790-4b75-6cf18a4d2b1c-vram",
+                memory_pool_id=RTX_GPU_POOL_ID,
                 model=MemoryModel.DISCRETE,
                 total_bytes=24 * 2**30,
             ),
@@ -171,12 +178,12 @@ def finalize(capability: WorkerCapability) -> WorkerCapability:
 
 def make_worker_state(
     worker_id: str,
-    device_ids: tuple[str, ...] = ("gpu-0",),
-    pool_ids: tuple[str, ...] = ("pool-0",),
+    device_ids: tuple[str, ...] = (RTX_GPU_DEVICE_ID,),
+    pool_ids: tuple[str, ...] = (RTX_GPU_POOL_ID,),
 ) -> WorkerState:
+    """Dynamic state consistent with ``make_rtx_capability`` by default."""
     return WorkerState(
         worker_id=worker_id,
-        status=WorkerStatus.ONLINE,
         device_states=tuple(
             DeviceState(
                 device_id=device_id,

@@ -9,7 +9,13 @@ import pytest
 from factories import make_rtx_capability, make_worker_identity, make_worker_state
 
 from edgeshard.cluster.snapshot import ClusterSnapshot, WorkerSnapshot
-from edgeshard.cluster.state import DeviceState, WorkerState
+from edgeshard.cluster.state import (
+    DeviceAvailability,
+    DeviceState,
+    MemoryPoolState,
+    WorkerState,
+    WorkerStatus,
+)
 
 CREATED_AT = datetime(2026, 9, 5, 12, 0, 0, tzinfo=UTC)
 LAST_SEEN_AT = datetime(2026, 9, 5, 11, 59, 58, tzinfo=UTC)
@@ -20,6 +26,7 @@ def make_worker_snapshot(worker_id: str = "worker-1") -> WorkerSnapshot:
         identity=make_worker_identity(worker_id),
         capability=make_rtx_capability(),
         state=make_worker_state(worker_id),
+        status=WorkerStatus.ONLINE,
         session_id="session-1",
         last_seen_at=LAST_SEEN_AT,
     )
@@ -40,6 +47,7 @@ def test_snapshot_assembles() -> None:
         "worker-a",
         "worker-b",
     ]
+    assert all(worker.status is WorkerStatus.ONLINE for worker in snapshot.workers)
 
 
 def test_snapshot_requires_consistent_worker_id() -> None:
@@ -48,6 +56,7 @@ def test_snapshot_requires_consistent_worker_id() -> None:
             identity=make_worker_identity("worker-1"),
             capability=make_rtx_capability(),
             state=make_worker_state("worker-2"),
+            status=WorkerStatus.ONLINE,
             session_id="session-1",
             last_seen_at=LAST_SEEN_AT,
         )
@@ -119,3 +128,42 @@ def test_snapshot_contains_facts_only_shape() -> None:
     gpu_state: DeviceState = worker.state.device_states[0]
     assert gpu_state.utilization == 21.0
     assert worker.state.memory_states[0].available_bytes == 18 * 2**30
+
+
+def test_snapshot_rejects_device_state_for_unknown_device() -> None:
+    snapshot = make_worker_snapshot()
+    ghost = DeviceState(
+        device_id="ghost-device",
+        utilization=None,
+        temperature_c=None,
+        power_w=None,
+        availability=DeviceAvailability.UNKNOWN,
+        running_runtime_ids=(),
+    )
+    broken_state = dataclasses.replace(
+        snapshot.state, device_states=(*snapshot.state.device_states, ghost)
+    )
+    with pytest.raises(ValueError, match="unknown device"):
+        dataclasses.replace(snapshot, state=broken_state)
+
+
+def test_snapshot_rejects_memory_state_for_unknown_pool() -> None:
+    snapshot = make_worker_snapshot()
+    ghost = MemoryPoolState(memory_pool_id="ghost-pool", available_bytes=None)
+    broken_state = dataclasses.replace(
+        snapshot.state, memory_states=(*snapshot.state.memory_states, ghost)
+    )
+    with pytest.raises(ValueError, match="unknown memory pool"):
+        dataclasses.replace(snapshot, state=broken_state)
+
+
+def test_snapshot_rejects_runtime_instance_on_unknown_device() -> None:
+    snapshot = make_worker_snapshot()
+    broken_instance = dataclasses.replace(
+        snapshot.state.runtime_instances[0], device_ids=("ghost-device",)
+    )
+    broken_state = dataclasses.replace(
+        snapshot.state, runtime_instances=(broken_instance,)
+    )
+    with pytest.raises(ValueError, match="unknown device"):
+        dataclasses.replace(snapshot, state=broken_state)

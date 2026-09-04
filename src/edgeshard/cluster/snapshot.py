@@ -18,7 +18,7 @@ from datetime import datetime
 
 from edgeshard.cluster.capability import WorkerCapability
 from edgeshard.cluster.identity import WorkerIdentity
-from edgeshard.cluster.state import WorkerState
+from edgeshard.cluster.state import WorkerState, WorkerStatus
 
 
 def _require_aware(value: datetime, field: str) -> None:
@@ -28,11 +28,20 @@ def _require_aware(value: datetime, field: str) -> None:
 
 @dataclass(frozen=True)
 class WorkerSnapshot:
-    """Everything known about one Worker at snapshot time (spec §38)."""
+    """Everything known about one Worker at snapshot time (spec §38).
+
+    ``identity``, ``capability`` and ``state`` are Worker-reported facts;
+    ``status``, ``session_id`` and ``last_seen_at`` are Master-assigned
+    bookkeeping layered on top. Construction cross-validates the reported
+    state against the capability and fails loudly on any dangling reference.
+    """
 
     identity: WorkerIdentity
     capability: WorkerCapability
     state: WorkerState
+
+    status: WorkerStatus
+    """Master-assigned liveness (spec §32); never reported by the Worker."""
 
     session_id: str | None
     """Current registration session, or ``None`` if never registered."""
@@ -53,6 +62,32 @@ class WorkerSnapshot:
             raise ValueError("session_id must not be empty when present")
         if self.last_seen_at is not None:
             _require_aware(self.last_seen_at, "last_seen_at")
+
+        known_devices = {device.identity.device_id for device in self.capability.devices}
+        known_pools = {pool.memory_pool_id for pool in self.capability.memory_pools}
+
+        for device_state in self.state.device_states:
+            if device_state.device_id not in known_devices:
+                raise ValueError(
+                    f"device state references unknown device {device_state.device_id!r}"
+                )
+        for memory_state in self.state.memory_states:
+            if memory_state.memory_pool_id not in known_pools:
+                raise ValueError(
+                    f"memory state references unknown memory pool "
+                    f"{memory_state.memory_pool_id!r}"
+                )
+        for instance in self.state.runtime_instances:
+            unknown = [
+                device_id
+                for device_id in instance.device_ids
+                if device_id not in known_devices
+            ]
+            if unknown:
+                raise ValueError(
+                    f"runtime instance {instance.runtime_id!r} references "
+                    f"unknown device(s): {', '.join(repr(u) for u in unknown)}"
+                )
 
 
 @dataclass(frozen=True)

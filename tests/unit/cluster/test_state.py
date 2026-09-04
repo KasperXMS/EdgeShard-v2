@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 import pytest
 from factories import make_worker_state
 
@@ -9,6 +11,7 @@ from edgeshard.cluster.state import (
     DeviceAvailability,
     DeviceState,
     MemoryPoolState,
+    WorkerState,
     WorkerStatus,
 )
 
@@ -37,10 +40,15 @@ def test_worker_status_values() -> None:
     assert [status.value for status in WorkerStatus] == ["online", "suspect", "offline"]
 
 
+def test_worker_state_carries_no_liveness_status() -> None:
+    """Liveness is Master-assigned and never part of the reported state."""
+    field_names = {field.name for field in dataclasses.fields(WorkerState)}
+    assert "status" not in field_names
+
+
 def test_worker_state_assembles() -> None:
     state = make_worker_state("worker-1", device_ids=("gpu-a", "gpu-b"), pool_ids=("pool-a",))
     assert state.worker_id == "worker-1"
-    assert state.status is WorkerStatus.ONLINE
     assert [device.device_id for device in state.device_states] == ["gpu-a", "gpu-b"]
     assert len(state.runtime_instances) == 1
     assert len(state.models) == 1
