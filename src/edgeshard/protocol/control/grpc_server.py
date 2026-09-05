@@ -1,8 +1,9 @@
 """Async gRPC servicer for the Worker control plane (Phase 1 spec §28).
 
 The servicer owns only the wire side: mapping request DTOs to domain
-objects, delegating to a :class:`WorkerRegistryHandler` (implemented by the
-Master, milestone P1F), and mapping responses back. Domain-level protocol
+objects, delegating to a :class:`WorkerRegistryHandler` (implemented by
+``edgeshard.control.master.service.MasterService``), and mapping responses
+back. Domain-level protocol
 violations abort the RPC explicitly with ``INVALID_ARGUMENT`` instead of
 returning silently degraded results (spec §47); semantic rejections (stale
 session, out-of-order heartbeat) are *not* transport errors — they travel as

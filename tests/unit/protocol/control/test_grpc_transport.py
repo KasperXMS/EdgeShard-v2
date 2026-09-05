@@ -1,7 +1,9 @@
 """Control-plane gRPC transport tests (Phase 1 spec §28, §40).
 
-An in-process ``grpc.aio`` server with a recording handler stands in for the
-Master (real Master state lands in P1F): domain objects must cross the wire
+An in-process ``grpc.aio`` server with a recording handler isolates the
+transport layer (Master semantics are tested against the real
+``MasterService`` in tests/unit/control/master and tests/integration/control):
+domain objects must cross the wire
 and back unchanged, and protocol violations must surface as explicit gRPC
 errors instead of degraded responses (spec §47).
 """

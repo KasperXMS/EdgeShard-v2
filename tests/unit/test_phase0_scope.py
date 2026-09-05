@@ -8,9 +8,9 @@ production master, ...) do not exist anywhere. Any accidental introduction
 fails in Tier 1.
 
 Phase 1 status: the pure ``cluster`` domain package is admitted (spec §7);
-``control`` holds the Mock Master plus the production Worker Agent from
-milestone P1B onward. The production Master lands under ``control`` in a
-later milestone.
+``control`` holds the Mock Master, the production Worker Agent from
+milestone P1B onward, and the production Master state components from
+milestone P1F onward. Scheduler/profiling/placement remain deferred (§57).
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ FORBIDDEN_SUBMODULES = (
     "edgeshard.scheduler",
     "edgeshard.worker",
     "edgeshard.profiling",
-    "edgeshard.master",  # production master; only control.mock exists so far
+    "edgeshard.master",  # the production Master is edgeshard.control.master (P1F)
     "edgeshard.placement",
 )
 FORBIDDEN_FILE_STEMS = {
@@ -62,12 +62,13 @@ def test_only_expected_packages_exist() -> None:
 
 
 def test_control_contains_only_milestone_components() -> None:
-    # P1B admits the production Worker Agent (spec §56); the production
-    # Master is still deferred.
+    # P1B admits the production Worker Agent; P1F admits the production
+    # Master state components (spec §33, §56). SnapshotBuilder joins the
+    # master package in P1H; scheduler-like modules stay deferred (§57).
     entries = {
         path.name for path in (SRC / "control").iterdir() if path.name != "__pycache__"
     }
-    assert entries == {"__init__.py", "mock", "worker"}
+    assert entries == {"__init__.py", "mock", "worker", "master"}
 
 
 def test_no_future_phase_modules_are_importable() -> None:
