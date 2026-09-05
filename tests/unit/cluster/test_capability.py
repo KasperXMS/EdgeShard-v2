@@ -6,7 +6,6 @@ import dataclasses
 import re
 
 import pytest
-from factories import PLACEHOLDER_REVISION, finalize, make_jetson_capability, make_rtx_capability
 
 from edgeshard.cluster.capability import (
     MemoryModel,
@@ -17,6 +16,7 @@ from edgeshard.cluster.capability import (
     compute_capability_revision,
 )
 from edgeshard.cluster.identity import DeviceKind
+from factories import PLACEHOLDER_REVISION, finalize, make_jetson_capability, make_rtx_capability
 
 
 def test_rtx_capability_memory_topology() -> None:

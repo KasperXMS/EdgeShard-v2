@@ -76,6 +76,12 @@ development hosts (the example uses the production location).
 Hardware-specific probe validation lives in `tests/platform/` and is
 selected with `pytest -m rtx` / `pytest -m jetson`.
 
+The Master/Worker control plane speaks `proto/worker_control.proto`
+(`RegisterWorker` / `Heartbeat` / `UpdateCapability` over gRPC). The wire
+DTOs are mapped to/from the `edgeshard.cluster` domain model only at
+`edgeshard.protocol.control.mapper`; the transport is `grpc.aio`
+(`protocol/control/grpc_client.py` + `grpc_server.py`).
+
 ## Examples
 
 - `examples/configs/` — `ShardRuntimeConfig` YAML (spec 19.1): a host
@@ -104,7 +110,7 @@ Tests never require internet access; they use locally generated tiny models.
 ## Regenerating protocol buffers
 
 Generated code is committed; regenerate only when `proto/shard_runtime.proto`
-changes:
+or `proto/worker_control.proto` changes:
 
 ```sh
 uv run python scripts/generate_proto.py

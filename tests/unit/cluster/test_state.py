@@ -5,7 +5,6 @@ from __future__ import annotations
 import dataclasses
 
 import pytest
-from factories import make_worker_state
 
 from edgeshard.cluster.state import (
     DeviceAvailability,
@@ -14,6 +13,7 @@ from edgeshard.cluster.state import (
     WorkerState,
     WorkerStatus,
 )
+from factories import make_worker_state
 
 
 def make_device_state(device_id: str = "gpu-0") -> DeviceState:

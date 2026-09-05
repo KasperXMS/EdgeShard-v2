@@ -21,16 +21,9 @@ from pathlib import Path
 from edgeshard import __version__
 from edgeshard.cluster.identity import WorkerIdentity
 from edgeshard.model.errors import EdgeShardError
+from edgeshard.protocol.control.mapper import CONTROL_PROTOCOL_VERSION
 
 logger = logging.getLogger("worker.identity")
-
-CONTROL_PROTOCOL_VERSION = "1"
-"""Control-plane protocol revision this Agent speaks.
-
-Superseded by the wire-protocol constant when ``protocol.control`` lands in
-milestone P1E; kept here so P1B identity and inspection output already carry
-a protocol version.
-"""
 
 _CPU_DEVICE_KEY = "host-cpu"
 _JETSON_GPU_DEVICE_KEY = "tegra-gpu"

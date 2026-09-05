@@ -1,0 +1,277 @@
+// EdgeShard v2 Phase 1 — Master/Worker control plane protocol (spec 28).
+//
+// Wire DTOs only (spec 40): the cluster domain model lives in Python
+// dataclasses under edgeshard.cluster and is translated explicitly by
+// edgeshard.protocol.control.mapper — generated protobuf objects never reach
+// WorkerRegistry/StateStore/SnapshotBuilder (spec 40) or any future
+// scheduler (spec 59).
+//
+// Missing telemetry is encoded as field absence via proto3 `optional`, never
+// as a sentinel value: an absent power reading (None) is not the same fact as
+// a zero reading (spec 17). Deployment RPCs are deliberately absent in
+// Phase 1 (spec 28).
+
+syntax = "proto3";
+
+package edgeshard.control.v1;
+
+// ---------------------------------------------------------------------------
+// Identity (spec 10)
+// ---------------------------------------------------------------------------
+
+message WorkerIdentity {
+  string worker_id = 1;
+  string hostname = 2;
+  string agent_version = 3;
+  string protocol_version = 4;
+}
+
+// ---------------------------------------------------------------------------
+// Capability (spec 12-16)
+// ---------------------------------------------------------------------------
+
+enum DeviceKind {
+  DEVICE_KIND_UNSPECIFIED = 0;
+  DEVICE_KIND_CPU = 1;
+  DEVICE_KIND_GPU = 2;
+  DEVICE_KIND_NPU = 3;
+  DEVICE_KIND_OTHER = 4;
+}
+
+enum MemoryModel {
+  MEMORY_MODEL_UNSPECIFIED = 0;
+  MEMORY_MODEL_DISCRETE = 1;
+  MEMORY_MODEL_SHARED = 2;
+}
+
+message DeviceIdentity {
+  string device_id = 1;
+  DeviceKind kind = 2;
+  // Host-local handle (PCI address, CUDA ordinal); informational only and
+  // never used as identity (spec 11).
+  string local_locator = 3;
+}
+
+message MemoryPoolCapability {
+  string memory_pool_id = 1;
+  MemoryModel model = 2;
+  int64 total_bytes = 3;
+}
+
+message OSInfo {
+  string name = 1;
+  optional string version = 2;
+  optional string kernel = 3;
+}
+
+message ContainerRuntimeCapability {
+  string runtime = 1;
+  optional string version = 2;
+  bool nvidia_runtime_available = 3;
+}
+
+message NetworkInterfaceCapability {
+  string interface_id = 1;
+  string name = 2;
+  repeated string addresses = 3;
+  optional int32 mtu = 4;
+}
+
+message RuntimePlatformCapability {
+  string backend = 1;
+  string platform = 2;
+  optional string image = 3;
+}
+
+message DeviceCapability {
+  DeviceIdentity identity = 1;
+
+  string vendor = 2;
+  string model = 3;
+
+  optional string compute_capability = 4;
+
+  // The physical memory pool this device draws from (spec 12); several
+  // devices may reference the same shared pool (Jetson, spec 14).
+  optional string memory_pool_id = 5;
+
+  repeated string supported_dtypes = 6;
+  optional string driver_version = 7;
+  repeated string platform_tags = 8;
+}
+
+message WorkerCapability {
+  string architecture = 1;
+  OSInfo os = 2;
+
+  optional ContainerRuntimeCapability container_runtime = 3;
+
+  repeated NetworkInterfaceCapability network_interfaces = 4;
+  repeated DeviceCapability devices = 5;
+  repeated MemoryPoolCapability memory_pools = 6;
+  repeated RuntimePlatformCapability runtime_platforms = 7;
+
+  // Deterministic fingerprint of this capability (spec 16).
+  string capability_revision = 8;
+}
+
+// ---------------------------------------------------------------------------
+// Dynamic state (spec 17-20)
+// ---------------------------------------------------------------------------
+
+enum DeviceAvailability {
+  DEVICE_AVAILABILITY_UNSPECIFIED = 0;
+  DEVICE_AVAILABILITY_AVAILABLE = 1;
+  DEVICE_AVAILABILITY_UNAVAILABLE = 2;
+  DEVICE_AVAILABILITY_UNKNOWN = 3;
+}
+
+enum RuntimeStatus {
+  RUNTIME_STATUS_UNSPECIFIED = 0;
+  RUNTIME_STATUS_CREATED = 1;
+  RUNTIME_STATUS_RUNNING = 2;
+  RUNTIME_STATUS_STOPPED = 3;
+  RUNTIME_STATUS_FAILED = 4;
+  RUNTIME_STATUS_UNKNOWN = 5;
+}
+
+enum ModelAvailability {
+  MODEL_AVAILABILITY_UNSPECIFIED = 0;
+  MODEL_AVAILABILITY_READY = 1;
+  MODEL_AVAILABILITY_INCOMPLETE = 2;
+  MODEL_AVAILABILITY_INVALID = 3;
+}
+
+message DeviceState {
+  string device_id = 1;
+
+  // Percentages/metrics as double so telemetry survives the round trip
+  // exactly. Absent field == missing telemetry (None), never zero (spec 17).
+  optional double utilization = 2;
+  optional double temperature_c = 3;
+  optional double power_w = 4;
+
+  DeviceAvailability availability = 5;
+
+  repeated string running_runtime_ids = 6;
+}
+
+message MemoryPoolState {
+  string memory_pool_id = 1;
+  optional int64 available_bytes = 2;
+}
+
+message RuntimeInstanceState {
+  string runtime_id = 1;
+  string backend = 2;
+
+  optional string execution_id = 3;
+
+  RuntimeStatus status = 4;
+
+  repeated string device_ids = 5;
+
+  optional string container_id = 6;
+  optional string endpoint = 7;
+  optional string model_local_name = 8;
+}
+
+message ModelInventoryEntry {
+  // Logical model identity only; host paths never cross to the Master
+  // (spec 20).
+  string local_name = 1;
+
+  optional string model_id = 2;
+  optional string revision = 3;
+  optional int64 size_bytes = 4;
+
+  ModelAvailability status = 5;
+}
+
+message WorkerState {
+  string worker_id = 1;
+
+  repeated DeviceState device_states = 2;
+  repeated MemoryPoolState memory_states = 3;
+
+  repeated RuntimeInstanceState runtime_instances = 4;
+  repeated ModelInventoryEntry models = 5;
+}
+
+// ---------------------------------------------------------------------------
+// RPC messages (spec 29-30)
+// ---------------------------------------------------------------------------
+
+message RegisterWorkerRequest {
+  string protocol_version = 1;
+
+  // worker_id/instance_id scope: persistent installation identity vs. one
+  // Agent process (spec 10.1, 10.2).
+  string worker_id = 2;
+  string instance_id = 3;
+
+  WorkerIdentity identity = 4;
+
+  // Must equal capability.capability_revision (spec 16).
+  string capability_revision = 5;
+  WorkerCapability capability = 6;
+
+  WorkerState initial_state = 7;
+}
+
+message RegisterWorkerResponse {
+  string session_id = 1;
+  int32 heartbeat_interval_ms = 2;
+  string server_protocol_version = 3;
+}
+
+message HeartbeatRequest {
+  string worker_id = 1;
+  string instance_id = 2;
+  string session_id = 3;
+
+  // Begins at a known value after registration and increases monotonically
+  // (spec 30); out-of-order heartbeats must never overwrite newer state.
+  int64 sequence_number = 4;
+
+  // Worker wall clock, debugging aid only; Master liveness uses its own
+  // monotonic receive timestamps (spec 31).
+  optional int64 worker_reported_at_ms = 5;
+
+  string capability_revision = 6;
+
+  WorkerState state = 7;
+}
+
+message HeartbeatResponse {
+  bool accepted = 1;
+  // Mandatory explanation whenever a heartbeat is rejected (spec 46
+  // observability).
+  string detail = 2;
+}
+
+message UpdateCapabilityRequest {
+  string worker_id = 1;
+  string instance_id = 2;
+  string session_id = 3;
+
+  WorkerCapability capability = 4;
+}
+
+message UpdateCapabilityResponse {
+  bool accepted = 1;
+  string detail = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Service (spec 28)
+// ---------------------------------------------------------------------------
+
+service WorkerRegistryService {
+  rpc RegisterWorker(RegisterWorkerRequest) returns (RegisterWorkerResponse);
+
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+
+  rpc UpdateCapability(UpdateCapabilityRequest)
+      returns (UpdateCapabilityResponse);
+}

@@ -1,10 +1,14 @@
-"""Shared builders for cluster domain tests (Phase 1 spec §13-14).
+"""Shared builders for cluster/control-plane tests (Phase 1 spec §13-14).
+
+Lives at the ``tests/`` root so every test directory can ``from factories
+import ...`` (pytest puts the root conftest's directory on ``sys.path``).
 
 ``make_rtx_capability`` and ``make_jetson_capability`` model the two
 reference platforms of Phase 1 - a discrete-GPU host with independent VRAM
 pools, and a Jetson host whose CPU and GPU share one system-memory pool.
 The integration suite reuses the same shapes for fake Worker fixtures
-(spec §52 Test B).
+(spec §52 Test B), and the control-protocol tests reuse them as wire
+payloads (spec §40).
 
 ``make_worker_state`` defaults to ids drawn from the RTX capability so
 capability and state compose into a consistent ``WorkerSnapshot``.

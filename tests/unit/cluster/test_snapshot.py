@@ -6,7 +6,6 @@ import dataclasses
 from datetime import UTC, datetime
 
 import pytest
-from factories import make_rtx_capability, make_worker_identity, make_worker_state
 
 from edgeshard.cluster.snapshot import ClusterSnapshot, WorkerSnapshot
 from edgeshard.cluster.state import (
@@ -16,6 +15,7 @@ from edgeshard.cluster.state import (
     WorkerState,
     WorkerStatus,
 )
+from factories import make_rtx_capability, make_worker_identity, make_worker_state
 
 CREATED_AT = datetime(2026, 9, 5, 12, 0, 0, tzinfo=UTC)
 LAST_SEEN_AT = datetime(2026, 9, 5, 11, 59, 58, tzinfo=UTC)
