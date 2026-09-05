@@ -63,9 +63,14 @@ class HostCapabilityProbe:
         self,
         worker_id: str,
         docker_client_factory: Callable[[], Any] | None = None,
+        *,
+        memory_pool_id: str = HOST_MEMORY_POOL_ID,
     ) -> None:
         self._worker_id = worker_id
         self._docker_client_factory = docker_client_factory or docker.from_env
+        # Jetson hosts reuse this probe with the shared system-memory pool id
+        # (spec §14); discrete/host hosts keep the default.
+        self._memory_pool_id = memory_pool_id
 
     def discover(self) -> CapabilityFragment:
         architecture = canonical_architecture(platform.machine())
@@ -77,7 +82,7 @@ class HostCapabilityProbe:
             devices=(self._cpu_device(architecture),),
             memory_pools=(
                 MemoryPoolCapability(
-                    memory_pool_id=HOST_MEMORY_POOL_ID,
+                    memory_pool_id=self._memory_pool_id,
                     model=MemoryModel.SHARED,
                     total_bytes=int(psutil.virtual_memory().total),
                 ),
@@ -112,7 +117,7 @@ class HostCapabilityProbe:
             vendor=machine,
             model=platform.processor() or machine,
             compute_capability=None,
-            memory_pool_id=HOST_MEMORY_POOL_ID,
+            memory_pool_id=self._memory_pool_id,
             # Phase 0 CPU runtimes execute fp32 shards (containers/hf CPU image).
             supported_dtypes=("fp32",),
             driver_version=None,

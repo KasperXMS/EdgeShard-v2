@@ -33,6 +33,7 @@ a protocol version.
 """
 
 _CPU_DEVICE_KEY = "host-cpu"
+_JETSON_GPU_DEVICE_KEY = "tegra-gpu"
 
 
 class IdentityError(EdgeShardError):
@@ -91,6 +92,17 @@ def derive_cpu_device_id(worker_id: str) -> str:
     stable as the identity file itself.
     """
     return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"edgeshard:{worker_id}:{_CPU_DEVICE_KEY}"))
+
+
+def derive_jetson_gpu_device_id(worker_id: str) -> str:
+    """Stable identity of the Jetson integrated GPU (spec §11).
+
+    Like the host CPU, the integrated GPU has no hardware UUID; the id is
+    derived from ``worker_id`` plus a stable platform device key.
+    """
+    return str(
+        uuid.uuid5(uuid.NAMESPACE_DNS, f"edgeshard:{worker_id}:{_JETSON_GPU_DEVICE_KEY}")
+    )
 
 
 def new_instance_id() -> str:

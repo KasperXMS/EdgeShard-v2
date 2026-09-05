@@ -28,12 +28,14 @@ from edgeshard.cluster.state import DeviceState, WorkerState
 from edgeshard.control.worker.config import WorkerConfig
 from edgeshard.control.worker.discovery.base import CapabilityFragment, CapabilityProbe
 from edgeshard.control.worker.discovery.host import HostCapabilityProbe
+from edgeshard.control.worker.discovery.jetson import JetsonPlatformProbe, is_jetson_host
 from edgeshard.control.worker.discovery.nvidia import NvidiaCapabilityProbe
 from edgeshard.control.worker.identity import IdentityManager, build_worker_identity
 from edgeshard.control.worker.model_inventory import scan_model_inventory
 from edgeshard.control.worker.runtime_inventory import scan_runtime_inventory
 from edgeshard.control.worker.telemetry.base import TelemetryProbe
 from edgeshard.control.worker.telemetry.host import HostTelemetryProbe
+from edgeshard.control.worker.telemetry.jetson import JetsonTelemetryBackend
 from edgeshard.control.worker.telemetry.nvidia import NvidiaTelemetryProbe
 from edgeshard.runtime.model_store import ModelStore
 
@@ -129,26 +131,29 @@ async def inspect_local_worker(
     """The local portion of the Agent lifecycle (spec §27), Master-less.
 
     Probe and client injection points exist for tests; production callers
-    rely on the defaults (host + NVIDIA probes, psutil/NVML telemetry,
-    Docker SDK). Backends without the corresponding hardware report empty
-    fragments rather than failing (spec §47).
+    rely on the platform-appropriate defaults (host + NVIDIA probes on
+    generic/RTX hosts, the dedicated Jetson backend on Jetson - spec §23).
+    Backends without the corresponding hardware report empty fragments
+    rather than failing (spec §47). Injected probes are owned by the
+    caller; default samplers are closed after sampling (tegrastats
+    lifecycle, spec §24).
     """
     worker_id = IdentityManager(config.worker.identity_path).load_or_create()
     identity = build_worker_identity(worker_id)
 
     if capability_probes is None:
-        capability_probes = (HostCapabilityProbe(worker_id), NvidiaCapabilityProbe())
+        capability_probes = _default_capability_probes(worker_id)
     capability = assemble_capability([probe.discover() for probe in capability_probes])
 
+    owns_samplers = telemetry_probes is None
     samplers = (
-        telemetry_probes
-        if telemetry_probes is not None
-        else (
-            HostTelemetryProbe(worker_id, cpu_sample_interval_s=0.25),
-            NvidiaTelemetryProbe(),
-        )
+        telemetry_probes if telemetry_probes is not None else _default_telemetry_probes(worker_id)
     )
-    state_fragments = [await sampler.sample() for sampler in samplers]
+    try:
+        state_fragments = [await sampler.sample() for sampler in samplers]
+    finally:
+        if owns_samplers:
+            await _close_samplers(samplers)
 
     models = scan_model_inventory(ModelStore(model_root=config.model_store.root))
     runtime_instances = ()
@@ -176,6 +181,35 @@ async def inspect_local_worker(
         len(models),
     )
     return LocalInspection(identity=identity, capability=capability, state=state)
+
+
+def _default_capability_probes(worker_id: str) -> tuple[CapabilityProbe, ...]:
+    """Platform-appropriate discovery set.
+
+    Jetson is never modeled as a discrete NVML GPU host (spec §23): the
+    dedicated platform probe replaces both the host and NVIDIA probes.
+    """
+    if is_jetson_host():
+        return (JetsonPlatformProbe(worker_id),)
+    return (HostCapabilityProbe(worker_id), NvidiaCapabilityProbe())
+
+
+def _default_telemetry_probes(worker_id: str) -> tuple[TelemetryProbe, ...]:
+    """Platform-appropriate telemetry set (mirrors the discovery split)."""
+    if is_jetson_host():
+        return (JetsonTelemetryBackend(worker_id, cpu_sample_interval_s=0.25),)
+    return (
+        HostTelemetryProbe(worker_id, cpu_sample_interval_s=0.25),
+        NvidiaTelemetryProbe(),
+    )
+
+
+async def _close_samplers(samplers: Sequence[TelemetryProbe]) -> None:
+    """Stop default samplers that hold resources (tegrastats, spec §24)."""
+    for sampler in samplers:
+        close = getattr(sampler, "close", None)
+        if callable(close):
+            await close()
 
 
 def _scan_runtimes(docker_client: Any) -> tuple[Any, ...]:

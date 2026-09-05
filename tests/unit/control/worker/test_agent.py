@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
 import pytest
+from fake_nvml import DEFAULT_UUID, FakeGpu, FakeNvml
 
 from edgeshard.cluster.capability import (
     DeviceCapability,
@@ -36,7 +38,19 @@ from edgeshard.control.worker.config import (
     WorkerSection,
 )
 from edgeshard.control.worker.discovery.base import CapabilityFragment
-from edgeshard.control.worker.identity import derive_cpu_device_id
+from edgeshard.control.worker.discovery.host import HostCapabilityProbe
+from edgeshard.control.worker.discovery.jetson import (
+    SYSTEM_MEMORY_POOL_ID,
+    JetsonPlatformProbe,
+)
+from edgeshard.control.worker.discovery.nvidia import NvidiaCapabilityProbe
+from edgeshard.control.worker.identity import IdentityManager, derive_cpu_device_id
+from edgeshard.control.worker.telemetry.host import HostTelemetryProbe
+from edgeshard.control.worker.telemetry.jetson import (
+    JetsonTelemetryBackend,
+    TegrastatsProcess,
+)
+from edgeshard.control.worker.telemetry.nvidia import NvidiaTelemetryProbe
 from edgeshard.runtime import labels
 
 
@@ -267,3 +281,144 @@ async def test_inspect_without_runtime_discovery_reports_no_runtimes(tmp_path: P
 async def test_inspect_tolerates_explicit_none_docker_client(tmp_path: Path) -> None:
     inspection = await inspect_local_worker(make_config(tmp_path), docker_client=None)
     assert inspection.state.runtime_instances == ()
+
+
+async def test_inspect_uses_jetson_backend_on_jetson_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """§23/§56: on Jetson the dedicated backend replaces host + NVML probes.
+
+    One shared system-memory pool referenced by both CPU and GPU; state ids
+    stay snapshot-consistent. (tegrastats is absent off-hardware, so GPU
+    telemetry degrades to UNKNOWN instead of failing.)
+    """
+    import edgeshard.control.worker.agent as agent_module
+
+    monkeypatch.setattr(agent_module, "is_jetson_host", lambda: True)
+
+    inspection = await inspect_local_worker(make_config(tmp_path, discover=False))
+
+    pool_ids = {pool.memory_pool_id for pool in inspection.capability.memory_pools}
+    assert pool_ids == {SYSTEM_MEMORY_POOL_ID}
+    assert {device.memory_pool_id for device in inspection.capability.devices} == {
+        SYSTEM_MEMORY_POOL_ID
+    }
+    assert {device.identity.kind for device in inspection.capability.devices} == {
+        DeviceKind.CPU,
+        DeviceKind.GPU,
+    }
+
+    state_device_ids = {state.device_id for state in inspection.state.device_states}
+    capability_device_ids = {
+        device.identity.device_id for device in inspection.capability.devices
+    }
+    assert state_device_ids == capability_device_ids
+    assert derive_cpu_device_id(inspection.identity.worker_id) in state_device_ids
+
+    WorkerSnapshot(
+        identity=inspection.identity,
+        capability=inspection.capability,
+        state=inspection.state,
+        status=WorkerStatus.ONLINE,
+        session_id=None,
+        last_seen_at=None,
+    )
+
+
+def _no_docker() -> object:
+    raise RuntimeError("no docker daemon in this test")
+
+
+TEGRASTATS_LINE = "RAM 3214/30536MB GR3D_FREQ 34% CPU@46.5C VDD_GPU_SOC 5.2W"
+
+
+async def test_resource_abstraction_represents_rtx_and_jetson(tmp_path: Path) -> None:
+    """§56: one Agent lifecycle represents both reference platforms.
+
+    RTX host: discrete GPU with an independent VRAM pool (spec §13).
+    Jetson host: CPU and integrated GPU sharing one system-memory pool
+    (spec §14) - never two independent resources.
+    """
+    config = make_config(tmp_path, discover=False)
+    worker_id = IdentityManager(config.worker.identity_path).load_or_create()
+
+    # --- RTX-like topology -------------------------------------------------
+    rtx = await inspect_local_worker(
+        config,
+        capability_probes=(
+            HostCapabilityProbe(worker_id, docker_client_factory=_no_docker),
+            NvidiaCapabilityProbe(FakeNvml([FakeGpu()])),
+        ),
+        telemetry_probes=(
+            HostTelemetryProbe(worker_id),
+            NvidiaTelemetryProbe(FakeNvml([FakeGpu()])),
+        ),
+        docker_client=None,
+    )
+    rtx_pools = {pool.memory_pool_id: pool for pool in rtx.capability.memory_pools}
+    assert "host-memory" in rtx_pools
+    gpu_pool = f"gpu-{DEFAULT_UUID}-vram"
+    assert rtx_pools[gpu_pool].model is MemoryModel.DISCRETE
+    assert {device.identity.kind for device in rtx.capability.devices} == {
+        DeviceKind.CPU,
+        DeviceKind.GPU,
+    }
+    gpu_device = next(
+        device
+        for device in rtx.capability.devices
+        if device.identity.device_id == DEFAULT_UUID
+    )
+    assert gpu_device.memory_pool_id == gpu_pool
+    gpu_state = next(s for s in rtx.state.device_states if s.device_id == DEFAULT_UUID)
+    assert gpu_state.utilization == 17.0
+    assert any(m.memory_pool_id == gpu_pool for m in rtx.state.memory_states)
+
+    # --- Jetson-like topology ----------------------------------------------
+    script = tmp_path / "fake_tegrastats.py"
+    script.write_text(
+        "import time\n"
+        f"line = {TEGRASTATS_LINE!r}\n"
+        "while True:\n"
+        "    print(line, flush=True)\n"
+        "    time.sleep(0.05)\n",
+        encoding="utf-8",
+    )
+    backend = JetsonTelemetryBackend(
+        worker_id, tegrastats=TegrastatsProcess(command=(sys.executable, str(script)))
+    )
+    try:
+        jetson = await inspect_local_worker(
+            config,
+            capability_probes=(
+                JetsonPlatformProbe(worker_id, docker_client_factory=_no_docker),
+            ),
+            telemetry_probes=(backend,),
+            docker_client=None,
+        )
+    finally:
+        await backend.close()
+
+    assert {pool.memory_pool_id for pool in jetson.capability.memory_pools} == {
+        SYSTEM_MEMORY_POOL_ID
+    }
+    assert jetson.capability.memory_pools[0].model is MemoryModel.SHARED
+    assert {device.memory_pool_id for device in jetson.capability.devices} == {
+        SYSTEM_MEMORY_POOL_ID
+    }
+    assert {device.identity.kind for device in jetson.capability.devices} == {
+        DeviceKind.CPU,
+        DeviceKind.GPU,
+    }
+    (memory_state,) = jetson.state.memory_states
+    assert memory_state.memory_pool_id == SYSTEM_MEMORY_POOL_ID
+
+    # Both views pass the Master-side consistency checks (spec §38).
+    for inspection in (rtx, jetson):
+        WorkerSnapshot(
+            identity=inspection.identity,
+            capability=inspection.capability,
+            state=inspection.state,
+            status=WorkerStatus.ONLINE,
+            session_id=None,
+            last_seen_at=None,
+        )
