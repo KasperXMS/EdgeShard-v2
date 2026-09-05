@@ -1,15 +1,16 @@
 """Bundled examples stay parseable: configs and manifests from examples/.
 
 Every shipped example must parse through the same strict models the
-runtime, the Worker Agent, and the Mock Master use, so documentation cannot
-drift from the schemas (spec 28: examples are part of the Definition of
-Done; Phase 1 spec §61).
+runtime, the Worker Agent, the Master, and the Mock Master use, so
+documentation cannot drift from the schemas (spec 28: examples are part of
+the Definition of Done; Phase 1 spec §61).
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
+from edgeshard.control.master.config import MasterServeConfig
 from edgeshard.control.mock.manifest import DeploymentManifest
 from edgeshard.control.worker.config import WorkerConfig
 from edgeshard.runtime.config import ShardRuntimeConfig
@@ -21,7 +22,7 @@ def test_all_example_runtime_configs_parse() -> None:
     paths = sorted(
         path
         for path in (EXAMPLES_DIR / "configs").glob("*.yaml")
-        if not path.name.startswith("worker")
+        if not path.name.startswith(("worker", "master"))
     )
     assert paths, "examples/configs/ should not be empty"
     for path in paths:
@@ -33,6 +34,14 @@ def test_all_example_worker_configs_parse() -> None:
     assert paths, "examples/configs/ should contain a worker example"
     for path in paths:
         WorkerConfig.from_yaml(path)
+
+
+def test_all_example_master_configs_parse() -> None:
+    paths = sorted((EXAMPLES_DIR / "configs").glob("master*.yaml"))
+    assert paths, "examples/configs/ should contain a master example"
+    for path in paths:
+        config = MasterServeConfig.from_yaml(path)
+        config.to_master_config()  # timing invariants must hold too
 
 
 def test_all_example_manifests_parse() -> None:

@@ -92,6 +92,18 @@ def test_worker_group_lists_inspect() -> None:
     assert "inspect" in result.output
 
 
+def test_worker_group_lists_serve() -> None:
+    result = runner.invoke(app, ["worker", "--help"])
+    assert result.exit_code == 0
+    assert "serve" in result.output
+
+
+def test_master_group_lists_serve() -> None:
+    result = runner.invoke(app, ["master", "--help"])
+    assert result.exit_code == 0
+    assert "serve" in result.output
+
+
 def test_runtime_group_lists_serve() -> None:
     result = runner.invoke(app, ["runtime", "--help"])
     assert result.exit_code == 0
@@ -128,3 +140,41 @@ def test_legacy_bare_config_routes_to_runtime_serve(
     result = runner.invoke(app, ["--config", str(config_file)])
     assert result.exit_code == 0, result.output
     assert calls == [config_file]
+
+
+# ---------------------------------------------------------------------------
+# Serve error paths (spec §44-45, P1G): fail loudly before any I/O.
+# Happy paths run in tests/integration/control as real processes.
+# ---------------------------------------------------------------------------
+
+
+def test_worker_serve_without_master_endpoint_exits_nonzero(tmp_path: Path) -> None:
+    # §26: worker.master is optional for inspect but required for serve.
+    config = write_worker_config(tmp_path)
+    result = runner.invoke(app, ["worker", "serve", "--config", str(config)])
+    assert result.exit_code == 1
+
+
+def test_worker_serve_invalid_config_exits_nonzero(tmp_path: Path) -> None:
+    path = tmp_path / "bad.yaml"
+    path.write_text(yaml.safe_dump({"worker": {"bogus": 1}}), encoding="utf-8")
+    result = runner.invoke(app, ["worker", "serve", "--config", str(path)])
+    assert result.exit_code == 1
+
+
+def test_master_serve_invalid_config_exits_nonzero(tmp_path: Path) -> None:
+    path = tmp_path / "bad-master.yaml"
+    path.write_text(yaml.safe_dump({"master": {"port": -1}}), encoding="utf-8")
+    result = runner.invoke(app, ["master", "serve", "--config", str(path)])
+    assert result.exit_code == 1
+
+
+def test_master_serve_unsafe_thresholds_exit_nonzero(tmp_path: Path) -> None:
+    # offline_after_ms below the default suspect threshold violates §32;
+    # the semantic core rejects it before the server ever binds.
+    path = tmp_path / "unsafe-master.yaml"
+    path.write_text(
+        yaml.safe_dump({"master": {"offline_after_ms": 5_000}}), encoding="utf-8"
+    )
+    result = runner.invoke(app, ["master", "serve", "--config", str(path)])
+    assert result.exit_code == 1

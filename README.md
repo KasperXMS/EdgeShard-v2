@@ -82,11 +82,30 @@ DTOs are mapped to/from the `edgeshard.cluster` domain model only at
 `edgeshard.protocol.control.mapper`; the transport is `grpc.aio`
 (`protocol/control/grpc_client.py` + `grpc_server.py`).
 
+## Run the control plane (Phase 1)
+
+```sh
+uv run edgeshard master serve --config examples/configs/master.yaml
+uv run edgeshard worker serve --config <worker.yaml>   # worker.master.endpoint required
+```
+
+`master serve` binds the WorkerRegistryService, prints
+`READY master endpoint=<host:port>` (port `0` asks the OS for a free
+port), then accepts registrations and heartbeats, tracks liveness
+(ONLINE → SUSPECT → OFFLINE, spec §32) and keeps the worker registry —
+no REST, dashboard or scheduler yet. `worker serve` runs the §27 Agent
+loop: persistent identity, per-process instance id, local discovery and
+telemetry, registration, heartbeats at the Master-dictated cadence, and
+reconnect with exponential backoff — a lost Master is never answered by
+restoring a stale session. Capability changes are detected per cycle and
+retransmitted via `UpdateCapability` (spec §16).
+
 ## Examples
 
 - `examples/configs/` — `ShardRuntimeConfig` YAML (spec 19.1): a host
-  process stage and a container stage; plus a `WorkerConfig` YAML
-  (Phase 1 spec §26) for `worker inspect` / `worker serve`.
+  process stage and a container stage; plus `WorkerConfig` and
+  `MasterServeConfig` YAML (Phase 1 spec §26, §45) for
+  `worker inspect` / `worker serve` / `master serve`.
 - `examples/manifests/` — `DeploymentManifest` YAML (spec 22.2): two-shard,
   three-shard, and mixed shard+vLLM deployments.
 - `containers/hf/` — pinned CPU / CUDA / Jetson shard Dockerfiles (see the

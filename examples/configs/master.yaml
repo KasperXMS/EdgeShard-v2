@@ -1,0 +1,21 @@
+# Example: Master serve configuration (Phase 1 spec §45).
+#
+# `edgeshard master serve --config master.yaml` binds the control plane and
+# prints `READY master endpoint=<host>:<port>` once listening. Port 0 asks
+# the OS for a free port (the READY line reports the bound one).
+#
+# Liveness defaults follow spec §32: heartbeat 5 s, SUSPECT beyond 10 s,
+# OFFLINE beyond 20 s. The invariant offline > suspect >= heartbeat is
+# validated at startup (a single missed heartbeat must never degrade a
+# Worker).
+master:
+  host: 0.0.0.0
+  port: 51000
+
+  heartbeat_interval_ms: 5000
+  suspect_after_ms: 10000
+  offline_after_ms: 20000
+  liveness_tick_ms: 1000
+
+tls:
+  enabled: false

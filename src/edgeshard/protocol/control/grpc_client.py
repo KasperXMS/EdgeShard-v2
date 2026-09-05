@@ -45,22 +45,26 @@ class WorkerRegistryClient:
         return self._endpoint
 
     async def register_worker(
-        self, request: mapper.RegisterWorkerRequest
+        self, request: mapper.RegisterWorkerRequest, *, timeout: float | None = None
     ) -> mapper.RegisterWorkerResponse:
-        wire = await self._stub.RegisterWorker(mapper.register_request_to_wire(request))
+        wire = await self._stub.RegisterWorker(
+            mapper.register_request_to_wire(request), timeout=timeout
+        )
         return mapper.register_response_from_wire(wire)
 
     async def heartbeat(
-        self, request: mapper.HeartbeatRequest
+        self, request: mapper.HeartbeatRequest, *, timeout: float | None = None
     ) -> mapper.HeartbeatResponse:
-        wire = await self._stub.Heartbeat(mapper.heartbeat_request_to_wire(request))
+        wire = await self._stub.Heartbeat(
+            mapper.heartbeat_request_to_wire(request), timeout=timeout
+        )
         return mapper.heartbeat_response_from_wire(wire)
 
     async def update_capability(
-        self, request: mapper.UpdateCapabilityRequest
+        self, request: mapper.UpdateCapabilityRequest, *, timeout: float | None = None
     ) -> mapper.UpdateCapabilityResponse:
         wire = await self._stub.UpdateCapability(
-            mapper.update_capability_request_to_wire(request)
+            mapper.update_capability_request_to_wire(request), timeout=timeout
         )
         return mapper.update_capability_response_from_wire(wire)
 

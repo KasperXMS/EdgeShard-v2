@@ -1,10 +1,12 @@
-"""MasterConfig validation tests (Phase 1 spec §32)."""
+"""MasterConfig validation tests (Phase 1 spec §32, §45)."""
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
-from edgeshard.control.master.config import MasterConfig
+from edgeshard.control.master.config import MasterConfig, MasterServeConfig
 
 
 def test_defaults_match_spec_32() -> None:
@@ -37,3 +39,73 @@ def test_thresholds_are_configurable() -> None:
 def test_invalid_config_rejected(kwargs: dict[str, int]) -> None:
     with pytest.raises(ValueError):
         MasterConfig(**kwargs)
+
+
+# ---------------------------------------------------------------------------
+# MasterServeConfig: the YAML layer `master serve` parses (spec §45, P1G)
+# ---------------------------------------------------------------------------
+
+
+def write_master_config(tmp_path: Path, extra: str = "") -> Path:
+    path = tmp_path / "master.yaml"
+    path.write_text(extra, encoding="utf-8")
+    return path
+
+
+def test_serve_config_defaults() -> None:
+    config = MasterServeConfig()
+    assert config.master.host == "0.0.0.0"
+    assert config.master.port == 51_000
+    assert config.tls.enabled is False
+    assert config.to_master_config() == MasterConfig()
+
+
+def test_serve_config_from_yaml(tmp_path: Path) -> None:
+    path = write_master_config(
+        tmp_path,
+        """
+master:
+  host: 127.0.0.1
+  port: 0
+  heartbeat_interval_ms: 100
+  suspect_after_ms: 200
+  offline_after_ms: 400
+  liveness_tick_ms: 5
+tls:
+  enabled: false
+""",
+    )
+    config = MasterServeConfig.from_yaml(path)
+    assert config.master.host == "127.0.0.1"
+    assert config.master.port == 0  # OS-chosen; READY reports the bound port
+    assert config.to_master_config() == MasterConfig(
+        heartbeat_interval_ms=100,
+        suspect_after_ms=200,
+        offline_after_ms=400,
+        liveness_tick_ms=5,
+    )
+
+
+def test_serve_config_empty_file_uses_defaults(tmp_path: Path) -> None:
+    config = MasterServeConfig.from_yaml(write_master_config(tmp_path))
+    assert config == MasterServeConfig()
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "master:\n  host: ''\n",  # empty host
+        "master:\n  port: -1\n",  # negative port
+        "master:\n  port: 65536\n",  # port out of range
+        "master:\n  unknown_knob: 1\n",  # extra keys forbidden (§26 style)
+        "unknown_section:\n  x: 1\n",
+        # Timing invariants live in MasterConfig and must surface here too:
+        "master:\n  offline_after_ms: 5000\n",  # below default suspect 10 s
+        "not-a-mapping",
+    ],
+)
+def test_serve_config_invalid_rejected(tmp_path: Path, payload: str) -> None:
+    path = write_master_config(tmp_path, payload)
+    with pytest.raises(ValueError):
+        config = MasterServeConfig.from_yaml(path)
+        config.to_master_config()
