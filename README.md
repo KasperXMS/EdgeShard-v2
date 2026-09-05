@@ -64,12 +64,14 @@ uv run edgeshard worker inspect --config <worker.yaml> --format yaml
 
 `worker inspect` needs no Master: it loads/creates the persistent
 `worker_id`, discovers host capability (architecture, OS, CPU device,
-memory pools, network interfaces, container runtime), samples telemetry,
-and scans the ModelStore plus EdgeShard-managed Docker containers. Its
-machine-readable output (JSON by default) is the primary local validation
-tool for hardware discovery. `worker.identity_path` must be writable —
-point it somewhere local on development hosts (the example uses the
-production location).
+memory pools, network interfaces, container runtime, and NVIDIA discrete
+GPUs via NVML when a driver is present), samples telemetry, and scans the
+ModelStore plus EdgeShard-managed Docker containers. Its machine-readable
+output (JSON by default) is the primary local validation tool for hardware
+discovery. `worker.identity_path` must be writable — point it somewhere
+local on development hosts (the example uses the production location).
+Hardware-specific probe validation lives in `tests/platform/` and is
+selected with `pytest -m rtx` / `pytest -m jetson`.
 
 ## Examples
 

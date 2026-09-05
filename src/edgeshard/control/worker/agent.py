@@ -28,11 +28,13 @@ from edgeshard.cluster.state import DeviceState, WorkerState
 from edgeshard.control.worker.config import WorkerConfig
 from edgeshard.control.worker.discovery.base import CapabilityFragment, CapabilityProbe
 from edgeshard.control.worker.discovery.host import HostCapabilityProbe
+from edgeshard.control.worker.discovery.nvidia import NvidiaCapabilityProbe
 from edgeshard.control.worker.identity import IdentityManager, build_worker_identity
 from edgeshard.control.worker.model_inventory import scan_model_inventory
 from edgeshard.control.worker.runtime_inventory import scan_runtime_inventory
 from edgeshard.control.worker.telemetry.base import TelemetryProbe
 from edgeshard.control.worker.telemetry.host import HostTelemetryProbe
+from edgeshard.control.worker.telemetry.nvidia import NvidiaTelemetryProbe
 from edgeshard.runtime.model_store import ModelStore
 
 logger = logging.getLogger("worker.agent")
@@ -127,19 +129,24 @@ async def inspect_local_worker(
     """The local portion of the Agent lifecycle (spec §27), Master-less.
 
     Probe and client injection points exist for tests; production callers
-    rely on the defaults (host probe, psutil telemetry, Docker SDK).
+    rely on the defaults (host + NVIDIA probes, psutil/NVML telemetry,
+    Docker SDK). Backends without the corresponding hardware report empty
+    fragments rather than failing (spec §47).
     """
     worker_id = IdentityManager(config.worker.identity_path).load_or_create()
     identity = build_worker_identity(worker_id)
 
     if capability_probes is None:
-        capability_probes = (HostCapabilityProbe(worker_id),)
+        capability_probes = (HostCapabilityProbe(worker_id), NvidiaCapabilityProbe())
     capability = assemble_capability([probe.discover() for probe in capability_probes])
 
     samplers = (
         telemetry_probes
         if telemetry_probes is not None
-        else (HostTelemetryProbe(worker_id, cpu_sample_interval_s=0.25),)
+        else (
+            HostTelemetryProbe(worker_id, cpu_sample_interval_s=0.25),
+            NvidiaTelemetryProbe(),
+        )
     )
     state_fragments = [await sampler.sample() for sampler in samplers]
 
