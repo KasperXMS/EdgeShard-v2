@@ -8,7 +8,8 @@ gRPC transport::
     ├── WorkerRegistry    (stable identity + capability)
     ├── SessionManager    (current session + heartbeat sequence)
     ├── StateStore        (latest accepted state + receive timestamps)
-    └── LivenessManager   (derived ONLINE/SUSPECT/OFFLINE)
+    ├── LivenessManager   (derived ONLINE/SUSPECT/OFFLINE)
+    └── SnapshotBuilder   (immutable ClusterSnapshot views, P1H)
 
 Semantics follow spec §29-30 exactly:
 
@@ -42,11 +43,13 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 
 from edgeshard.cluster.capability import WorkerCapability, compute_capability_revision
+from edgeshard.cluster.snapshot import ClusterSnapshot
 from edgeshard.cluster.state import WorkerStatus
 from edgeshard.control.master.config import MasterConfig
 from edgeshard.control.master.liveness import LivenessManager
 from edgeshard.control.master.registry import WorkerRegistry
 from edgeshard.control.master.sessions import SessionManager
+from edgeshard.control.master.snapshot import SnapshotBuilder
 from edgeshard.control.master.state_store import StateStore
 from edgeshard.protocol.control.mapper import (
     CONTROL_PROTOCOL_VERSION,
@@ -76,6 +79,7 @@ class MasterService:
         monotonic: Callable[[], float] = time.monotonic,
         wall: Callable[[], datetime] = _utc_now,
         session_factory: Callable[[], str] | None = None,
+        snapshot_factory: Callable[[], str] | None = None,
     ) -> None:
         self._config = config or MasterConfig()
         self._monotonic = monotonic
@@ -87,8 +91,21 @@ class MasterService:
             self._sessions = SessionManager(session_factory=session_factory)
         self._states = StateStore()
         self._liveness = LivenessManager(self._states, self._config, monotonic=monotonic)
+        if snapshot_factory is None:
+            self._snapshot_builder = SnapshotBuilder(
+                self._registry, self._sessions, self._states, self._liveness, wall=wall
+            )
+        else:
+            self._snapshot_builder = SnapshotBuilder(
+                self._registry,
+                self._sessions,
+                self._states,
+                self._liveness,
+                wall=wall,
+                snapshot_factory=snapshot_factory,
+            )
 
-    # -- component access (read-oriented; P1H SnapshotBuilder consumes these)
+    # -- component access (read-oriented; SnapshotBuilder consumes these) ----
 
     @property
     def config(self) -> MasterConfig:
@@ -110,9 +127,21 @@ class MasterService:
     def liveness(self) -> LivenessManager:
         return self._liveness
 
+    @property
+    def snapshot_builder(self) -> SnapshotBuilder:
+        return self._snapshot_builder
+
     def worker_status(self, worker_id: str) -> WorkerStatus:
         """Derived liveness of one Worker (spec §32); ``KeyError`` if unknown."""
         return self._liveness.status_of(worker_id)
+
+    def build_snapshot(self) -> ClusterSnapshot:
+        """Immutable point-in-time view of the whole cluster (spec §38).
+
+        Synchronous, so it is atomic against registration/heartbeat on the
+        single event loop: the returned snapshot never changes afterward.
+        """
+        return self._snapshot_builder.build()
 
     # -- WorkerRegistryHandler protocol (spec §29-30) ----------------------
 

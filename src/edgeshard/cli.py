@@ -22,6 +22,7 @@ tracking and debug snapshots — no REST, dashboard or scheduler yet.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 from pathlib import Path
@@ -32,6 +33,7 @@ import yaml
 
 from edgeshard.control.master.config import MasterConfig, MasterServeConfig
 from edgeshard.control.master.service import MasterService
+from edgeshard.control.master.snapshot import format_snapshot
 from edgeshard.control.worker.agent import inspect_local_worker, to_plain_mapping
 from edgeshard.control.worker.config import WorkerConfig
 from edgeshard.control.worker.master_client import WorkerAgent
@@ -175,12 +177,23 @@ def worker_serve(config: WorkerConfigPath) -> None:
 
 
 @master_app.command("serve")
-def master_serve(config: MasterConfigPath) -> None:
+def master_serve(
+    config: MasterConfigPath,
+    snapshot_interval_s: Annotated[
+        float,
+        typer.Option(
+            min=0.0,
+            help="Log an immutable ClusterSnapshot every N seconds "
+            "(debug representation, spec §45); 0 disables it.",
+        ),
+    ] = 0.0,
+) -> None:
     """Run the Master control plane until terminated (spec §45).
 
     WorkerRegistryService over gRPC, session/sequence handling, liveness
-    tracking and debug snapshots — no REST, dashboard, database or
-    scheduler yet (spec §45, §57).
+    tracking and immutable cluster snapshots — no REST, dashboard, database
+    or scheduler yet (spec §45, §57). With ``--snapshot-interval-s`` set, a
+    debug rendering of each snapshot is logged periodically.
     """
     try:
         serve_config = MasterServeConfig.from_yaml(config)
@@ -193,7 +206,7 @@ def master_serve(config: MasterConfigPath) -> None:
 
     _configure_logging()
     try:
-        asyncio.run(_master_serve(serve_config, master_config))
+        asyncio.run(_master_serve(serve_config, master_config, snapshot_interval_s))
     except EdgeShardError as exc:
         typer.secho(f"master failed: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1) from exc
@@ -214,7 +227,9 @@ def _configure_logging() -> None:
 
 
 async def _master_serve(
-    serve_config: MasterServeConfig, master_config: MasterConfig
+    serve_config: MasterServeConfig,
+    master_config: MasterConfig,
+    snapshot_interval_s: float = 0.0,
 ) -> None:
     service = MasterService(master_config)
     server, port = await start_control_server(
@@ -222,11 +237,32 @@ async def _master_serve(
     )
     print(f"READY master endpoint={serve_config.master.host}:{port}", flush=True)
     await service.start()
+    snapshot_task: asyncio.Task[None] | None = None
+    if snapshot_interval_s > 0:
+        snapshot_task = asyncio.create_task(
+            _log_snapshots(service, snapshot_interval_s), name="master-snapshot-log"
+        )
     try:
         await server.wait_for_termination()
     finally:
+        if snapshot_task is not None:
+            snapshot_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await snapshot_task
         await service.stop()
         await server.stop(grace=None)
+
+
+async def _log_snapshots(service: MasterService, interval_s: float) -> None:
+    """Periodically log the debug rendering of a fresh snapshot (spec §45).
+
+    ``build_snapshot`` is synchronous and cheap; the sleep is the only await,
+    so this never contends with the registry/heartbeat handlers.
+    """
+    snapshot_logger = logging.getLogger("master.snapshot")
+    while True:
+        await asyncio.sleep(interval_s)
+        snapshot_logger.info("cluster snapshot:\n%s", format_snapshot(service.build_snapshot()))
 
 
 async def _serve(config: ShardRuntimeConfig) -> None:

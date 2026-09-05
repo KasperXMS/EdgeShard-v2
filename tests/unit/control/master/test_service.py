@@ -91,19 +91,11 @@ async def register(service: MasterService, **kwargs) -> tuple[RegisterWorkerRequ
 
 
 def snapshot_of(service: MasterService, worker_id: str) -> WorkerSnapshot:
-    """Assemble the Master's knowledge as a WorkerSnapshot (§38; builder lands in P1H)."""
-    record = service.registry.get(worker_id)
-    session = service.sessions.current(worker_id)
-    stored = service.states.get(worker_id)
-    assert stored is not None
-    return WorkerSnapshot(
-        identity=record.identity,
-        capability=record.capability,
-        state=stored.state,
-        status=service.worker_status(worker_id),
-        session_id=session.session_id if session else None,
-        last_seen_at=stored.received_wall,
-    )
+    """One Worker's slice of the Master's real ClusterSnapshot (§38, P1H)."""
+    for worker in service.build_snapshot().workers:
+        if worker.identity.worker_id == worker_id:
+            return worker
+    raise KeyError(worker_id)
 
 
 # -- registration (§29) -----------------------------------------------------

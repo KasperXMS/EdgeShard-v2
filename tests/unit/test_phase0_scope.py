@@ -63,8 +63,9 @@ def test_only_expected_packages_exist() -> None:
 
 def test_control_contains_only_milestone_components() -> None:
     # P1B admits the production Worker Agent; P1F admits the production
-    # Master state components (spec §33, §56). SnapshotBuilder joins the
-    # master package in P1H; scheduler-like modules stay deferred (§57).
+    # Master state components (spec §33, §56); P1H adds SnapshotBuilder
+    # inside the same master package. Scheduler-like modules stay deferred
+    # (§57), so the control package gains no new sub-packages here.
     entries = {
         path.name for path in (SRC / "control").iterdir() if path.name != "__pycache__"
     }
