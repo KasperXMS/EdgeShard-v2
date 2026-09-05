@@ -12,10 +12,12 @@ Phase 0 builds the stable execution layer of EdgeShard v2:
    — including independent full-model vLLM runtimes through the same
    backend-neutral lifecycle.
 
-Status: **Phase 0 complete (milestones 0A–0K).** See `ARCHITECTURE.md` for
-the mandatory rules and design decisions, and `KNOWN_LIMITATIONS.md` for
-what Phase 0 deliberately does not do. The full requirements live in
-`EdgeShard_v2_Phase0_ClaudeCode_Spec.md`.
+Status: **Phase 0 complete (milestones 0A–0K); Phase 1 in progress.**
+Phase 1 builds the Master/Worker control plane on this substrate; see
+`EdgeShard v2 Phase 1 Claude Code Implementation Spec.md` for its
+requirements and `ARCHITECTURE.md` for the mandatory rules and design
+decisions. `KNOWN_LIMITATIONS.md` records what each phase deliberately does
+not do.
 
 ## Requirements
 
@@ -42,17 +44,38 @@ uv run ruff check . && uv run mypy src/edgeshard && uv run pytest -q
 ## Run a shard runtime
 
 ```sh
-uv run edgeshard --config examples/configs/process-stage.yaml
+uv run edgeshard runtime serve --config examples/configs/process-stage.yaml
 # equivalent: uv run python -m edgeshard --config <runtime.yaml>
 ```
+
+The legacy Phase 0 forms stay as compatibility aliases during Phase 1:
+`edgeshard serve --config <runtime.yaml>` and the bare
+`edgeshard --config <runtime.yaml>`.
 
 The process loads its shard, binds the gRPC endpoint, prints
 `READY runtime=<id> endpoint=<host:port>`, and serves.
 
+## Inspect a Worker host (Phase 1)
+
+```sh
+uv run edgeshard worker inspect --config examples/configs/worker.yaml
+uv run edgeshard worker inspect --config <worker.yaml> --format yaml
+```
+
+`worker inspect` needs no Master: it loads/creates the persistent
+`worker_id`, discovers host capability (architecture, OS, CPU device,
+memory pools, network interfaces, container runtime), samples telemetry,
+and scans the ModelStore plus EdgeShard-managed Docker containers. Its
+machine-readable output (JSON by default) is the primary local validation
+tool for hardware discovery. `worker.identity_path` must be writable —
+point it somewhere local on development hosts (the example uses the
+production location).
+
 ## Examples
 
 - `examples/configs/` — `ShardRuntimeConfig` YAML (spec 19.1): a host
-  process stage and a container stage.
+  process stage and a container stage; plus a `WorkerConfig` YAML
+  (Phase 1 spec §26) for `worker inspect` / `worker serve`.
 - `examples/manifests/` — `DeploymentManifest` YAML (spec 22.2): two-shard,
   three-shard, and mixed shard+vLLM deployments.
 - `containers/hf/` — pinned CPU / CUDA / Jetson shard Dockerfiles (see the

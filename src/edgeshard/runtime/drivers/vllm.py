@@ -44,6 +44,7 @@ from edgeshard.runtime.drivers.base import (
     stop_and_remove_container,
 )
 from edgeshard.runtime.info import RuntimeInfo
+from edgeshard.runtime.labels import managed_container_labels
 from edgeshard.runtime.model_store import ModelStore
 
 DEFAULT_VLLM_IMAGE = "vllm/vllm-openai:v0.28.0"
@@ -116,12 +117,11 @@ class VLLMRuntimeDriver:
                         "mode": "ro",
                     },
                 },
-                "labels": {
-                    "io.edgeshard.managed": "true",
-                    "io.edgeshard.execution_id": spec.execution_id,
-                    "io.edgeshard.runtime_id": spec.runtime_id,
-                    "io.edgeshard.backend": spec.backend,
-                },
+                "labels": managed_container_labels(
+                    execution_id=spec.execution_id,
+                    runtime_id=spec.runtime_id,
+                    backend=spec.backend,
+                ),
                 # vLLM is GPU-bound in Phase 0: every container gets all
                 # host GPUs (the SDK equivalent of `--gpus all`) and the
                 # host IPC namespace, matching the manually validated

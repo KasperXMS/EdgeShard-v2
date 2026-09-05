@@ -1,0 +1,28 @@
+# Example: Worker Agent configuration (Phase 1 spec §26).
+#
+# `identity_path` must be writable by the Agent process; the default below
+# is the production location. For development, point it somewhere local,
+# e.g. `./.edgeshard/worker-id` (never derive identity from hostname/IP).
+#
+# `worker inspect` reads this file without any Master; `worker serve`
+# (milestone P1G) additionally requires `worker.master.endpoint`.
+worker:
+  identity_path: /var/lib/edgeshard/worker-id
+
+  master:
+    endpoint: 192.168.1.100:51000
+
+  heartbeat_interval_s: 5
+
+  reconnect:
+    initial_delay_s: 1
+    max_delay_s: 30
+
+model_store:
+  root: /data/edgeshard-models
+
+runtime:
+  discover_managed_containers: true
+
+tls:
+  enabled: false

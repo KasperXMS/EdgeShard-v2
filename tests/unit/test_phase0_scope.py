@@ -8,8 +8,9 @@ production master, ...) do not exist anywhere. Any accidental introduction
 fails in Tier 1.
 
 Phase 1 status: the pure ``cluster`` domain package is admitted (spec §7);
-``control`` still holds only the Mock Master until the Worker Agent and
-production Master milestones land.
+``control`` holds the Mock Master plus the production Worker Agent from
+milestone P1B onward. The production Master lands under ``control`` in a
+later milestone.
 """
 
 from __future__ import annotations
@@ -60,11 +61,13 @@ def test_only_expected_packages_exist() -> None:
     assert packages == EXPECTED_PACKAGES
 
 
-def test_control_contains_only_the_mock_master() -> None:
+def test_control_contains_only_milestone_components() -> None:
+    # P1B admits the production Worker Agent (spec §56); the production
+    # Master is still deferred.
     entries = {
         path.name for path in (SRC / "control").iterdir() if path.name != "__pycache__"
     }
-    assert entries == {"__init__.py", "mock"}
+    assert entries == {"__init__.py", "mock", "worker"}
 
 
 def test_no_future_phase_modules_are_importable() -> None:

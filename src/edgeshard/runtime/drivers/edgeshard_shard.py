@@ -32,6 +32,7 @@ from edgeshard.runtime.drivers.base import (
     stop_and_remove_container,
 )
 from edgeshard.runtime.info import RuntimeInfo, runtime_info_from_wire
+from edgeshard.runtime.labels import managed_container_labels
 from edgeshard.runtime.model_store import ModelStore
 
 _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
@@ -113,12 +114,11 @@ class EdgeShardShardRuntimeDriver:
                         "mode": "ro",
                     },
                 },
-                "labels": {
-                    "io.edgeshard.managed": "true",
-                    "io.edgeshard.execution_id": spec.execution_id,
-                    "io.edgeshard.runtime_id": spec.runtime_id,
-                    "io.edgeshard.backend": spec.backend,
-                },
+                "labels": managed_container_labels(
+                    execution_id=spec.execution_id,
+                    runtime_id=spec.runtime_id,
+                    backend=spec.backend,
+                ),
             }
             if spec.host_port is not None:
                 kwargs["ports"] = {f"{container_port}/tcp": spec.host_port or None}

@@ -109,7 +109,7 @@ mypy_path = "src"
 # These libraries ship no or incomplete type information. The adapter layer
 # is the Hugging Face boundary (spec 4.1), so we treat them as opaque here
 # instead of fighting partial stubs.
-module = ["transformers.*", "accelerate.*", "docker.*", "grpc.*"]
+module = ["transformers.*", "accelerate.*", "docker.*", "grpc.*", "psutil.*"]
 ignore_missing_imports = true
 follow_imports = "skip"
 
