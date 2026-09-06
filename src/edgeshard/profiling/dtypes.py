@@ -64,3 +64,16 @@ def kineto_dtype_label(raw: str) -> str:
         return UNKNOWN_DTYPE
     lowered = raw.lower().removeprefix("c10::")
     return _KINETO_LABELS.get(lowered, lowered)
+
+
+def torch_dtype(label: str) -> torch.dtype:
+    """Torch dtype for a project label (inverse of :func:`dtype_label`).
+
+    Used when building benchmark inputs for a declared measurement dtype
+    (P2D). Unknown labels raise ``ValueError`` — an input dtype is never
+    guessed (§52.2).
+    """
+    for dtype, known in _TORCH_LABELS.items():
+        if known == label:
+            return dtype
+    raise ValueError(f"unknown dtype label {label!r}")

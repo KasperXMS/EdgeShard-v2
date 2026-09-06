@@ -11,9 +11,42 @@ from pathlib import Path
 
 import pytest
 import torch
+import torch.nn as nn
 from transformers import AutoModelForCausalLM
 
+from edgeshard.model.adapters.registry import default_registry, resolve_adapter_for_source
+from edgeshard.model.layout import ModelLayout
+from edgeshard.model.source import ModelSource
+from edgeshard.profiling.domain.model import ModelCharacterization
+from edgeshard.profiling.model.adapters.qwen import QwenProfilingAdapter
+from edgeshard.profiling.model.characterization import characterize_model_source
 from edgeshard.profiling.operator.extractor import RawOperatorGraph, TorchExportExtractor
+
+
+def _tiny_qwen2_source(tiny_qwen2_dir: Path) -> ModelSource:
+    return ModelSource(path=tiny_qwen2_dir, model_id="tiny/qwen2")
+
+
+@pytest.fixture(scope="session")
+def tiny_qwen2_checkpoint(tiny_qwen2_dir: Path) -> nn.Module:
+    """Loaded tiny Qwen2 model in eval mode; treat as read-only."""
+    return AutoModelForCausalLM.from_pretrained(tiny_qwen2_dir).eval()
+
+
+@pytest.fixture(scope="session")
+def tiny_qwen2_layout(tiny_qwen2_dir: Path) -> ModelLayout:
+    source = _tiny_qwen2_source(tiny_qwen2_dir)
+    return resolve_adapter_for_source(source, default_registry()).inspect(source)
+
+
+@pytest.fixture(scope="session")
+def qwen2_adapter() -> QwenProfilingAdapter:
+    return QwenProfilingAdapter()
+
+
+@pytest.fixture(scope="session")
+def qwen2_characterization(tiny_qwen2_dir: Path) -> ModelCharacterization:
+    return characterize_model_source(_tiny_qwen2_source(tiny_qwen2_dir), dtype="fp32")
 
 
 @pytest.fixture(scope="module")

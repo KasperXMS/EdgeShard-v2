@@ -6,9 +6,13 @@ inspection of HF configs for backbone structure. The HF config is read
 only for facts the layout does not carry (``vocab_size``, an explicit
 ``head_dim`` override, the quantization method).
 
-``build_layer_inputs``/``build_module_inputs`` (§16.1) belong to the
-protocol but are implemented with the P2D layer/module profilers, which
-define the execution conventions they must feed.
+``build_layer_inputs``/``build_module_inputs`` (§16.1, P2D) materialize
+shape-correct benchmark inputs for a case spec: v1 supports ``PREFILL``
+only — decode fails with a typed ``UNSUPPORTED_PHASE`` error and is
+never approximated from prefill (§24). Inputs are built on CPU with an
+optional seed (reproducible experiments) and moved to the module's
+actual device; the declared case dtype must match the module's observed
+weight dtype, so a dtype mix-up fails before any benchmark runs.
 
 Unknown models fail with a typed ``UNSUPPORTED_MODEL`` error (§16.1);
 unexpected layer children are preserved as ``ModuleKind.OTHER`` — module
@@ -18,14 +22,17 @@ is recorded, even when unrecognized).
 
 from __future__ import annotations
 
+import inspect
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, ClassVar, Protocol
 
+import torch
 import torch.nn as nn
 from transformers import PretrainedConfig
 
 from edgeshard.model.layout import ModelLayout
-from edgeshard.profiling.domain.experiment import ProfilingErrorCategory
+from edgeshard.profiling.domain.experiment import ModelCaseSpec, ProfilingErrorCategory
 from edgeshard.profiling.domain.hashing import normalized_items
 from edgeshard.profiling.domain.model import (
     ModelCharacterization,
@@ -33,8 +40,8 @@ from edgeshard.profiling.domain.model import (
     ModelStage,
     StageKind,
 )
-from edgeshard.profiling.domain.signature import ModuleKind, ModuleSignature
-from edgeshard.profiling.dtypes import dtype_label
+from edgeshard.profiling.domain.signature import InferencePhase, ModuleKind, ModuleSignature
+from edgeshard.profiling.dtypes import dtype_label, torch_dtype
 from edgeshard.profiling.errors import ProfilingError
 
 
@@ -99,6 +106,72 @@ class ModelProfilingAdapter(Protocol):
     ) -> tuple[ProfileModule, ...]:
         """Normalized profile modules of one layer (§23)."""
         ...
+
+    def build_layer_inputs(
+        self,
+        case: ModelCaseSpec,
+        model: nn.Module,
+        layer: LayerReference,
+        layout: ModelLayout,
+        *,
+        seed: int | None = None,
+    ) -> Mapping[str, Any]:
+        """Shape-correct keyword inputs for one layer benchmark (§21)."""
+        ...
+
+    def build_module_inputs(
+        self,
+        case: ModelCaseSpec,
+        model: nn.Module,
+        module: ProfileModule,
+        layout: ModelLayout,
+        *,
+        seed: int | None = None,
+    ) -> Mapping[str, Any]:
+        """Shape-correct keyword inputs for one module benchmark (§23)."""
+        ...
+
+
+def layer_list_path(layout: ModelLayout) -> str:
+    """Module path of the ``ModuleList`` holding the transformer layers."""
+    list_path = layout.block_prefix_template.split("{index}")[0].rstrip(".")
+    if not list_path:
+        raise ProfilingError(
+            ProfilingErrorCategory.UNSUPPORTED_MODEL,
+            f"layout block prefix template {layout.block_prefix_template!r} "
+            "does not identify a layer list",
+        )
+    return list_path
+
+
+def module_device(module: nn.Module) -> torch.device:
+    """Device of the module's first parameter/buffer (CPU when it has none)."""
+    for parameter in module.parameters():
+        return parameter.device
+    for buffer in module.buffers():
+        return buffer.device
+    return torch.device("cpu")
+
+
+def primary_input_name(module: nn.Module) -> str:
+    """Keyword name of the module's primary (hidden-states) input.
+
+    Read from the module's actual ``forward`` signature: decoder layers
+    and norms take ``hidden_states``, MLPs take ``x`` — the convention
+    is "the first declared parameter", never a guessed name. A module
+    whose forward declares no named parameter cannot be fed and fails
+    typed.
+    """
+    signature = inspect.signature(module.forward)
+    for name, parameter in signature.parameters.items():
+        if parameter.kind in (parameter.VAR_POSITIONAL, parameter.VAR_KEYWORD):
+            continue
+        return name
+    raise ProfilingError(
+        ProfilingErrorCategory.UNSUPPORTED_MODEL,
+        f"module {type(module).__name__} declares no named forward input; "
+        "cannot build benchmark inputs",
+    )
 
 
 def quantization_from_config(config: PretrainedConfig) -> str | None:
@@ -214,13 +287,7 @@ class StandardDecoderProfilingAdapter:
     def enumerate_transformer_layers(
         self, model: nn.Module, layout: ModelLayout
     ) -> tuple[LayerReference, ...]:
-        list_path = layout.block_prefix_template.split("{index}")[0].rstrip(".")
-        if not list_path:
-            raise ProfilingError(
-                ProfilingErrorCategory.UNSUPPORTED_MODEL,
-                f"layout block prefix template {layout.block_prefix_template!r} "
-                "does not identify a layer list",
-            )
+        list_path = layer_list_path(layout)
         try:
             module_list = model.get_submodule(list_path)
         except AttributeError as exc:
@@ -303,6 +370,155 @@ class StandardDecoderProfilingAdapter:
         if kind is ModuleKind.NORM:
             return {"hidden_size": layout.hidden_size, "variant": self.norm_variant}
         return {}
+
+    def build_layer_inputs(
+        self,
+        case: ModelCaseSpec,
+        model: nn.Module,
+        layer: LayerReference,
+        layout: ModelLayout,
+        *,
+        seed: int | None = None,
+    ) -> Mapping[str, Any]:
+        self._require_prefill(case)
+        dtype = torch_dtype(case.dtype)  # label validity first, never guessed
+        self._require_dtype_match(case.dtype, layer.layer, layer.module_path)
+        device = module_device(layer.layer)
+        hidden_states = self._hidden_states(case, dtype, layout, device, seed)
+        position_ids = (
+            torch.arange(case.sequence_length).unsqueeze(0).expand(case.batch_size, -1)
+        )
+        position_embeddings = self.position_embeddings(
+            model, layer, layout, hidden_states, position_ids.to(device)
+        )
+        return {
+            primary_input_name(layer.layer): hidden_states,
+            "position_ids": position_ids.to(device),
+            "position_embeddings": position_embeddings,
+            "use_cache": False,
+        }
+
+    def build_module_inputs(
+        self,
+        case: ModelCaseSpec,
+        model: nn.Module,
+        module: ProfileModule,
+        layout: ModelLayout,
+        *,
+        seed: int | None = None,
+    ) -> Mapping[str, Any]:
+        self._require_prefill(case)
+        dtype = torch_dtype(case.dtype)  # label validity first, never guessed
+        self._require_dtype_match(case.dtype, module.module, module.module_path)
+        device = module_device(module.module)
+        hidden_states = self._hidden_states(case, dtype, layout, device, seed)
+        inputs: dict[str, Any] = {primary_input_name(module.module): hidden_states}
+        if module.kind is ModuleKind.ATTENTION:
+            # Attention modules consume rotary embeddings directly; the
+            # layer reference is not needed — only the root model that
+            # owns the rotary module. ``attention_mask=None`` is passed
+            # explicitly: current transformers attention modules require
+            # it as a positional argument, and None means "no mask" —
+            # the attention implementation applies its own causality.
+            layer = LayerReference(index=0, module_path=module.module_path, layer=module.module)
+            position_ids = (
+                torch.arange(case.sequence_length)
+                .unsqueeze(0)
+                .expand(case.batch_size, -1)
+                .to(device)
+            )
+            inputs["attention_mask"] = None
+            inputs["position_embeddings"] = self.position_embeddings(
+                model, layer, layout, hidden_states, position_ids
+            )
+        return inputs
+
+    def position_embeddings(
+        self,
+        model: nn.Module,
+        layer: LayerReference,
+        layout: ModelLayout,
+        hidden_states: torch.Tensor,
+        position_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Rotary ``(cos, sin)`` for the given positions.
+
+        Resolves the rotary module from the installed structure: the
+        model-level ``rotary_emb`` of current transformers releases
+        first, then the layer/attention-level module of older ones. No
+        rotary module anywhere is a typed structure failure — cos/sin are
+        never fabricated.
+        """
+        rotary = self.resolve_rotary_emb(model, layer, layout)
+        with torch.no_grad():
+            cos, sin = rotary(hidden_states, position_ids)
+        return cos, sin
+
+    def resolve_rotary_emb(
+        self, model: nn.Module, layer: LayerReference, layout: ModelLayout
+    ) -> nn.Module:
+        list_path = layer_list_path(layout)
+        root, _, _ = list_path.rpartition(".")
+        model_level = f"{root}.rotary_emb" if root else "rotary_emb"
+        candidate = _resolved_submodule(model, model_level)
+        if candidate is not None:
+            return candidate
+        for holder in (layer.layer, getattr(layer.layer, "self_attn", None)):
+            legacy = getattr(holder, "rotary_emb", None) if holder is not None else None
+            if isinstance(legacy, nn.Module):
+                return legacy
+        raise ProfilingError(
+            ProfilingErrorCategory.UNSUPPORTED_MODEL,
+            f"no rotary embedding module found at {model_level!r} or inside "
+            f"{layer.module_path!r}; cannot build position embeddings",
+        )
+
+    def _hidden_states(
+        self,
+        case: ModelCaseSpec,
+        dtype: torch.dtype,
+        layout: ModelLayout,
+        device: torch.device,
+        seed: int | None,
+    ) -> torch.Tensor:
+        generator = torch.Generator().manual_seed(seed) if seed is not None else None
+        return torch.randn(
+            (case.batch_size, case.sequence_length, layout.hidden_size),
+            dtype=dtype,
+            generator=generator,
+        ).to(device)
+
+    @staticmethod
+    def _require_prefill(case: ModelCaseSpec) -> None:
+        if case.phase is not InferencePhase.PREFILL:
+            raise ProfilingError(
+                ProfilingErrorCategory.UNSUPPORTED_PHASE,
+                "decode profiling is not supported in v1: the runtime does not "
+                "expose stable KV-cache decode semantics to the profiling "
+                "harness (§24), and decode is never approximated from prefill",
+                {"phase": case.phase.value, "context_length": case.context_length},
+            )
+
+    @staticmethod
+    def _require_dtype_match(dtype: str, module: nn.Module, module_path: str) -> None:
+        observed = observed_module_dtype(module)
+        if observed is not None and observed != dtype:
+            raise ProfilingError(
+                ProfilingErrorCategory.UNSUPPORTED_MODEL,
+                f"case dtype {dtype!r} does not match observed dtype {observed!r} "
+                f"at {module_path!r}; load or cast the checkpoint to the "
+                "measurement dtype before profiling",
+                {"case_dtype": dtype, "observed_dtype": observed},
+            )
+
+
+def _resolved_submodule(model: nn.Module, path: str) -> nn.Module | None:
+    """``model.get_submodule(path)`` when it resolves to a module, else None."""
+    try:
+        candidate = model.get_submodule(path)
+    except AttributeError:
+        return None
+    return candidate if isinstance(candidate, nn.Module) else None
 
 
 class ProfilingAdapterRegistry:
@@ -387,7 +603,10 @@ __all__ = [
     "ProfilingAdapterRegistry",
     "StandardDecoderProfilingAdapter",
     "default_profiling_registry",
+    "layer_list_path",
+    "module_device",
     "observed_module_dtype",
+    "primary_input_name",
     "quantization_from_config",
     "resolve_profiling_adapter",
 ]
