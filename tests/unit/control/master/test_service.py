@@ -15,7 +15,13 @@ import pytest
 
 from edgeshard.cluster.capability import compute_capability_revision
 from edgeshard.cluster.snapshot import WorkerSnapshot
-from edgeshard.cluster.state import WorkerStatus
+from edgeshard.cluster.state import (
+    DeviceAvailability,
+    DeviceState,
+    MemoryPoolState,
+    WorkerState,
+    WorkerStatus,
+)
 from edgeshard.control.master.config import MasterConfig
 from edgeshard.control.master.service import MasterService
 from edgeshard.protocol.control.mapper import (
@@ -99,6 +105,33 @@ def snapshot_of(service: MasterService, worker_id: str) -> WorkerSnapshot:
     raise KeyError(worker_id)
 
 
+# -- state/capability consistency mutators (§38 pre-write gate) --------------
+
+
+def with_ghost_device(state: WorkerState) -> WorkerState:
+    ghost = DeviceState(
+        device_id="ghost-device",
+        utilization=None,
+        temperature_c=None,
+        power_w=None,
+        availability=DeviceAvailability.UNKNOWN,
+        running_runtime_ids=(),
+    )
+    return dataclasses.replace(state, device_states=(*state.device_states, ghost))
+
+
+def with_ghost_pool(state: WorkerState) -> WorkerState:
+    ghost = MemoryPoolState(memory_pool_id="ghost-pool", available_bytes=None)
+    return dataclasses.replace(state, memory_states=(*state.memory_states, ghost))
+
+
+def with_runtime_on_ghost_device(state: WorkerState) -> WorkerState:
+    broken = dataclasses.replace(
+        state.runtime_instances[0], device_ids=("ghost-device",)
+    )
+    return dataclasses.replace(state, runtime_instances=(broken,))
+
+
 # -- registration (§29) -----------------------------------------------------
 
 
@@ -149,6 +182,35 @@ async def test_registration_rejects_tampered_capability_revision() -> None:
     with pytest.raises(ControlProtocolError, match="capability_revision mismatch"):
         await service.register_worker(request)
     assert len(service.registry) == 0
+
+
+@pytest.mark.parametrize(
+    "break_state",
+    [with_ghost_device, with_ghost_pool, with_runtime_on_ghost_device],
+    ids=["ghost-device", "ghost-pool", "runtime-on-ghost-device"],
+)
+async def test_registration_rejects_state_the_capability_cannot_validate(
+    break_state,
+) -> None:
+    """§38/§47: consistency is checked *before* any Master mutation.
+
+    A state referencing a device/pool the reported capability lacks is a
+    clear protocol error at the boundary — nothing is written, so a later
+    snapshot can never be the first place the inconsistency surfaces.
+    """
+    service, _clock = make_service()
+    identity = make_worker_identity()
+    request = make_register_request(
+        identity=identity,
+        state=break_state(make_worker_state(identity.worker_id)),
+    )
+
+    with pytest.raises(ControlProtocolError, match="state/capability mismatch"):
+        await service.register_worker(request)
+
+    assert len(service.registry) == 0
+    assert service.sessions.current(identity.worker_id) is None
+    assert service.states.get(identity.worker_id) is None
 
 
 # -- sessions (§35, §51 Master sessions) ------------------------------------
@@ -323,6 +385,32 @@ async def test_heartbeat_revision_mismatch_rejected_reregister_required() -> Non
     assert retry.accepted
 
 
+async def test_heartbeat_rejects_inconsistent_state_before_writing() -> None:
+    """§38: a heartbeat state the stored capability cannot validate is refused.
+
+    The rejection happens before *any* mutation: the stored state keeps the
+    previous value and the sequence number is not consumed, so the Worker
+    can recover by resending a consistent state under the same sequence.
+    """
+    service, _clock = make_service()
+    request, session_id = await register(service)
+    worker_id = request.identity.worker_id
+
+    broken = with_ghost_device(request.initial_state)
+    with pytest.raises(ControlProtocolError, match="state/capability mismatch"):
+        await service.heartbeat(make_heartbeat(request, session_id, 1, state=broken))
+
+    stored = service.states.get(worker_id)
+    assert stored is not None
+    assert stored.state == request.initial_state  # nothing was overwritten
+    session = service.sessions.current(worker_id)
+    assert session is not None
+    assert session.last_accepted_sequence == 0  # sequence not consumed
+
+    retry = await service.heartbeat(make_heartbeat(request, session_id, 1))
+    assert retry.accepted
+
+
 # -- capability updates (§16) -----------------------------------------------
 
 
@@ -427,6 +515,45 @@ async def test_update_capability_rejects_tampered_revision() -> None:
                 state=make_worker_state(request.identity.worker_id),
             )
         )
+
+
+async def test_update_capability_rejects_inconsistent_state_before_writing() -> None:
+    """§38: the atomic pair never lands when its state cannot cross-validate.
+
+    Neither the new capability nor the inconsistent state may reach storage:
+    the previously stored, mutually-consistent pair stays untouched.
+    """
+    service, _clock = make_service()
+    request, session_id = await register(service)
+    worker_id = request.identity.worker_id
+
+    evolved = finalize(
+        dataclasses.replace(
+            request.capability,
+            runtime_platforms=request.capability.runtime_platforms[:1],
+        )
+    )
+    broken_state = with_ghost_device(make_worker_state(worker_id))
+    with pytest.raises(ControlProtocolError, match="state/capability mismatch"):
+        await service.update_capability(
+            UpdateCapabilityRequest(
+                worker_id=worker_id,
+                instance_id=request.instance_id,
+                session_id=session_id,
+                capability=evolved,
+                state=broken_state,
+            )
+        )
+
+    record = service.registry.get(worker_id)
+    assert record.capability == request.capability  # capability untouched
+    stored = service.states.get(worker_id)
+    assert stored is not None
+    assert stored.state == request.initial_state  # state untouched
+    # The stored pair still cross-validates: snapshots keep building cleanly.
+    snapshot = snapshot_of(service, worker_id)
+    assert snapshot.capability == request.capability
+    assert snapshot.state == request.initial_state
 
 
 # -- liveness interplay (§32) ------------------------------------------------

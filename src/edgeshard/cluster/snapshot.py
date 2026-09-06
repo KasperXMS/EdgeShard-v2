@@ -26,6 +26,51 @@ def _require_aware(value: datetime, field: str) -> None:
         raise ValueError(f"{field} must be timezone-aware")
 
 
+def validate_state_against_capability(
+    state: WorkerState, capability: WorkerCapability
+) -> None:
+    """Cross-validate a reported state against its capability (spec §38).
+
+    Every reference inside the state must resolve inside the capability:
+
+    * each ``DeviceState.device_id`` must exist in ``capability.devices``;
+    * each ``MemoryPoolState.memory_pool_id`` must exist in
+      ``capability.memory_pools``;
+    * each ``RuntimeInstanceState.device_ids`` entry must exist in
+      ``capability.devices``.
+
+    Raises ``ValueError`` on the first dangling reference so callers fail
+    loudly. The Master runs this *before* writing a state (spec §29-30,
+    §47) — never after the fact during snapshot construction — and
+    :class:`WorkerSnapshot` reuses it as its construction-time gate.
+    """
+    known_devices = {device.identity.device_id for device in capability.devices}
+    known_pools = {pool.memory_pool_id for pool in capability.memory_pools}
+
+    for device_state in state.device_states:
+        if device_state.device_id not in known_devices:
+            raise ValueError(
+                f"device state references unknown device {device_state.device_id!r}"
+            )
+    for memory_state in state.memory_states:
+        if memory_state.memory_pool_id not in known_pools:
+            raise ValueError(
+                f"memory state references unknown memory pool "
+                f"{memory_state.memory_pool_id!r}"
+            )
+    for instance in state.runtime_instances:
+        unknown = [
+            device_id
+            for device_id in instance.device_ids
+            if device_id not in known_devices
+        ]
+        if unknown:
+            raise ValueError(
+                f"runtime instance {instance.runtime_id!r} references "
+                f"unknown device(s): {', '.join(repr(u) for u in unknown)}"
+            )
+
+
 @dataclass(frozen=True)
 class WorkerSnapshot:
     """Everything known about one Worker at snapshot time (spec §38).
@@ -63,31 +108,7 @@ class WorkerSnapshot:
         if self.last_seen_at is not None:
             _require_aware(self.last_seen_at, "last_seen_at")
 
-        known_devices = {device.identity.device_id for device in self.capability.devices}
-        known_pools = {pool.memory_pool_id for pool in self.capability.memory_pools}
-
-        for device_state in self.state.device_states:
-            if device_state.device_id not in known_devices:
-                raise ValueError(
-                    f"device state references unknown device {device_state.device_id!r}"
-                )
-        for memory_state in self.state.memory_states:
-            if memory_state.memory_pool_id not in known_pools:
-                raise ValueError(
-                    f"memory state references unknown memory pool "
-                    f"{memory_state.memory_pool_id!r}"
-                )
-        for instance in self.state.runtime_instances:
-            unknown = [
-                device_id
-                for device_id in instance.device_ids
-                if device_id not in known_devices
-            ]
-            if unknown:
-                raise ValueError(
-                    f"runtime instance {instance.runtime_id!r} references "
-                    f"unknown device(s): {', '.join(repr(u) for u in unknown)}"
-                )
+        validate_state_against_capability(self.state, self.capability)
 
 
 @dataclass(frozen=True)

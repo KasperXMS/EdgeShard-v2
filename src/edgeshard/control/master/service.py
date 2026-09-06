@@ -30,9 +30,12 @@ Semantics follow spec §29-30 exactly:
 
 Protocol validation proper (version, redundant-field agreement, enum
 decoding) already happened in the mapper before a domain request reaches
-this class (spec §40, §47); what remains here is the integrity check that
-a reported ``capability_revision`` really fingerprints the reported
-capability (spec §16).
+this class (spec §40, §47); what remains here are the integrity gates that
+run before *every* state mutation: a reported ``capability_revision`` must
+really fingerprint the reported capability (spec §16), and a reported state
+must cross-validate against the capability it will be stored with (spec
+§38) — an inconsistent state is rejected as a clear protocol error at the
+boundary, never written first and discovered only at snapshot time.
 
 Concurrency: everything is in-memory and single-event-loop — no method
 awaits between reading and writing component state, so each RPC applies
@@ -47,8 +50,11 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 
 from edgeshard.cluster.capability import WorkerCapability, compute_capability_revision
-from edgeshard.cluster.snapshot import ClusterSnapshot
-from edgeshard.cluster.state import WorkerStatus
+from edgeshard.cluster.snapshot import (
+    ClusterSnapshot,
+    validate_state_against_capability,
+)
+from edgeshard.cluster.state import WorkerState, WorkerStatus
 from edgeshard.control.master.config import MasterConfig
 from edgeshard.control.master.liveness import LivenessManager
 from edgeshard.control.master.registry import WorkerRegistry
@@ -160,6 +166,7 @@ class MasterService:
         self, request: RegisterWorkerRequest
     ) -> RegisterWorkerResponse:
         self._check_capability_revision(request.capability)
+        self._check_state_consistency(request.initial_state, request.capability)
         worker_id = request.identity.worker_id
 
         # §29: upsert identity + capability, invalidate the old session,
@@ -209,6 +216,14 @@ class MasterService:
             return HeartbeatResponse(
                 accepted=False, detail=rejection.detail, reason=rejection.reason
             )
+
+        # §38: validate the reported state against the *stored* capability
+        # before any Master mutation — the revision gate above guarantees
+        # the two are a matching pair. A dangling reference is a Worker bug:
+        # fail loudly here rather than store a state that only snapshot
+        # construction would reject later. The sequence is not consumed.
+        record = self._registry.get(request.worker_id)
+        self._check_state_consistency(request.state, record.capability)
 
         self._sessions.record_accepted_sequence(request.worker_id, request.sequence_number)
         self._states.record(
@@ -265,6 +280,7 @@ class MasterService:
             )
 
         self._check_capability_revision(request.capability)
+        self._check_state_consistency(request.state, request.capability)
         record = self._registry.get(request.worker_id)
         # Atomic capability+state replacement (no await between the two):
         # a snapshot built at any instant pairs the new capability with the
@@ -311,3 +327,17 @@ class MasterService:
                 f"capability_revision mismatch: reported {capability.capability_revision!r}, "
                 f"recomputed {expected!r}"
             )
+
+    @staticmethod
+    def _check_state_consistency(state: WorkerState, capability: WorkerCapability) -> None:
+        """Fail loudly when a state references devices/pools the capability lacks (§38, §47).
+
+        Runs before *every* Master state mutation (registration, heartbeat,
+        capability update), so an inconsistent state is rejected at the
+        protocol boundary as ``ControlProtocolError`` — never written first
+        and discovered only when a snapshot is built.
+        """
+        try:
+            validate_state_against_capability(state, capability)
+        except ValueError as exc:
+            raise ControlProtocolError(f"state/capability mismatch: {exc}") from exc

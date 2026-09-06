@@ -77,13 +77,16 @@ def _attrs(container: Any) -> dict[str, Any]:
 
 
 def _device_ids(container: Any) -> tuple[str, ...]:
-    """Explicit device attribution from inspect data (spec §19).
+    """Explicit device attribution from inspect data (spec §19, §11).
 
-    Only unambiguous assignments are reported: ``DeviceRequests`` carrying
-    concrete ``DeviceIDs``, else ``NVIDIA_VISIBLE_DEVICES`` listing GPU
-    UUIDs. ``all``/``none``/CUDA ordinals cannot be resolved to stable
-    device ids from inside this module, so attribution stays empty rather
-    than guessed (§11: ordinals are never identity).
+    Only stable GPU UUIDs are ever reported. A ``DeviceRequests`` entry is
+    used only when *all* of its ``DeviceIDs`` are GPU UUIDs — the same
+    all-or-nothing rule ``NVIDIA_VISIBLE_DEVICES`` already follows — else
+    attribution falls through to the environment. CUDA ordinals (``"0"``,
+    ``"1"``) and shorthands (``"all"``, ``"none"``) are never identity and
+    are never written into ``RuntimeInstanceState.device_ids``; an ambiguous
+    assignment reports nothing rather than guessing (§11: ordinals are never
+    identity).
     """
     attrs = _attrs(container)
     ids: list[str] = []
@@ -91,11 +94,7 @@ def _device_ids(container: Any) -> tuple[str, ...]:
     for request in host_config.get("DeviceRequests") or []:
         if not isinstance(request, dict):
             continue
-        ids.extend(
-            device_id
-            for device_id in request.get("DeviceIDs") or []
-            if isinstance(device_id, str) and device_id
-        )
+        ids.extend(_gpu_uuid_device_ids(request.get("DeviceIDs")))
     if not ids:
         config = attrs.get("Config") or {}
         for entry in config.get("Env") or []:
@@ -107,6 +106,21 @@ def _device_ids(container: Any) -> tuple[str, ...]:
                 break
     # De-duplicate while preserving order.
     return tuple(dict.fromkeys(ids))
+
+
+def _gpu_uuid_device_ids(raw_device_ids: Any) -> list[str]:
+    """GPU-UUID ``DeviceIDs`` of one device request; ``[]`` unless all are UUIDs.
+
+    Mirrors :func:`_gpu_uuid_tokens`: an ordinal or shorthand anywhere in
+    the list poisons the whole assignment, so nothing is attributed rather
+    than a partial guess (§11).
+    """
+    if not isinstance(raw_device_ids, list):
+        return []
+    candidates = [item for item in raw_device_ids if isinstance(item, str) and item]
+    if candidates and all(_is_gpu_uuid(candidate) for candidate in candidates):
+        return candidates
+    return []
 
 
 def _gpu_uuid_tokens(value: str) -> list[str]:

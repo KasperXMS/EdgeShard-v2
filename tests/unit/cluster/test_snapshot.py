@@ -7,7 +7,11 @@ from datetime import UTC, datetime
 
 import pytest
 
-from edgeshard.cluster.snapshot import ClusterSnapshot, WorkerSnapshot
+from edgeshard.cluster.snapshot import (
+    ClusterSnapshot,
+    WorkerSnapshot,
+    validate_state_against_capability,
+)
 from edgeshard.cluster.state import (
     DeviceAvailability,
     DeviceState,
@@ -167,3 +171,43 @@ def test_snapshot_rejects_runtime_instance_on_unknown_device() -> None:
     )
     with pytest.raises(ValueError, match="unknown device"):
         dataclasses.replace(snapshot, state=broken_state)
+
+
+# -- the shared pre-write gate (spec §38; used by the Master before writes) --
+
+
+def test_validate_state_against_capability_accepts_consistent_pair() -> None:
+    validate_state_against_capability(make_worker_state("worker-1"), make_rtx_capability())
+
+
+def test_validate_state_against_capability_rejects_unknown_device() -> None:
+    state = make_worker_state("worker-1")
+    ghost = DeviceState(
+        device_id="ghost-device",
+        utilization=None,
+        temperature_c=None,
+        power_w=None,
+        availability=DeviceAvailability.UNKNOWN,
+        running_runtime_ids=(),
+    )
+    broken = dataclasses.replace(state, device_states=(*state.device_states, ghost))
+    with pytest.raises(ValueError, match="unknown device"):
+        validate_state_against_capability(broken, make_rtx_capability())
+
+
+def test_validate_state_against_capability_rejects_unknown_pool() -> None:
+    state = make_worker_state("worker-1")
+    ghost = MemoryPoolState(memory_pool_id="ghost-pool", available_bytes=None)
+    broken = dataclasses.replace(state, memory_states=(*state.memory_states, ghost))
+    with pytest.raises(ValueError, match="unknown memory pool"):
+        validate_state_against_capability(broken, make_rtx_capability())
+
+
+def test_validate_state_against_capability_rejects_runtime_on_unknown_device() -> None:
+    state = make_worker_state("worker-1")
+    broken_instance = dataclasses.replace(
+        state.runtime_instances[0], device_ids=("ghost-device",)
+    )
+    broken = dataclasses.replace(state, runtime_instances=(broken_instance,))
+    with pytest.raises(ValueError, match="unknown device"):
+        validate_state_against_capability(broken, make_rtx_capability())

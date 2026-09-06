@@ -139,6 +139,31 @@ def test_device_request_ids_are_attributed() -> None:
     assert instance.device_ids == (GPU_UUID_1, GPU_UUID_2)
 
 
+@pytest.mark.parametrize("device_id", ["0", "1", "all", "none", "gpu0"])
+def test_device_request_ordinals_and_shorthands_are_never_attributed(
+    device_id: str,
+) -> None:
+    """§11: a CUDA ordinal/shorthand is not a stable device_id — never written."""
+    container = FakeContainer(managed_labels(), attrs=device_requests(device_id))
+    (instance,) = scan_runtime_inventory(FakeDockerClient([container]))
+    assert instance.device_ids == ()
+
+
+def test_device_request_mixed_uuid_and_ordinal_reports_nothing() -> None:
+    """All-or-nothing, same rule as ``NVIDIA_VISIBLE_DEVICES``: no partial guess."""
+    container = FakeContainer(managed_labels(), attrs=device_requests(GPU_UUID_1, "0"))
+    (instance,) = scan_runtime_inventory(FakeDockerClient([container]))
+    assert instance.device_ids == ()
+
+
+def test_ordinal_device_request_falls_through_to_env_uuids() -> None:
+    """An unusable ``DeviceIDs`` list leaves the env as the attribution source."""
+    attrs = {**device_requests("0"), **visible_devices(GPU_UUID_1)}
+    container = FakeContainer(managed_labels(), attrs=attrs)
+    (instance,) = scan_runtime_inventory(FakeDockerClient([container]))
+    assert instance.device_ids == (GPU_UUID_1,)
+
+
 def test_device_requests_win_over_environment() -> None:
     attrs = {**device_requests(GPU_UUID_1), **visible_devices(GPU_UUID_2)}
     container = FakeContainer(managed_labels(), attrs=attrs)
