@@ -171,7 +171,13 @@ class MasterService:
 
         # §29: upsert identity + capability, invalidate the old session,
         # create a new one, store the initial state, mark ONLINE.
-        self._registry.upsert(request.identity, request.capability)
+        # Phase 2 (additive): registration also carries the Worker's
+        # profiling endpoint — absent means "does not host profiling".
+        self._registry.upsert(
+            request.identity,
+            request.capability,
+            profiling_endpoint=request.profiling_endpoint,
+        )
         session = self._sessions.open_session(worker_id, request.instance_id)
         self._states.record(
             worker_id,
@@ -285,7 +291,13 @@ class MasterService:
         # Atomic capability+state replacement (no await between the two):
         # a snapshot built at any instant pairs the new capability with the
         # state sampled alongside it, never with the pre-update state (§38).
-        self._registry.upsert(record.identity, request.capability)
+        # The profiling endpoint survives capability updates untouched —
+        # only registration changes it (Phase 2 spec §41).
+        self._registry.upsert(
+            record.identity,
+            request.capability,
+            profiling_endpoint=record.profiling_endpoint,
+        )
         self._states.record(
             request.worker_id,
             request.state,

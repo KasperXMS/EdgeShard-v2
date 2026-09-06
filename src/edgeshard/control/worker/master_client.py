@@ -184,12 +184,15 @@ class WorkerAgent:
         sleeper: Sleeper = asyncio.sleep,
         clock: Clock = _utc_now,
         rpc_timeout_s: float = DEFAULT_RPC_TIMEOUT_S,
+        profiling_endpoint: str | None = None,
     ) -> None:
         if config.worker.master is None:
             raise WorkerAgentError(
                 "worker.master.endpoint is required to serve a Worker; "
                 "see examples/configs/worker.yaml"
             )
+        if profiling_endpoint is not None and not profiling_endpoint:
+            raise WorkerAgentError("profiling_endpoint must not be empty when present")
         self._config = config
         self._endpoint = config.worker.master.endpoint
         self._client = client
@@ -197,6 +200,7 @@ class WorkerAgent:
         self._sleeper = sleeper
         self._clock = clock
         self._rpc_timeout_s = rpc_timeout_s
+        self._profiling_endpoint = profiling_endpoint
         self._instance_id = new_instance_id()
         self._stopping = False
 
@@ -208,6 +212,11 @@ class WorkerAgent:
     @property
     def endpoint(self) -> str:
         return self._endpoint
+
+    @property
+    def profiling_endpoint(self) -> str | None:
+        """Advertised profiling endpoint, or ``None`` when not hosted (§41)."""
+        return self._profiling_endpoint
 
     def request_stop(self) -> None:
         """Ask ``run`` to exit at the next checkpoint (between RPCs)."""
@@ -278,6 +287,9 @@ class WorkerAgent:
             identity=inspection.identity,
             capability=inspection.capability,
             initial_state=inspection.state,
+            # Phase 2 (additive): the *bound* profiling endpoint when this
+            # Agent hosts WorkerProfilingService, else absent (§41).
+            profiling_endpoint=self._profiling_endpoint,
         )
         response = await self._call(client.register_worker, request, "registration")
 

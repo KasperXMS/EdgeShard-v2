@@ -4,8 +4,9 @@ Usage (repository root, managed environment):
 
     uv run python scripts/generate_proto.py
 
-Compiles ``proto/shard_runtime.proto`` (Phase 0 shard data plane) and
-``proto/worker_control.proto`` (Phase 1 control plane, spec 41). The
+Compiles ``proto/shard_runtime.proto`` (Phase 0 shard data plane),
+``proto/worker_control.proto`` (Phase 1 control plane, spec 41), and
+``proto/profiling.proto`` (Phase 2 profiling plane, Phase 2 spec §41). The
 generated files are committed so runtime environments and CI never need
 grpcio-tools (spec 4.10 reproducibility); grpcio-tools is a dev dependency
 only. Generated code lands in the package listed per target and each grpc
@@ -50,6 +51,11 @@ TARGETS = (
         proto="worker_control.proto",
         out_dir=SRC_DIR / "protocol" / "control" / "pb",
         package="edgeshard.protocol.control.pb",
+    ),
+    ProtoTarget(
+        proto="profiling.proto",
+        out_dir=SRC_DIR / "protocol" / "profiling" / "pb",
+        package="edgeshard.protocol.profiling.pb",
     ),
 )
 

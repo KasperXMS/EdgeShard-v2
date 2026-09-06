@@ -85,6 +85,11 @@ class RegisterWorkerRequest:
     ``worker_id`` and ``capability_revision`` travel both top-level and
     inside ``identity``/``capability`` on the wire; the mapper cross-checks
     the redundant copies and rejects any mismatch (spec §47).
+
+    ``profiling_endpoint`` is the additive Phase 2 field (Phase 2 spec §41):
+    the "host:port" of the Worker-hosted ``WorkerProfilingService``, or
+    ``None`` when the Worker does not host profiling. It lives outside
+    ``WorkerCapability`` so frozen capability revisions never change.
     """
 
     protocol_version: str
@@ -92,6 +97,7 @@ class RegisterWorkerRequest:
     identity: WorkerIdentity
     capability: WorkerCapability
     initial_state: WorkerState
+    profiling_endpoint: str | None = None
 
     def __post_init__(self) -> None:
         if self.protocol_version != CONTROL_PROTOCOL_VERSION:
@@ -114,6 +120,8 @@ class RegisterWorkerRequest:
                 f"identity/state worker_id mismatch: "
                 f"{self.identity.worker_id!r} vs {self.initial_state.worker_id!r}"
             )
+        if self.profiling_endpoint is not None and not self.profiling_endpoint:
+            raise ValueError("profiling_endpoint must not be empty when present")
 
 
 @dataclass(frozen=True)
@@ -721,7 +729,7 @@ def _timestamp_from_ms(ms: int | None) -> datetime | None:
 
 
 def register_request_to_wire(request: RegisterWorkerRequest) -> pb.RegisterWorkerRequest:
-    return pb.RegisterWorkerRequest(
+    wire = pb.RegisterWorkerRequest(
         protocol_version=request.protocol_version,
         worker_id=request.identity.worker_id,
         instance_id=request.instance_id,
@@ -730,6 +738,10 @@ def register_request_to_wire(request: RegisterWorkerRequest) -> pb.RegisterWorke
         capability=capability_to_wire(request.capability),
         initial_state=state_to_wire(request.initial_state),
     )
+    # proto3 optional: absence (never a sentinel) encodes "no profiling" (§17).
+    if request.profiling_endpoint is not None:
+        wire.profiling_endpoint = request.profiling_endpoint
+    return wire
 
 
 def register_request_from_wire(wire: pb.RegisterWorkerRequest) -> RegisterWorkerRequest:
@@ -757,6 +769,9 @@ def register_request_from_wire(wire: pb.RegisterWorkerRequest) -> RegisterWorker
         identity=identity,
         capability=capability,
         initial_state=state_from_wire(wire.initial_state),
+        profiling_endpoint=(
+            wire.profiling_endpoint if wire.HasField("profiling_endpoint") else None
+        ),
     )
 
 

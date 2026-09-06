@@ -1,0 +1,261 @@
+// EdgeShard v2 Phase 2 — profiling wire protocol (spec §41).
+//
+// Two services live in this file:
+//
+//   * WorkerProfilingService — hosted by each Worker Agent process, called
+//     by the Master's ProfilingController (§40). This is the first
+//     master→worker RPC channel; Phase 1 only defined worker→master
+//     registration. Workers advertise their profiling endpoint via the
+//     additive RegisterWorkerRequest.profiling_endpoint field (absent =
+//     the worker does not host profiling).
+//   * ProfilingAdminService — hosted by the Master, called by the CLI
+//     (§49). The CLI never drives domain logic itself; it submits intents
+//     and reads back status/snapshots.
+//
+// Encoding convention (the §41 "alternative simplification that fits the
+// existing control conventions"): every message is a *typed envelope* —
+// canonical ids and session tokens in real proto fields, with the deep
+// variant-rich domain trees (case specs, signatures, session facts,
+// measurement records, outcomes) carried as deterministic canonical-JSON
+// payload strings produced by edgeshard.profiling.codec. Duplicating those
+// trees in .proto would create a second source of truth for shapes the §7
+// canonical hashing already pins; the mapper boundary, typed rejections,
+// and "generated pb never reaches the domain" rules of Phase 1 are all
+// preserved (spec §41: protocol messages carry domain DTOs, never
+// persistence objects).
+//
+// Missing values are field absence or empty payload strings, never
+// sentinel encodings (spec §17, §52.2). Malformed payloads are rejected at
+// the mapper boundary with grpc INVALID_ARGUMENT, mirroring Phase 1.
+
+syntax = "proto3";
+
+package edgeshard.profiling.v1;
+
+// ---------------------------------------------------------------------------
+// Rejections
+// ---------------------------------------------------------------------------
+
+// Why a Worker refused a profiling RPC. Recovery keys off this enum, never
+// off the human-readable detail: UNKNOWN_SESSION / SESSION_CLOSED mean
+// "prepare (again) first", STALE_SESSION means "this registration was
+// superseded — the Master must re-select a worker" (§41: a stale worker
+// session MUST NOT publish measurements), SESSION_KIND_MISMATCH and
+// UNKNOWN_CASE are Master-side protocol violations that must fail loudly,
+// and DEVICE_BUSY is the §39 lease rejection (defer or re-select).
+enum ProfilingRejectionReason {
+  PROFILING_REJECTION_REASON_UNSPECIFIED = 0;
+  PROFILING_REJECTION_REASON_UNKNOWN_SESSION = 1;
+  PROFILING_REJECTION_REASON_STALE_SESSION = 2;
+  PROFILING_REJECTION_REASON_SESSION_CLOSED = 3;
+  PROFILING_REJECTION_REASON_SESSION_KIND_MISMATCH = 4;
+  PROFILING_REJECTION_REASON_DEVICE_BUSY = 5;
+  PROFILING_REJECTION_REASON_UNKNOWN_CASE = 6;
+}
+
+// ---------------------------------------------------------------------------
+// WorkerProfilingService messages (§38-§39, §41)
+// ---------------------------------------------------------------------------
+
+// worker_id/instance_id/registration_session_id are the Phase 1 session
+// tokens: the Worker validates them against its *current* registration on
+// every RPC, so a superseded or restarted Agent can never execute or
+// publish profiling work under a dead session (§41).
+
+message PrepareProfilingSessionRequest {
+  string worker_id = 1;
+  string instance_id = 2;
+  string registration_session_id = 3;
+
+  // Master-assigned id for the new profiling session (§38).
+  string profiling_session_id = 4;
+
+  // codec JSON: ProfilingSessionRequest (kind, device_ids, model, dtype…).
+  string session_request_payload = 5;
+
+  // codec JSON: tuple of WorkerNetworkFacts — the Master-resolved cluster
+  // address facts a network session probes against. Empty for non-network
+  // sessions; the executing Worker never guesses destinations (§52.2).
+  string network_facts_payload = 6;
+}
+
+message PrepareProfilingSessionResponse {
+  bool accepted = 1;
+  // Mandatory explanation whenever accepted=false (§46 observability).
+  string detail = 2;
+  // Mandatory whenever accepted=false; UNSPECIFIED when accepted.
+  ProfilingRejectionReason reason = 3;
+
+  // codec JSON: ModelSessionFacts — static characterization/layer/module/
+  // operator facts for MODEL sessions (§47 planning input). Empty for
+  // OPERATOR/NETWORK sessions. Preparation performs static work only; no
+  // benchmark ever runs inside prepare (§40).
+  string session_facts_payload = 4;
+}
+
+message RunProfilingCaseRequest {
+  string worker_id = 1;
+  string instance_id = 2;
+  string registration_session_id = 3;
+  string profiling_session_id = 4;
+
+  // Canonical case id (§7); must match the payload's case_id.
+  string case_id = 5;
+
+  // codec JSON: ProfilingCase.
+  string case_payload = 6;
+}
+
+message RunProfilingCaseResponse {
+  // accepted=false means the case was *refused* (session/lease problem) and
+  // never ran. A case that ran and failed is accepted=true with a typed
+  // failure inside the outcome — failures are results (§42), not transport
+  // rejections.
+  bool accepted = 1;
+  string detail = 2;
+  ProfilingRejectionReason reason = 3;
+
+  // codec JSON: CaseOutcome (exactly one of MeasurementRecord /
+  // ProfilingFailure). Present whenever accepted=true.
+  string outcome_payload = 4;
+}
+
+message GetProfilingCaseRequest {
+  string worker_id = 1;
+  string instance_id = 2;
+  string registration_session_id = 3;
+  string profiling_session_id = 4;
+  string case_id = 5;
+}
+
+message GetProfilingCaseResponse {
+  bool accepted = 1;
+  string detail = 2;
+  ProfilingRejectionReason reason = 3;
+
+  // CaseState value ("pending"/"running"/"completed"/"failed"/"cancelled");
+  // empty when the session does not track this case.
+  string case_state = 4;
+
+  // codec JSON: CaseOutcome — present once the case reached a terminal state.
+  string outcome_payload = 5;
+}
+
+message CancelProfilingCaseRequest {
+  string worker_id = 1;
+  string instance_id = 2;
+  string registration_session_id = 3;
+  string profiling_session_id = 4;
+  string case_id = 5;
+}
+
+message CancelProfilingCaseResponse {
+  // accepted=true means the case is now cancelled (or was already terminal,
+  // which cancellation must not undo — §44: history is never rewritten).
+  bool accepted = 1;
+  string detail = 2;
+  ProfilingRejectionReason reason = 3;
+
+  // CaseState value after the cancellation attempt.
+  string case_state = 4;
+}
+
+message CloseProfilingSessionRequest {
+  string worker_id = 1;
+  string instance_id = 2;
+  string registration_session_id = 3;
+  string profiling_session_id = 4;
+}
+
+message CloseProfilingSessionResponse {
+  // Closing an unknown or already-closed session is accepted (idempotent):
+  // cleanup must have released the session's leases and model state either
+  // way (§38-§39).
+  bool accepted = 1;
+  string detail = 2;
+  ProfilingRejectionReason reason = 3;
+}
+
+// ---------------------------------------------------------------------------
+// ProfilingAdminService messages (§40, §49)
+// ---------------------------------------------------------------------------
+
+message StartExperimentRequest {
+  // codec JSON: ProfilingRequest — the intent the CLI submits (what to
+  // profile, on which workers, missing-only flags…). The Master expands it
+  // through the active strategy (§47-§48); the CLI carries no domain logic.
+  string request_payload = 1;
+}
+
+message StartExperimentResponse {
+  bool accepted = 1;
+  string detail = 2;
+  string experiment_id = 3;
+}
+
+message GetExperimentRequest {
+  string experiment_id = 1;
+}
+
+message GetExperimentResponse {
+  bool found = 1;
+  // codec JSON: ExperimentStatus — Master-side lifecycle view (experiment
+  // state plus per-case states and typed failures). Absent when found=false.
+  string status_payload = 2;
+}
+
+message CancelExperimentRequest {
+  string experiment_id = 1;
+}
+
+message CancelExperimentResponse {
+  bool accepted = 1;
+  string detail = 2;
+}
+
+message BuildProfileSnapshotRequest {
+  // Reserved for future scoping filters (model/worker); v1 snapshots the
+  // whole store (§46).
+}
+
+message BuildProfileSnapshotResponse {
+  bool accepted = 1;
+  string detail = 2;
+  // codec JSON: ProfileSnapshot. Rendering (yaml/json) is CLI presentation
+  // and never a Master concern (§49).
+  string snapshot_payload = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Services (§41, §49)
+// ---------------------------------------------------------------------------
+
+service WorkerProfilingService {
+  rpc PrepareProfilingSession(PrepareProfilingSessionRequest)
+      returns (PrepareProfilingSessionResponse);
+
+  rpc RunProfilingCase(RunProfilingCaseRequest)
+      returns (RunProfilingCaseResponse);
+
+  rpc GetProfilingCase(GetProfilingCaseRequest)
+      returns (GetProfilingCaseResponse);
+
+  rpc CancelProfilingCase(CancelProfilingCaseRequest)
+      returns (CancelProfilingCaseResponse);
+
+  rpc CloseProfilingSession(CloseProfilingSessionRequest)
+      returns (CloseProfilingSessionResponse);
+}
+
+service ProfilingAdminService {
+  rpc StartExperiment(StartExperimentRequest)
+      returns (StartExperimentResponse);
+
+  rpc GetExperiment(GetExperimentRequest) returns (GetExperimentResponse);
+
+  rpc CancelExperiment(CancelExperimentRequest)
+      returns (CancelExperimentResponse);
+
+  rpc BuildProfileSnapshot(BuildProfileSnapshotRequest)
+      returns (BuildProfileSnapshotResponse);
+}

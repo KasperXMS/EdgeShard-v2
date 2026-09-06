@@ -8,7 +8,11 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
-from edgeshard.control.worker.config import WorkerConfig
+from edgeshard.control.worker.config import (
+    DEFAULT_PROFILING_HOST,
+    DEFAULT_PROFILING_PORT,
+    WorkerConfig,
+)
 from edgeshard.runtime.model_store import DEFAULT_MODEL_ROOT
 
 SPEC_EXAMPLE = """\
@@ -191,3 +195,45 @@ def test_from_yaml_non_mapping_rejected(tmp_path: Path) -> None:
 def test_from_yaml_missing_file_raises_oserror(tmp_path: Path) -> None:
     with pytest.raises(OSError):
         WorkerConfig.from_yaml(tmp_path / "missing.yaml")
+
+
+# -- profiling section (Phase 2 spec §41, additive) --------------------------
+
+
+def test_profiling_defaults_disabled_with_listen_defaults() -> None:
+    """Phase 1 configs keep working unchanged: profiling is opt-in (§41)."""
+    config = WorkerConfig.model_validate({})
+    assert config.profiling.enabled is False
+    assert config.profiling.host == DEFAULT_PROFILING_HOST
+    assert config.profiling.port == DEFAULT_PROFILING_PORT
+    # The spec example carries no profiling section and still parses.
+    assert WorkerConfig.model_validate(yaml.safe_load(SPEC_EXAMPLE)).profiling.enabled is False
+
+
+def test_profiling_section_parses() -> None:
+    config = WorkerConfig.model_validate(
+        {"profiling": {"enabled": True, "host": "127.0.0.1", "port": 0}}
+    )
+    assert config.profiling.enabled is True
+    assert config.profiling.host == "127.0.0.1"
+    assert config.profiling.port == 0
+
+
+def test_profiling_port_zero_allowed_for_os_chosen_bind() -> None:
+    """``worker serve`` advertises the *bound* port, so 0 is a valid knob."""
+    config = WorkerConfig.model_validate({"profiling": {"port": 0}})
+    assert config.profiling.port == 0
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"profiling": {"host": ""}},
+        {"profiling": {"port": -1}},
+        {"profiling": {"port": 65_536}},
+        {"profiling": {"bogus": 1}},
+    ],
+)
+def test_invalid_profiling_section_rejected(payload: dict[str, object]) -> None:
+    with pytest.raises(ValidationError):
+        WorkerConfig.model_validate(payload)

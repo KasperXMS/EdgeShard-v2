@@ -153,6 +153,7 @@ def make_register_request(
     state=None,
     protocol_version=CONTROL_PROTOCOL_VERSION,
     instance_id=INSTANCE_ID,
+    profiling_endpoint: str | None = None,
 ) -> RegisterWorkerRequest:
     identity = identity or make_worker_identity(WORKER_ID)
     capability = capability or make_rtx_capability()
@@ -163,6 +164,7 @@ def make_register_request(
         identity=identity,
         capability=capability,
         initial_state=state,
+        profiling_endpoint=profiling_endpoint,
     )
 
 
@@ -437,3 +439,29 @@ def test_unknown_memory_model_enum_rejected() -> None:
     wire.model = 42
     with pytest.raises(ControlProtocolError, match="memory model"):
         mapper._memory_pool_from_wire(wire)
+
+
+# -- profiling endpoint advertisement (Phase 2 spec §41, additive) -----------
+
+
+def test_register_request_profiling_endpoint_roundtrip() -> None:
+    request = make_register_request(profiling_endpoint="10.0.0.5:51100")
+    restored = mapper.register_request_from_wire(mapper.register_request_to_wire(request))
+    assert restored == request
+    assert restored.profiling_endpoint == "10.0.0.5:51100"
+
+
+def test_register_request_without_profiling_endpoint_stays_absent() -> None:
+    """proto3 optional: absence means "does not host profiling", never a
+    sentinel — Phase 1 workers keep producing byte-identical requests (§41)."""
+    request = make_register_request()
+    wire = mapper.register_request_to_wire(request)
+    assert not wire.HasField("profiling_endpoint")
+    restored = mapper.register_request_from_wire(wire)
+    assert restored.profiling_endpoint is None
+    assert restored == request
+
+
+def test_register_request_rejects_empty_profiling_endpoint() -> None:
+    with pytest.raises(ValueError, match="profiling_endpoint"):
+        make_register_request(profiling_endpoint="")

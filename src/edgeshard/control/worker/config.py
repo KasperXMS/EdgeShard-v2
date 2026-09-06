@@ -142,6 +142,38 @@ class RuntimeSection(BaseModel):
         return self
 
 
+DEFAULT_PROFILING_HOST = "0.0.0.0"
+DEFAULT_PROFILING_PORT = 51_100
+"""Listen defaults for the Worker-hosted ``WorkerProfilingService`` (Phase 2
+spec §41). Port 0 (OS-chosen) is allowed: ``worker serve`` advertises the
+*bound* endpoint at registration, so tests and busy hosts never collide."""
+
+
+class ProfilingSection(BaseModel):
+    """Worker-side profiling-plane hosting intent (Phase 2 spec §41).
+
+    Additive: ``enabled=false`` (the default) keeps exact Phase 1 behavior —
+    no profiling server is started and registration advertises no endpoint.
+    This section declares *intent* (listen host/port); the endpoint actually
+    advertised to the Master is the resolved ``host:bound_port`` computed by
+    ``worker serve`` after the server starts.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    host: str = DEFAULT_PROFILING_HOST
+    port: int = DEFAULT_PROFILING_PORT
+
+    @model_validator(mode="after")
+    def _check_listen(self) -> ProfilingSection:
+        if not self.host:
+            raise ValueError("profiling host must be non-empty")
+        if not 0 <= self.port <= 65_535:
+            raise ValueError(f"profiling port out of range: {self.port}")
+        return self
+
+
 class TlsSection(BaseModel):
     """Transport security placeholder (spec §48): TLS lands later.
 
@@ -173,6 +205,7 @@ class WorkerConfig(BaseModel):
     worker: WorkerSection = WorkerSection()
     model_store: ModelStoreSection = ModelStoreSection()
     runtime: RuntimeSection = RuntimeSection()
+    profiling: ProfilingSection = ProfilingSection()
     tls: TlsSection = TlsSection()
 
     @classmethod

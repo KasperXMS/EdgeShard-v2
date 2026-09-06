@@ -80,8 +80,9 @@ target-version = "py312"
 line-length = 100
 src = ["src", "tests"]
 extend-exclude = [
-    "src/edgeshard/protocol/pb",         # generated shard protobuf code
-    "src/edgeshard/protocol/control/pb", # generated control protobuf code
+    "src/edgeshard/protocol/pb",           # generated shard protobuf code
+    "src/edgeshard/protocol/control/pb",   # generated control protobuf code
+    "src/edgeshard/protocol/profiling/pb", # generated profiling protobuf code
 ]
 
 [tool.ruff.lint]
@@ -121,7 +122,11 @@ follow_imports = "skip"
 # Generated protobuf code (scripts/generate_proto.py). The pb2 module ships
 # real .pyi stubs that importers use; errors inside the generated files
 # (including the untyped grpc import in pb2_grpc) are suppressed.
-module = ["edgeshard.protocol.pb.*", "edgeshard.protocol.control.pb.*"]
+module = [
+    "edgeshard.protocol.pb.*",
+    "edgeshard.protocol.control.pb.*",
+    "edgeshard.protocol.profiling.pb.*",
+]
 ignore_errors = true
 
 # ---------------------------------------------------------------------------

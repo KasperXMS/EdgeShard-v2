@@ -64,7 +64,12 @@ def make_service(config: MasterConfig | None = None) -> tuple[MasterService, Fak
 
 
 def make_register_request(
-    *, identity=None, capability=None, state=None, instance_id=None
+    *,
+    identity=None,
+    capability=None,
+    state=None,
+    instance_id=None,
+    profiling_endpoint: str | None = None,
 ) -> RegisterWorkerRequest:
     identity = identity or make_worker_identity()
     capability = capability or make_rtx_capability()
@@ -75,6 +80,7 @@ def make_register_request(
         identity=identity,
         capability=capability,
         initial_state=state,
+        profiling_endpoint=profiling_endpoint,
     )
 
 
@@ -625,3 +631,76 @@ async def test_service_start_stop_context_manager() -> None:
         request, session_id = await register(service)
         response = await service.heartbeat(make_heartbeat(request, session_id, 1))
         assert response.accepted
+
+
+# -- profiling endpoint advertisement (Phase 2 spec §41, additive) -----------
+
+
+async def test_registration_stores_profiling_endpoint() -> None:
+    service, _clock = make_service()
+    request = make_register_request(profiling_endpoint="10.0.0.5:51100")
+
+    await service.register_worker(request)
+
+    record = service.registry.get(request.identity.worker_id)
+    assert record.profiling_endpoint == "10.0.0.5:51100"
+
+
+async def test_registration_without_profiling_endpoint_stores_none() -> None:
+    """Phase 1 registrations are untouched by the additive field."""
+    service, _clock = make_service()
+    request, _session = await register(service)
+    record = service.registry.get(request.identity.worker_id)
+    assert record.profiling_endpoint is None
+
+
+async def test_reregistration_replaces_profiling_endpoint() -> None:
+    """A restarted Worker that stopped hosting profiling clears the stale
+    address: registration is the endpoint's only source of truth (§41)."""
+    service, _clock = make_service()
+    identity = make_worker_identity()
+    hosting = make_register_request(
+        identity=identity, profiling_endpoint="10.0.0.5:51100"
+    )
+    await service.register_worker(hosting)
+
+    plain = make_register_request(
+        identity=identity, state=make_worker_state(identity.worker_id)
+    )
+    await service.register_worker(plain)
+
+    assert service.registry.get(identity.worker_id).profiling_endpoint is None
+
+
+async def test_capability_update_preserves_profiling_endpoint() -> None:
+    """Only registration changes the endpoint; capability updates carry no
+    endpoint field and must keep the advertised one (§41)."""
+    service, _clock = make_service()
+    request = make_register_request(profiling_endpoint="10.0.0.5:51100")
+    response = await service.register_worker(request)
+    worker_id = request.identity.worker_id
+
+    gpu = request.capability.devices[1]
+    evolved = finalize(
+        dataclasses.replace(
+            request.capability,
+            devices=(
+                request.capability.devices[0],
+                dataclasses.replace(gpu, platform_tags=(*gpu.platform_tags, "nvlink")),
+            ),
+        )
+    )
+    update = await service.update_capability(
+        UpdateCapabilityRequest(
+            worker_id=worker_id,
+            instance_id=request.instance_id,
+            session_id=response.session_id,
+            capability=evolved,
+            state=make_worker_state(worker_id),
+        )
+    )
+
+    assert update.accepted
+    record = service.registry.get(worker_id)
+    assert record.capability == evolved
+    assert record.profiling_endpoint == "10.0.0.5:51100"

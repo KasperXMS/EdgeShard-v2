@@ -21,14 +21,23 @@ from edgeshard.cluster.identity import WorkerIdentity
 
 @dataclass(frozen=True)
 class WorkerRecord:
-    """Stable information about one registered Worker (spec §34)."""
+    """Stable information about one registered Worker (spec §34).
+
+    ``profiling_endpoint`` is the additive Phase 2 field (Phase 2 spec §41):
+    the "host:port" of the Worker's ``WorkerProfilingService``, or ``None``
+    when the Worker does not host profiling. It comes from registration —
+    never from capability, whose revision hash stays frozen.
+    """
 
     identity: WorkerIdentity
     capability: WorkerCapability
+    profiling_endpoint: str | None = None
 
     def __post_init__(self) -> None:
         if not self.identity.worker_id:
             raise ValueError("worker_id must not be empty")
+        if self.profiling_endpoint is not None and not self.profiling_endpoint:
+            raise ValueError("profiling_endpoint must not be empty when present")
 
     @property
     def worker_id(self) -> str:
@@ -53,10 +62,22 @@ class WorkerRegistry:
         self._records: dict[str, WorkerRecord] = {}
 
     def upsert(
-        self, identity: WorkerIdentity, capability: WorkerCapability
+        self,
+        identity: WorkerIdentity,
+        capability: WorkerCapability,
+        profiling_endpoint: str | None = None,
     ) -> WorkerRecord:
-        """Insert or replace the record for ``identity.worker_id``."""
-        record = WorkerRecord(identity=identity, capability=capability)
+        """Insert or replace the record for ``identity.worker_id``.
+
+        ``profiling_endpoint`` replaces any previously advertised endpoint:
+        registration is its only source of truth, so a restarted Worker that
+        no longer hosts profiling clears the stale address.
+        """
+        record = WorkerRecord(
+            identity=identity,
+            capability=capability,
+            profiling_endpoint=profiling_endpoint,
+        )
         self._records[record.worker_id] = record
         return record
 

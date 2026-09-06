@@ -218,6 +218,12 @@ message RegisterWorkerRequest {
   WorkerCapability capability = 6;
 
   WorkerState initial_state = 7;
+
+  // Phase 2 (additive): "host:port" of this Worker's WorkerProfilingService
+  // (profiling.proto). Absent means the Worker does not host profiling —
+  // Phase 1 semantics are unchanged, and the endpoint deliberately lives
+  // outside WorkerCapability so capability_revision hashes stay frozen.
+  optional string profiling_endpoint = 8;
 }
 
 message RegisterWorkerResponse {

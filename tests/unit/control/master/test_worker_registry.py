@@ -71,3 +71,44 @@ def test_record_rejects_empty_worker_id() -> None:
         # re-asserts it so a hand-built record cannot sneak past.
         identity = dataclasses.replace(make_worker_identity(), worker_id="")
         WorkerRecord(identity=identity, capability=make_rtx_capability())
+
+
+# -- profiling endpoint advertisement (Phase 2 spec §41, additive) -----------
+
+
+def test_profiling_endpoint_defaults_to_none() -> None:
+    """Phase 1 registrations (no endpoint argument) store None, not ''."""
+    registry = WorkerRegistry()
+    identity = make_worker_identity()
+    record = registry.upsert(identity, make_rtx_capability())
+    assert record.profiling_endpoint is None
+
+
+def test_upsert_stores_profiling_endpoint() -> None:
+    registry = WorkerRegistry()
+    identity = make_worker_identity()
+    registry.upsert(identity, make_rtx_capability(), profiling_endpoint="10.0.0.5:51100")
+    assert registry.get(identity.worker_id).profiling_endpoint == "10.0.0.5:51100"
+
+
+def test_reregistration_replaces_profiling_endpoint() -> None:
+    """Registration is the endpoint's only source of truth: a restarted
+    Worker that no longer hosts profiling clears the stale address (§41)."""
+    registry = WorkerRegistry()
+    identity = make_worker_identity()
+    registry.upsert(identity, make_rtx_capability(), profiling_endpoint="10.0.0.5:51100")
+
+    registry.upsert(identity, make_rtx_capability())
+    assert registry.get(identity.worker_id).profiling_endpoint is None
+
+    registry.upsert(identity, make_rtx_capability(), profiling_endpoint="10.0.0.5:51101")
+    assert registry.get(identity.worker_id).profiling_endpoint == "10.0.0.5:51101"
+
+
+def test_record_rejects_empty_profiling_endpoint() -> None:
+    with pytest.raises(ValueError, match="profiling_endpoint"):
+        WorkerRecord(
+            identity=make_worker_identity(),
+            capability=make_rtx_capability(),
+            profiling_endpoint="",
+        )

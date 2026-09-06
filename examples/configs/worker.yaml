@@ -24,5 +24,14 @@ model_store:
 runtime:
   discover_managed_containers: true
 
+# Phase 2 (additive): host the WorkerProfilingService and advertise its
+# *bound* endpoint at registration. `enabled: false` keeps exact Phase 1
+# behavior. `port: 0` lets the OS choose; `worker serve` reports the bound
+# port in its READY line and registers `host:bound_port` with the Master.
+profiling:
+  enabled: false
+  host: 0.0.0.0
+  port: 51100
+
 tls:
   enabled: false

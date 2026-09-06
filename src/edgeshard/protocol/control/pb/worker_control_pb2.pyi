@@ -268,7 +268,7 @@ class WorkerState(_message.Message):
     def __init__(self, worker_id: _Optional[str] = ..., device_states: _Optional[_Iterable[_Union[DeviceState, _Mapping]]] = ..., memory_states: _Optional[_Iterable[_Union[MemoryPoolState, _Mapping]]] = ..., runtime_instances: _Optional[_Iterable[_Union[RuntimeInstanceState, _Mapping]]] = ..., models: _Optional[_Iterable[_Union[ModelInventoryEntry, _Mapping]]] = ...) -> None: ...
 
 class RegisterWorkerRequest(_message.Message):
-    __slots__ = ("protocol_version", "worker_id", "instance_id", "identity", "capability_revision", "capability", "initial_state")
+    __slots__ = ("protocol_version", "worker_id", "instance_id", "identity", "capability_revision", "capability", "initial_state", "profiling_endpoint")
     PROTOCOL_VERSION_FIELD_NUMBER: _ClassVar[int]
     WORKER_ID_FIELD_NUMBER: _ClassVar[int]
     INSTANCE_ID_FIELD_NUMBER: _ClassVar[int]
@@ -276,6 +276,7 @@ class RegisterWorkerRequest(_message.Message):
     CAPABILITY_REVISION_FIELD_NUMBER: _ClassVar[int]
     CAPABILITY_FIELD_NUMBER: _ClassVar[int]
     INITIAL_STATE_FIELD_NUMBER: _ClassVar[int]
+    PROFILING_ENDPOINT_FIELD_NUMBER: _ClassVar[int]
     protocol_version: str
     worker_id: str
     instance_id: str
@@ -283,7 +284,8 @@ class RegisterWorkerRequest(_message.Message):
     capability_revision: str
     capability: WorkerCapability
     initial_state: WorkerState
-    def __init__(self, protocol_version: _Optional[str] = ..., worker_id: _Optional[str] = ..., instance_id: _Optional[str] = ..., identity: _Optional[_Union[WorkerIdentity, _Mapping]] = ..., capability_revision: _Optional[str] = ..., capability: _Optional[_Union[WorkerCapability, _Mapping]] = ..., initial_state: _Optional[_Union[WorkerState, _Mapping]] = ...) -> None: ...
+    profiling_endpoint: str
+    def __init__(self, protocol_version: _Optional[str] = ..., worker_id: _Optional[str] = ..., instance_id: _Optional[str] = ..., identity: _Optional[_Union[WorkerIdentity, _Mapping]] = ..., capability_revision: _Optional[str] = ..., capability: _Optional[_Union[WorkerCapability, _Mapping]] = ..., initial_state: _Optional[_Union[WorkerState, _Mapping]] = ..., profiling_endpoint: _Optional[str] = ...) -> None: ...
 
 class RegisterWorkerResponse(_message.Message):
     __slots__ = ("session_id", "heartbeat_interval_ms", "server_protocol_version")

@@ -196,6 +196,7 @@ def make_rig(
     initial_delay_s: float = 1.0,
     max_delay_s: float = 4.0,
     configured_interval_s: float = 99.0,
+    profiling_endpoint: str | None = None,
 ) -> Rig:
     client = FakeClient(heartbeat_interval_ms=interval_ms)
     client.register_effects = deque(register_effects)
@@ -215,7 +216,12 @@ def make_rig(
         )
     )
     agent = WorkerAgent(
-        config, client=client, inspector=inspector, sleeper=sleeper, clock=clock
+        config,
+        client=client,
+        inspector=inspector,
+        sleeper=sleeper,
+        clock=clock,
+        profiling_endpoint=profiling_endpoint,
     )
     sleeper.agent = agent
     return Rig(agent=agent, client=client, inspector=inspector, sleeper=sleeper, clock=clock)
@@ -581,3 +587,55 @@ async def test_stale_session_capability_update_stops_agent() -> None:
     assert len(rig.client.updates) == 1
     assert len(rig.client.heartbeats) == 0  # stopped before the next beat
     assert rig.inspector.closed == 1
+
+
+# ---------------------------------------------------------------------------
+# Profiling endpoint advertisement (Phase 2 spec §41, additive)
+# ---------------------------------------------------------------------------
+
+
+async def test_registration_advertises_profiling_endpoint() -> None:
+    rig = make_rig(stop_after=1, profiling_endpoint="10.0.0.5:51100")
+
+    await rig.agent.run()
+
+    (registration,) = rig.client.registrations
+    assert registration.profiling_endpoint == "10.0.0.5:51100"
+    assert rig.agent.profiling_endpoint == "10.0.0.5:51100"
+
+
+async def test_registration_without_profiling_endpoint_stays_absent() -> None:
+    """Phase 1 behavior is untouched: no endpoint configured → field absent."""
+    rig = make_rig(stop_after=1)
+
+    await rig.agent.run()
+
+    (registration,) = rig.client.registrations
+    assert registration.profiling_endpoint is None
+    assert rig.agent.profiling_endpoint is None
+
+
+async def test_reregistration_keeps_advertising_profiling_endpoint() -> None:
+    """Every reconnect performs a full registration (§27) — the endpoint
+    must be re-advertised on the second registration too, never just the first."""
+    rig = make_rig(
+        stop_after=2,
+        register_effects=[unavailable("reset"), None],
+        profiling_endpoint="10.0.0.5:51100",
+    )
+
+    await rig.agent.run()
+
+    assert len(rig.client.registrations) == 2
+    assert all(
+        request.profiling_endpoint == "10.0.0.5:51100"
+        for request in rig.client.registrations
+    )
+
+
+def test_empty_profiling_endpoint_fails_loudly() -> None:
+    config = WorkerConfig(
+        worker=WorkerSection(master=WorkerMasterEndpoint(endpoint="master.test:51000"))
+    )
+    with pytest.raises(WorkerAgentError, match="profiling_endpoint"):
+        WorkerAgent(config, profiling_endpoint="")
