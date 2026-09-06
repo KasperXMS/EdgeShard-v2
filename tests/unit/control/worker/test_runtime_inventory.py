@@ -264,6 +264,46 @@ def test_wildcard_host_ip_normalizes_to_loopback(wildcard: str) -> None:
     assert instance.endpoint == "127.0.0.1:32768"
 
 
+def test_dual_stack_wildcard_publish_is_one_endpoint() -> None:
+    """Real RTX host layout: Docker reports ``0.0.0.0`` and ``[::]`` as two
+    bindings of the *same* published endpoint — never an ambiguity."""
+    container = FakeContainer(
+        managed_labels(),
+        attrs=ports(("8000/tcp", "0.0.0.0", "18080"), ("8000/tcp", "::", "18080")),
+    )
+    (instance,) = scan_runtime_inventory(FakeDockerClient([container]))
+    assert instance.endpoint == "127.0.0.1:18080"
+
+
+def test_duplicate_identical_bindings_are_not_ambiguous() -> None:
+    container = FakeContainer(
+        managed_labels(),
+        attrs=ports(("8000/tcp", "", "32768"), ("8000/tcp", "", "32768")),
+    )
+    (instance,) = scan_runtime_inventory(FakeDockerClient([container]))
+    assert instance.endpoint == "127.0.0.1:32768"
+
+
+def test_same_container_port_on_distinct_host_ports_is_ambiguous() -> None:
+    container = FakeContainer(
+        managed_labels(),
+        attrs=ports(("8000/tcp", "", "32768"), ("8000/tcp", "", "32769")),
+    )
+    (instance,) = scan_runtime_inventory(FakeDockerClient([container]))
+    assert instance.endpoint is None
+
+
+def test_wildcard_and_concrete_ip_on_same_port_are_distinct() -> None:
+    """``0.0.0.0`` normalizes to loopback; an explicit LAN ip is genuinely
+    another endpoint, so the pair stays ambiguous."""
+    container = FakeContainer(
+        managed_labels(),
+        attrs=ports(("8000/tcp", "0.0.0.0", "32768"), ("8000/tcp", "192.168.1.5", "32768")),
+    )
+    (instance,) = scan_runtime_inventory(FakeDockerClient([container]))
+    assert instance.endpoint is None
+
+
 def test_multiple_tcp_bindings_report_no_endpoint() -> None:
     container = FakeContainer(
         managed_labels(),

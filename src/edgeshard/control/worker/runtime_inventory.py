@@ -141,11 +141,16 @@ def _is_gpu_uuid(token: str) -> bool:
 
 
 def _endpoint(container: Any) -> str | None:
-    """Published host endpoint when exactly one tcp port is mapped.
+    """Published host endpoint when exactly one distinct endpoint is mapped.
 
-    With zero or multiple mappings there is no single answer, so the
-    endpoint stays ``None`` rather than guessed. Wildcard Docker host ips
-    are normalized to loopback, the only address Phase 1 runtimes serve on.
+    Wildcard Docker host ips are normalized to loopback — the only address
+    Phase 1 runtimes serve on — and the normalized endpoints are then
+    deduplicated, so a dual-stack publish (``0.0.0.0:<p>`` *and* ``[::]:<p>``
+    for the same container port, which Docker reports as two bindings)
+    counts as the single endpoint it really is. Only genuinely distinct
+    host addresses/ports are ambiguous: with zero or multiple distinct
+    endpoints there is no single answer, so the endpoint stays ``None``
+    rather than guessed.
     """
     attrs = _attrs(container)
     network = attrs.get("NetworkSettings") or {}
@@ -164,7 +169,8 @@ def _endpoint(container: Any) -> str | None:
             if host_ip in _WILDCARD_HOST_IPS:
                 host_ip = "127.0.0.1"
             found.append(f"{host_ip}:{host_port}")
-    return found[0] if len(found) == 1 else None
+    distinct = list(dict.fromkeys(found))
+    return distinct[0] if len(distinct) == 1 else None
 
 
 def _runtime_status(container: Any) -> RuntimeStatus:
