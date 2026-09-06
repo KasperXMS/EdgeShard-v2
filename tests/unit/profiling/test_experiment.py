@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 import pytest
 
 from edgeshard.profiling.domain.experiment import (
+    CaseOutcome,
     CaseState,
     ExperimentState,
     ModelCaseSpec,
@@ -18,6 +19,13 @@ from edgeshard.profiling.domain.experiment import (
     profiling_case_id,
 )
 from edgeshard.profiling.domain.hashing import normalized_items
+from edgeshard.profiling.domain.measurement import (
+    LatencyMetrics,
+    MeasurementMetrics,
+    MeasurementRecord,
+    TimeUnit,
+    summarize_samples,
+)
 from edgeshard.profiling.domain.model import ModelReference
 from edgeshard.profiling.domain.network import (
     NetworkDirection,
@@ -289,3 +297,81 @@ def test_experiment_validation() -> None:
             requested_by=None,
             case_ids=(),
         )
+
+
+# ---------------------------------------------------------------------------
+# P2G: layer positions (§22) and case outcomes (§42)
+# ---------------------------------------------------------------------------
+
+
+def _measurement(case_id: str = "c-1") -> MeasurementRecord:
+    return MeasurementRecord(
+        measurement_id=f"m-{case_id}",
+        case_id=case_id,
+        environment_fingerprint="fp-1",
+        started_at=NOW,
+        finished_at=NOW,
+        sample_count=1,
+        samples=(1.0,),
+        metrics=MeasurementMetrics(
+            latency=LatencyMetrics(
+                summary=summarize_samples((1.0,)), unit=TimeUnit.MILLISECONDS
+            )
+        ),
+    )
+
+
+def test_layer_index_is_transformer_layer_only() -> None:
+    """§22: the positional check applies to enumerated layers, nothing else."""
+    assert _model_case(layer_index=0).layer_index == 0
+    with pytest.raises(ValueError, match="transformer-layer"):
+        _model_case(
+            granularity=ProfilingGranularity.MODULE,
+            layer_signature=None,
+            module_signature=MODULE,
+            layer_index=1,
+        )
+    with pytest.raises(ValueError, match="transformer-layer"):
+        _model_case(
+            granularity=ProfilingGranularity.OPERATOR,
+            layer_signature=None,
+            operator_signature=OPERATOR,
+            layer_index=1,
+        )
+
+
+def test_layer_index_must_not_be_negative() -> None:
+    with pytest.raises(ValueError, match="layer_index"):
+        _model_case(layer_index=-1)
+
+
+def test_layer_index_keeps_positional_cases_distinct() -> None:
+    """§7 + §22: same-shape layers at different positions are different cases.
+
+    Without ``layer_index`` the early/middle/late sparse probes (§47 step 6)
+    would deduplicate into one case id and the positional check could not be
+    expressed; with it, positions stay distinct while the un-indexed spec
+    keeps its reuse-identity meaning (``None`` = first matching layer).
+    """
+    early = ProfilingCase.for_spec("w-1", _model_case(layer_index=0))
+    middle = ProfilingCase.for_spec("w-1", _model_case(layer_index=2))
+    late = ProfilingCase.for_spec("w-1", _model_case(layer_index=3))
+    unindexed = ProfilingCase.for_spec("w-1", _model_case())
+    ids = {early.case_id, middle.case_id, late.case_id, unindexed.case_id}
+    assert len(ids) == 4
+
+
+def test_case_outcome_carries_exactly_one_member() -> None:
+    """§42: a success travels with its record, a failure with its category."""
+    record = _measurement()
+    failure = ProfilingFailure(
+        category=ProfilingErrorCategory.DEVICE_BUSY, message="device busy"
+    )
+    success = CaseOutcome.from_record(record)
+    assert success.succeeded and success.record is record and success.failure is None
+    failed = CaseOutcome.from_failure(failure)
+    assert not failed.succeeded and failed.failure is failure and failed.record is None
+    with pytest.raises(ValueError, match="exactly one"):
+        CaseOutcome()
+    with pytest.raises(ValueError, match="exactly one"):
+        CaseOutcome(record=record, failure=failure)

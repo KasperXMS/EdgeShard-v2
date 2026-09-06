@@ -66,6 +66,7 @@ def test_profiling_domain_module_files_exist() -> None:
         "measurement",
         "model",
         "network",
+        "session",
         "signature",
         "snapshot",
     }

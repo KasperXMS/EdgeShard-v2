@@ -26,6 +26,7 @@ from edgeshard.profiling.domain.hashing import (
     canonical_sha256,
     check_normalized_items,
 )
+from edgeshard.profiling.domain.measurement import MeasurementRecord
 from edgeshard.profiling.domain.model import ModelReference
 from edgeshard.profiling.domain.network import (
     NetworkDirection,
@@ -76,6 +77,40 @@ class ProfilingFailure:
         check_normalized_items(self.details, "details")
 
 
+@dataclass(frozen=True)
+class CaseOutcome:
+    """Terminal result of one executed profiling case (spec §42).
+
+    Exactly one member is present: a successful case yields its empirical
+    ``MeasurementRecord``; a failed case yields the typed
+    ``ProfilingFailure``. A failure is never encoded as a zero-latency or
+    empty record, and a success never travels without its observations.
+    """
+
+    record: MeasurementRecord | None = None
+    failure: ProfilingFailure | None = None
+
+    def __post_init__(self) -> None:
+        if (self.record is None) == (self.failure is None):
+            raise ValueError(
+                "a case outcome carries exactly one of record/failure, got "
+                f"record={'set' if self.record else 'None'}, "
+                f"failure={'set' if self.failure else 'None'}"
+            )
+
+    @property
+    def succeeded(self) -> bool:
+        return self.record is not None
+
+    @classmethod
+    def from_record(cls, record: MeasurementRecord) -> CaseOutcome:
+        return cls(record=record)
+
+    @classmethod
+    def from_failure(cls, failure: ProfilingFailure) -> CaseOutcome:
+        return cls(failure=failure)
+
+
 class ExperimentState(StrEnum):
     """Lifecycle state of a whole experiment (Master-side bookkeeping)."""
 
@@ -117,6 +152,13 @@ class ModelCaseSpec:
     ``context_length`` is the already-cached past length and is mandatory
     for ``DECODE`` and forbidden for ``PREFILL`` (§24) — decode is never
     silently approximated by prefill.
+
+    ``layer_index`` selects *which* enumerated Transformer layer a
+    ``TRANSFORMER_LAYER`` case benchmarks (§22 positional check): same-shape
+    layers share one ``layer_signature``, so without the index the
+    early/middle/late cases would deduplicate into a single case id (§7) and
+    the positional check could not be expressed. ``None`` means "the first
+    layer matching the signature" — the reuse-identity view.
     """
 
     granularity: ProfilingGranularity
@@ -131,6 +173,7 @@ class ModelCaseSpec:
     batch_size: int = 1
     sequence_length: int = 512
     context_length: int | None = None
+    layer_index: int | None = None
 
     def __post_init__(self) -> None:
         if not self.device_ids:
@@ -152,6 +195,15 @@ class ModelCaseSpec:
             raise ValueError(
                 f"sequence_length must be positive, got {self.sequence_length}"
             )
+        if self.layer_index is not None:
+            if self.granularity is not ProfilingGranularity.TRANSFORMER_LAYER:
+                raise ValueError(
+                    "layer_index is only valid for transformer-layer cases (§22)"
+                )
+            if self.layer_index < 0:
+                raise ValueError(
+                    f"layer_index must not be negative, got {self.layer_index}"
+                )
         self._check_phase()
         self._check_granularity()
 
