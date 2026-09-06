@@ -1,16 +1,17 @@
 """Scope guard: deferred work must remain absent.
 
-Originated as the third clause of the 0K Phase 0 freeze gate, now evolved
-for Phase 1 (spec §57, §63): the package tree contains exactly the packages
-built so far, ``edgeshard.control`` holds only what the current milestone
-allows, and future-phase components (scheduler, profiling, placement,
-production master, ...) do not exist anywhere. Any accidental introduction
-fails in Tier 1.
+Originated as the third clause of the 0K Phase 0 freeze gate, evolved for
+Phase 1 (spec §57, §63) and now for Phase 2: the package tree contains
+exactly the packages built so far, ``edgeshard.control`` holds only what the
+current milestone allows, and future-phase components (scheduler, placement,
+estimators, ...) do not exist anywhere. Any accidental introduction fails
+in Tier 1.
 
-Phase 1 status: the pure ``cluster`` domain package is admitted (spec §7);
-``control`` holds the Mock Master, the production Worker Agent from
-milestone P1B onward, and the production Master state components from
-milestone P1F onward. Scheduler/profiling/placement remain deferred (§57).
+Phase 2 status: the ``profiling`` package is admitted (Phase 2 spec §4 —
+extensible profiling and workload characterization). Everything Phase 2
+defers stays forbidden (§53): no scheduler, no placement, no cost/estimate
+model — those are Phase 3/4 components and must not appear before their
+time, exactly as ``edgeshard.profiling`` was forbidden during Phase 1.
 """
 
 from __future__ import annotations
@@ -22,25 +23,23 @@ import edgeshard
 
 SRC = Path(edgeshard.__file__).resolve().parent
 
-EXPECTED_PACKAGES = {"cluster", "control", "inference", "model", "protocol", "runtime"}
+EXPECTED_PACKAGES = {"cluster", "control", "inference", "model", "profiling", "protocol", "runtime"}
 
-# Later-phase components (Phase 0 spec 29 / Phase 1 spec §57) that must not
-# exist yet. The production Worker/Master live under edgeshard.control.*,
-# never as top-level packages.
+# Later-phase components (Phase 0 spec 29 / Phase 1 spec §57 / Phase 2 spec
+# §53) that must not exist yet. The production Worker/Master live under
+# edgeshard.control.*, never as top-level packages.
 FORBIDDEN_SUBMODULES = (
     "edgeshard.scheduler",
     "edgeshard.worker",
-    "edgeshard.profiling",
     "edgeshard.master",  # the production Master is edgeshard.control.master (P1F)
     "edgeshard.placement",
 )
 FORBIDDEN_FILE_STEMS = {
     "scheduler",
     "worker",
-    "profiling",
-    "profile",
     "placement",
     "cost_model",
+    "estimator",
 }
 
 
