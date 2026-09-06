@@ -77,3 +77,33 @@ def torch_dtype(label: str) -> torch.dtype:
         if known == label:
             return dtype
     raise ValueError(f"unknown dtype label {label!r}")
+
+
+_BYTES_BY_LABEL: dict[str, int] = {
+    "fp64": 8,
+    "fp32": 4,
+    "fp16": 2,
+    "bf16": 2,
+    "fp8_e4m3": 1,
+    "fp8_e5m2": 1,
+    "int64": 8,
+    "int32": 4,
+    "int16": 2,
+    "int8": 1,
+    "uint8": 1,
+    "bool": 1,
+}
+
+
+def dtype_byte_size(label: str) -> int:
+    """Bytes per element for a project dtype label (torch-free).
+
+    Used by the §36 network payload formula (``batch * seq * hidden *
+    bytes_per_element``) without importing torch into pure computation.
+    Unknown labels raise ``ValueError`` — a payload size is never guessed
+    (§52.2).
+    """
+    size = _BYTES_BY_LABEL.get(label)
+    if size is None:
+        raise ValueError(f"unknown dtype label {label!r}")
+    return size
