@@ -3,10 +3,16 @@
 Everything is faked except the Agent itself: a scripted control client, a
 canned-inspection inspector, a recording sleeper and a fake clock. The
 tests pin the §27 outer loop contract — exponential backoff with reset on
-success, immediate re-registration on session invalidation (never
-restoring a stale session), fresh inspection state on every registration,
-per-session sequences restarting at 1, Master-dictated cadence, and
-capability-revision drift answered with a full UpdateCapability (§16).
+success, fresh inspection state on every registration, per-session
+sequences restarting at 1, Master-dictated cadence, and capability-revision
+drift answered with a full UpdateCapability carrying the atomically sampled
+state (§16).
+
+Rejections are classified by their typed ``RejectionReason`` (§30):
+UNKNOWN_WORKER/REREGISTER_REQUIRED re-register immediately (never restoring
+a stale session), STALE_SESSION stops the superseded Agent without
+re-registering (no session ping-pong), and INSTANCE_MISMATCH/OUT_OF_ORDER
+fail loudly instead of silently retrying.
 """
 
 from __future__ import annotations
@@ -39,6 +45,7 @@ from edgeshard.protocol.control.mapper import (
     HeartbeatResponse,
     RegisterWorkerRequest,
     RegisterWorkerResponse,
+    RejectionReason,
     UpdateCapabilityRequest,
     UpdateCapabilityResponse,
 )
@@ -103,16 +110,29 @@ class FakeClient:
 
 
 class FakeInspector:
-    """Returns canned inspections; sticks on the last once exhausted."""
+    """Returns canned inspections; sticks on the last once exhausted.
+
+    Implements the ``Inspector`` lifecycle protocol: ``run`` must start the
+    inspector once before registering and close it once when the Agent
+    stops, whatever the exit path (stop request, superseded, fatal error).
+    """
 
     def __init__(self, results: Sequence[LocalInspection]) -> None:
         self._results = list(results)
         self.returned: list[LocalInspection] = []
+        self.started = 0
+        self.closed = 0
 
-    async def __call__(self, config: WorkerConfig) -> LocalInspection:
+    async def start(self) -> None:
+        self.started += 1
+
+    async def inspect(self) -> LocalInspection:
         inspection = self._results[min(len(self.returned), len(self._results) - 1)]
         self.returned.append(inspection)
         return inspection
+
+    async def close(self) -> None:
+        self.closed += 1
 
 
 class FakeSleeper:
@@ -247,6 +267,9 @@ async def test_stopped_before_run_registers_nothing() -> None:
     assert rig.client.registrations == []
     assert rig.sleeper.delays == []
     assert rig.client.closed is False  # injected clients are caller-owned
+    # The inspector lifecycle still ran to completion (start + close).
+    assert rig.inspector.started == 1
+    assert rig.inspector.closed == 1
 
 
 # ---------------------------------------------------------------------------
@@ -387,13 +410,19 @@ async def test_connection_loss_backs_off_and_re_registers_fresh_state() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Session invalidation (§27: never restore a stale session)
+# Typed rejection classification (§27/§30: recover, stop, or fail loudly)
 # ---------------------------------------------------------------------------
 
 
-async def test_rejected_heartbeat_re_registers_immediately(caplog) -> None:
+@pytest.mark.parametrize(
+    "reason",
+    [RejectionReason.UNKNOWN_WORKER, RejectionReason.REREGISTER_REQUIRED],
+)
+async def test_lost_registration_re_registers_immediately(reason, caplog) -> None:
     rig = make_rig(
-        heartbeat_effects=[HeartbeatResponse(accepted=False, detail="stale session")],
+        heartbeat_effects=[
+            HeartbeatResponse(accepted=False, detail=reason.value, reason=reason)
+        ],
         stop_after=3,
     )
 
@@ -411,6 +440,63 @@ async def test_rejected_heartbeat_re_registers_immediately(caplog) -> None:
     assert fresh.instance_id == rig.agent.instance_id
 
 
+async def test_stale_session_heartbeat_stops_agent_without_reregistering(caplog) -> None:
+    """§27: the superseded Agent exits — it never steals the session back."""
+    rig = make_rig(
+        heartbeat_effects=[
+            HeartbeatResponse(
+                accepted=False,
+                detail="stale session",
+                reason=RejectionReason.STALE_SESSION,
+            )
+        ],
+        stop_after=10,
+    )
+
+    with caplog.at_level(logging.ERROR, logger="worker.master_client"):
+        await rig.agent.run()
+
+    assert len(rig.client.registrations) == 1  # no ping-pong re-registration
+    assert len(rig.client.heartbeats) == 1
+    assert any("superseded" in record.message for record in caplog.records)
+    assert rig.inspector.closed == 1  # resources released on the way out
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [RejectionReason.INSTANCE_MISMATCH, RejectionReason.OUT_OF_ORDER],
+)
+async def test_protocol_violation_rejection_is_fatal(reason) -> None:
+    """§47: an Agent-side protocol violation fails loudly, never retries."""
+    rig = make_rig(
+        heartbeat_effects=[
+            HeartbeatResponse(accepted=False, detail=reason.value, reason=reason)
+        ],
+        stop_after=10,
+    )
+
+    with pytest.raises(WorkerAgentError, match="non-recoverable"):
+        await rig.agent.run()
+
+    assert len(rig.client.registrations) == 1
+    assert len(rig.client.heartbeats) == 1
+    assert rig.inspector.closed == 1  # cleanup even on the fatal path
+
+
+async def test_rejection_without_reason_is_fatal() -> None:
+    """A rejection whose reason never arrived must not be retried blindly."""
+    response = HeartbeatResponse.__new__(HeartbeatResponse)
+    object.__setattr__(response, "accepted", False)
+    object.__setattr__(response, "detail", "master said no")
+    object.__setattr__(response, "reason", None)
+    rig = make_rig(heartbeat_effects=[response], stop_after=10)
+
+    with pytest.raises(WorkerAgentError, match="unspecified"):
+        await rig.agent.run()
+
+    assert len(rig.client.registrations) == 1
+
+
 # ---------------------------------------------------------------------------
 # Capability revision handling (§16)
 # ---------------------------------------------------------------------------
@@ -426,6 +512,8 @@ async def test_revision_change_sends_update_before_next_heartbeat(caplog) -> Non
 
     (update,) = rig.client.updates
     assert update.capability == evolved.capability
+    # §16: the update carries the state sampled alongside the new capability.
+    assert update.state == evolved.state
     assert update.session_id == "session-1"
     assert update.instance_id == rig.agent.instance_id
     assert any("revision changed" in record.message for record in caplog.records)
@@ -444,7 +532,13 @@ async def test_rejected_update_re_registers_with_new_capability() -> None:
     evolved = make_inspection(capability=evolved_capability())
     rig = make_rig(
         inspections=[base, evolved],
-        update_effects=[UpdateCapabilityResponse(accepted=False, detail="stale session")],
+        update_effects=[
+            UpdateCapabilityResponse(
+                accepted=False,
+                detail="unknown worker",
+                reason=RejectionReason.UNKNOWN_WORKER,
+            )
+        ],
         stop_after=4,
     )
 
@@ -463,3 +557,27 @@ async def test_rejected_update_re_registers_with_new_capability() -> None:
         and h.capability_revision == evolved.capability.capability_revision
         for h in rig.client.heartbeats
     )
+
+
+async def test_stale_session_capability_update_stops_agent() -> None:
+    """§27: a superseded Agent stops mid-update too — no re-registration."""
+    base = make_inspection()
+    evolved = make_inspection(capability=evolved_capability())
+    rig = make_rig(
+        inspections=[base, evolved],
+        update_effects=[
+            UpdateCapabilityResponse(
+                accepted=False,
+                detail="stale session",
+                reason=RejectionReason.STALE_SESSION,
+            )
+        ],
+        stop_after=10,
+    )
+
+    await rig.agent.run()
+
+    assert len(rig.client.registrations) == 1
+    assert len(rig.client.updates) == 1
+    assert len(rig.client.heartbeats) == 0  # stopped before the next beat
+    assert rig.inspector.closed == 1

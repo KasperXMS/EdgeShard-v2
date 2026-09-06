@@ -3,8 +3,11 @@
 ``IdentityManager`` owns the persistent ``worker_id``: a UUIDv4 generated on
 first start and written to ``identity_path``, then reused across every Agent
 restart. It is never derived from hostname, IP/MAC address, or CUDA ordinal
-(spec §10.1). A missing file creates the identity; a corrupt one fails
-loudly instead of silently re-identifying the Worker (spec §47).
+(spec §10.1). A missing file creates the identity *atomically and
+exclusively* — two Agents starting simultaneously against a fresh install
+converge on one worker_id via a unique temp file plus ``os.link``; a
+corrupt file fails loudly instead of silently re-identifying the Worker
+(spec §47).
 
 Device ids derived without hardware UUIDs (generic-host CPU) come from the
 persistent ``worker_id`` via UUIDv5 - the same scheme spec §11 sanctions for
@@ -13,7 +16,9 @@ integrated Jetson devices - so they stay stable across reboots.
 
 from __future__ import annotations
 
+import contextlib
 import logging
+import os
 import socket
 import uuid
 from pathlib import Path
@@ -64,15 +69,38 @@ class IdentityManager:
         return worker_id
 
     def _create(self) -> str:
+        """Create the identity file exclusively; adopt a concurrent winner's.
+
+        The fresh id is written to a unique temp file in the same directory
+        and then hard-linked onto the identity path. ``os.link`` fails with
+        ``FileExistsError`` when another process won the race, and a linked
+        name is only ever visible with its full content — so no reader can
+        observe a partially written identity, and the loser simply loads
+        the winner's worker_id instead of minting a second one.
+        """
         worker_id = str(uuid.uuid4())
+        directory = self._identity_path.parent
+        tmp_path = directory / f".{self._identity_path.name}.{uuid.uuid4().hex}.tmp"
         try:
-            self._identity_path.parent.mkdir(parents=True, exist_ok=True)
-            self._identity_path.write_text(worker_id + "\n", encoding="utf-8")
+            directory.mkdir(parents=True, exist_ok=True)
+            tmp_path.write_text(worker_id + "\n", encoding="utf-8")
+            try:
+                os.link(tmp_path, self._identity_path)
+            except FileExistsError:
+                # Lost the creation race: the winner's file is complete.
+                logger.info(
+                    "identity file %s was created concurrently; loading the winner's id",
+                    self._identity_path,
+                )
+                return self.load_or_create()
         except OSError as exc:
             raise IdentityError(
                 f"cannot create Worker identity file {self._identity_path}: {exc} "
                 f"(set worker.identity_path to a writable location)"
             ) from exc
+        finally:
+            with contextlib.suppress(OSError):
+                tmp_path.unlink()
         logger.info("created worker_id=%s at %s", worker_id, self._identity_path)
         return worker_id
 

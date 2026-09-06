@@ -203,6 +203,7 @@ message WorkerState {
 // ---------------------------------------------------------------------------
 
 message RegisterWorkerRequest {
+  // Must equal identity.protocol_version (checked at the mapper boundary).
   string protocol_version = 1;
 
   // worker_id/instance_id scope: persistent installation identity vs. one
@@ -243,11 +244,29 @@ message HeartbeatRequest {
   WorkerState state = 7;
 }
 
+// Why the Master rejected a heartbeat or capability update. The Worker
+// Agent's recovery action keys off this enum, never off the human-readable
+// detail string: UNKNOWN_WORKER and REREGISTER_REQUIRED mean "register again
+// with a fresh inspection", STALE_SESSION means "a newer registration
+// superseded this Agent — stop, do not fight for the session", and
+// INSTANCE_MISMATCH / OUT_OF_ORDER are Agent-side protocol violations that
+// must fail loudly.
+enum RejectionReason {
+  REJECTION_REASON_UNSPECIFIED = 0;
+  REJECTION_REASON_UNKNOWN_WORKER = 1;
+  REJECTION_REASON_STALE_SESSION = 2;
+  REJECTION_REASON_INSTANCE_MISMATCH = 3;
+  REJECTION_REASON_OUT_OF_ORDER = 4;
+  REJECTION_REASON_REREGISTER_REQUIRED = 5;
+}
+
 message HeartbeatResponse {
   bool accepted = 1;
   // Mandatory explanation whenever a heartbeat is rejected (spec 46
   // observability).
   string detail = 2;
+  // Mandatory whenever accepted=false; UNSPECIFIED when accepted.
+  RejectionReason reason = 3;
 }
 
 message UpdateCapabilityRequest {
@@ -256,11 +275,18 @@ message UpdateCapabilityRequest {
   string session_id = 3;
 
   WorkerCapability capability = 4;
+
+  // The state sampled atomically with this capability (spec 16): the Master
+  // applies both in one step, so a snapshot can never pair a new capability
+  // with an old state that references devices/pools it no longer contains.
+  WorkerState state = 5;
 }
 
 message UpdateCapabilityResponse {
   bool accepted = 1;
   string detail = 2;
+  // Mandatory whenever accepted=false; UNSPECIFIED when accepted.
+  RejectionReason reason = 3;
 }
 
 // ---------------------------------------------------------------------------

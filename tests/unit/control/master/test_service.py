@@ -23,6 +23,7 @@ from edgeshard.protocol.control.mapper import (
     ControlProtocolError,
     HeartbeatRequest,
     RegisterWorkerRequest,
+    RejectionReason,
     UpdateCapabilityRequest,
 )
 from factories import (
@@ -267,10 +268,17 @@ async def test_heartbeat_updates_last_seen_timestamps() -> None:
     assert service.worker_status(worker_id) is WorkerStatus.ONLINE
 
 
-async def test_capability_drift_warns_but_accepts(caplog) -> None:
-    """A heartbeat revision differing from the stored capability is drift, not rejection."""
+async def test_heartbeat_revision_mismatch_rejected_reregister_required() -> None:
+    """§30/§38: a heartbeat whose revision the Master does not store is rejected.
+
+    Its state was sampled against a capability the Master cannot
+    cross-validate, so it must never be written; the typed reason tells the
+    Worker to send UpdateCapability or re-register. The sequence number is
+    *not* consumed, so the Worker recovers without a session loss.
+    """
     service, _clock = make_service()
     request, session_id = await register(service)
+    worker_id = request.identity.worker_id
 
     evolved = finalize(
         dataclasses.replace(
@@ -278,21 +286,41 @@ async def test_capability_drift_warns_but_accepts(caplog) -> None:
             runtime_platforms=request.capability.runtime_platforms[:1],
         )
     )
-    await service.update_capability(
+    evolved_state = make_worker_state(worker_id)
+    update = await service.update_capability(
         UpdateCapabilityRequest(
-            worker_id=request.identity.worker_id,
+            worker_id=worker_id,
             instance_id=request.instance_id,
             session_id=session_id,
             capability=evolved,
+            state=evolved_state,
         )
     )
+    assert update.accepted
 
-    with caplog.at_level("WARNING", logger="master.service"):
-        # The heartbeat still reports the pre-update revision.
-        response = await service.heartbeat(make_heartbeat(request, session_id, 1))
+    # A lagging heartbeat still reporting the pre-update revision.
+    response = await service.heartbeat(make_heartbeat(request, session_id, 1))
+    assert response.accepted is False
+    assert response.reason is RejectionReason.REREGISTER_REQUIRED
+    assert "capability revision mismatch" in response.detail
 
-    assert response.accepted
-    assert any("capability drift" in record.getMessage() for record in caplog.records)
+    # The rejected heartbeat wrote nothing: the stored state is still the one
+    # the capability update carried atomically.
+    stored = service.states.get(worker_id)
+    assert stored is not None
+    assert stored.state == evolved_state
+
+    # The sequence was not consumed: the Worker catches up and seq 1 is accepted.
+    caught_up = HeartbeatRequest(
+        worker_id=worker_id,
+        instance_id=request.instance_id,
+        session_id=session_id,
+        sequence_number=1,
+        capability_revision=evolved.capability_revision,
+        state=evolved_state,
+    )
+    retry = await service.heartbeat(caught_up)
+    assert retry.accepted
 
 
 # -- capability updates (§16) -----------------------------------------------
@@ -316,12 +344,14 @@ async def test_update_capability_replaces_stored_capability() -> None:
     )
     assert compute_capability_revision(evolved) != old_revision
 
+    new_state = make_worker_state(worker_id)
     response = await service.update_capability(
         UpdateCapabilityRequest(
             worker_id=worker_id,
             instance_id=request.instance_id,
             session_id=session_id,
             capability=evolved,
+            state=new_state,
         )
     )
 
@@ -330,6 +360,16 @@ async def test_update_capability_replaces_stored_capability() -> None:
     assert record.capability == evolved
     assert record.capability_revision != old_revision
     assert record.identity == request.identity  # identity untouched
+
+    # §16/§38: capability and state were replaced atomically — the stored
+    # state is the one carried with the update, and any snapshot built now
+    # pairs the new capability with a state that cross-validates against it.
+    stored = service.states.get(worker_id)
+    assert stored is not None
+    assert stored.state == new_state
+    snapshot = snapshot_of(service, worker_id)
+    assert snapshot.capability == evolved
+    assert snapshot.state == new_state
 
 
 async def test_update_capability_stale_session_rejected() -> None:
@@ -346,26 +386,31 @@ async def test_update_capability_stale_session_rejected() -> None:
             instance_id=first_request.instance_id,
             session_id=first_session,
             capability=make_rtx_capability(),
+            state=make_worker_state(identity.worker_id),
         )
     )
 
     assert response.accepted is False
     assert response.detail == "stale session"
+    assert response.reason is RejectionReason.STALE_SESSION
     assert second_session != first_session
 
 
 async def test_update_capability_unknown_worker_rejected() -> None:
     service, _clock = make_service()
+    worker_id = str(uuid.uuid4())
     response = await service.update_capability(
         UpdateCapabilityRequest(
-            worker_id=str(uuid.uuid4()),
+            worker_id=worker_id,
             instance_id=str(uuid.uuid4()),
             session_id="s",
             capability=make_rtx_capability(),
+            state=make_worker_state(worker_id),
         )
     )
     assert response.accepted is False
     assert response.detail == "unknown worker"
+    assert response.reason is RejectionReason.UNKNOWN_WORKER
 
 
 async def test_update_capability_rejects_tampered_revision() -> None:
@@ -379,6 +424,7 @@ async def test_update_capability_rejects_tampered_revision() -> None:
                 instance_id=request.instance_id,
                 session_id=session_id,
                 capability=dataclasses.replace(make_rtx_capability(), capability_revision="x"),
+                state=make_worker_state(request.identity.worker_id),
             )
         )
 

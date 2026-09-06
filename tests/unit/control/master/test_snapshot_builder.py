@@ -338,6 +338,60 @@ async def test_snapshot_reflects_liveness_and_keeps_offline_workers() -> None:
     assert len(snapshot.workers) == 1
 
 
+def test_liveness_classified_against_a_single_clock_read() -> None:
+    """§38: one snapshot never mixes two monotonic instants.
+
+    The injected clock advances 5 s on *every* read and both Workers were
+    last seen at its first reading. With a single ``now`` for the whole
+    build both are ONLINE; a per-Worker clock read would classify the
+    second Worker 5 s older — past ``suspect_after`` — and mix two instants
+    in one supposedly point-in-time snapshot.
+    """
+
+    class AdvancingClock:
+        def __init__(self, start: float, step: float) -> None:
+            self._next = start
+            self._step = step
+            self.reads = 0
+
+        def __call__(self) -> float:
+            self.reads += 1
+            value = self._next
+            self._next += self._step
+            return value
+
+    config = MasterConfig(
+        heartbeat_interval_ms=1_000,
+        suspect_after_ms=4_000,
+        offline_after_ms=8_000,
+        liveness_tick_ms=5,
+    )
+    registry = WorkerRegistry()
+    sessions = SessionManager()
+    states = StateStore()
+    liveness = LivenessManager(states, config)
+
+    clock = AdvancingClock(start=1_000.0, step=5.0)
+    for _ in range(2):
+        identity = make_worker_identity()
+        registry.upsert(identity, make_rtx_capability())
+        states.record(
+            identity.worker_id,
+            make_worker_state(identity.worker_id),
+            monotonic=1_000.0,  # both last seen at the clock's first reading
+            wall=WALL_BASE,
+        )
+
+    builder = SnapshotBuilder(
+        registry, sessions, states, liveness, monotonic=clock, wall=lambda: WALL_BASE
+    )
+    snapshot = builder.build()
+
+    assert clock.reads == 1  # exactly one monotonic read for the whole snapshot
+    assert len(snapshot.workers) == 2
+    assert all(worker.status is WorkerStatus.ONLINE for worker in snapshot.workers)
+
+
 async def test_snapshot_reflects_new_session_after_re_registration() -> None:
     service, _clock = make_service()
     request, first_session = await register(service)

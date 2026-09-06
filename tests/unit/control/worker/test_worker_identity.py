@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import socket
+import threading
 import uuid
 from pathlib import Path
 
@@ -40,6 +41,40 @@ def test_distinct_paths_get_distinct_ids(tmp_path: Path) -> None:
     first = IdentityManager(tmp_path / "a" / "worker-id").load_or_create()
     second = IdentityManager(tmp_path / "b" / "worker-id").load_or_create()
     assert first != second
+
+
+def test_concurrent_creation_converges_on_one_id(tmp_path: Path) -> None:
+    """§10.1: two Agents starting simultaneously must not mint two worker_ids.
+
+    All threads race past a barrier onto a fresh path; the exclusive
+    temp-file + hard-link creation guarantees exactly one winner, and every
+    loser adopts the winner's complete file — never a partially written one.
+    """
+    path = tmp_path / "worker-id"
+    results: list[str] = []
+    errors: list[BaseException] = []
+    barrier = threading.Barrier(8, timeout=10.0)
+
+    def create() -> None:
+        try:
+            barrier.wait()
+            results.append(IdentityManager(path).load_or_create())
+        except BaseException as exc:  # re-asserted on the main thread
+            errors.append(exc)
+
+    threads = [threading.Thread(target=create) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=15.0)
+
+    assert errors == []
+    assert len(results) == 8
+    assert len(set(results)) == 1  # ONE worker_id, not one per process
+    uuid.UUID(results[0])
+    assert path.read_text(encoding="utf-8").strip() == results[0]
+    # The race leaves no temp-file debris next to the identity.
+    assert sorted(item.name for item in tmp_path.iterdir()) == ["worker-id"]
 
 
 def test_corrupt_identity_file_fails_loudly(tmp_path: Path) -> None:

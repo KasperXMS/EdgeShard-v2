@@ -49,14 +49,26 @@ class LivenessManager:
 
     def status_of(self, worker_id: str) -> WorkerStatus:
         """Current liveness of one Worker; ``KeyError`` if it never registered."""
+        return self.status_at(worker_id, self._monotonic())
+
+    def status_at(self, worker_id: str, now: float) -> WorkerStatus:
+        """Liveness of one Worker at an explicit monotonic instant.
+
+        ``SnapshotBuilder`` passes one ``now`` for the whole snapshot, so
+        every Worker in it is classified against the same instant (§38: a
+        snapshot is internally consistent, not a spread of clock reads).
+        """
         entry = self._states.get(worker_id)
         if entry is None:
             raise KeyError(worker_id)
-        return self._classify(self._monotonic() - entry.received_monotonic)
+        return self._classify(now - entry.received_monotonic)
 
     def statuses(self) -> dict[str, WorkerStatus]:
         """Liveness of every tracked Worker (snapshot/P1H and test convenience)."""
-        now = self._monotonic()
+        return self.statuses_at(self._monotonic())
+
+    def statuses_at(self, now: float) -> dict[str, WorkerStatus]:
+        """Liveness of every tracked Worker at one explicit monotonic instant."""
         return {
             worker_id: self._classify(now - entry.received_monotonic)
             for worker_id, entry in self._states.items()

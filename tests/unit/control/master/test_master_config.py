@@ -91,6 +91,14 @@ def test_serve_config_empty_file_uses_defaults(tmp_path: Path) -> None:
     assert config == MasterServeConfig()
 
 
+def test_serve_config_tls_enabled_true_is_a_hard_error(tmp_path: Path) -> None:
+    """§47/§48: TLS is unimplemented in Phase 1 — requesting it must refuse to
+    start rather than silently serve insecure gRPC under a 'secure' flag."""
+    path = write_master_config(tmp_path, "tls:\n  enabled: true\n")
+    with pytest.raises(ValueError, match="insecure channel as if it were secure"):
+        MasterServeConfig.from_yaml(path)
+
+
 @pytest.mark.parametrize(
     "payload",
     [

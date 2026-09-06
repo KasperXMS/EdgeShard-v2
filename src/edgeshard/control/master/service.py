@@ -18,11 +18,15 @@ Semantics follow spec §29-30 exactly:
   timestamps, and answers with a fresh ``session_id`` plus the configured
   heartbeat interval — leaving the Worker ONLINE by construction;
 * a heartbeat is accepted only when the Worker is known, its session and
-  instance are current, and its sequence strictly advances; every
-  rejection travels as ``accepted=False`` with a mandatory detail and
-  never touches stored state;
+  instance are current, its sequence strictly advances, and its reported
+  ``capability_revision`` is the one the Master stores; every rejection
+  travels as ``accepted=False`` with a mandatory detail *and* a typed
+  :class:`~edgeshard.protocol.control.mapper.RejectionReason` the Worker's
+  recovery keys off, and never touches stored state;
 * capability updates require a current session and replace the stable
-  capability in place.
+  capability *and* the Worker state atomically — the request carries the
+  state sampled alongside the new capability, so a snapshot never pairs a
+  new capability with an old state it cannot cross-validate (§16, §38).
 
 Protocol validation proper (version, redundant-field agreement, enum
 decoding) already happened in the mapper before a domain request reaches
@@ -48,7 +52,7 @@ from edgeshard.cluster.state import WorkerStatus
 from edgeshard.control.master.config import MasterConfig
 from edgeshard.control.master.liveness import LivenessManager
 from edgeshard.control.master.registry import WorkerRegistry
-from edgeshard.control.master.sessions import SessionManager
+from edgeshard.control.master.sessions import Rejection, SessionManager
 from edgeshard.control.master.snapshot import SnapshotBuilder
 from edgeshard.control.master.state_store import StateStore
 from edgeshard.protocol.control.mapper import (
@@ -58,6 +62,7 @@ from edgeshard.protocol.control.mapper import (
     HeartbeatResponse,
     RegisterWorkerRequest,
     RegisterWorkerResponse,
+    RejectionReason,
     UpdateCapabilityRequest,
     UpdateCapabilityResponse,
 )
@@ -93,7 +98,12 @@ class MasterService:
         self._liveness = LivenessManager(self._states, self._config, monotonic=monotonic)
         if snapshot_factory is None:
             self._snapshot_builder = SnapshotBuilder(
-                self._registry, self._sessions, self._states, self._liveness, wall=wall
+                self._registry,
+                self._sessions,
+                self._states,
+                self._liveness,
+                monotonic=monotonic,
+                wall=wall,
             )
         else:
             self._snapshot_builder = SnapshotBuilder(
@@ -101,6 +111,7 @@ class MasterService:
                 self._sessions,
                 self._states,
                 self._liveness,
+                monotonic=monotonic,
                 wall=wall,
                 snapshot_factory=snapshot_factory,
             )
@@ -175,21 +186,29 @@ class MasterService:
         )
 
     async def heartbeat(self, request: HeartbeatRequest) -> HeartbeatResponse:
-        detail = self._sessions.check_heartbeat(
+        rejection = self._sessions.check_heartbeat(
             request.worker_id,
             request.instance_id,
             request.session_id,
             request.sequence_number,
         )
-        if detail is not None:
-            # §30: rejected heartbeats never overwrite newer state.
+        if rejection is None:
+            rejection = self._check_heartbeat_revision(request)
+        if rejection is not None:
+            # §30: rejected heartbeats never overwrite newer state — and a
+            # revision-mismatched heartbeat never writes a state the stored
+            # capability cannot cross-validate (§38). The sequence is not
+            # consumed, so the Worker can recover and resend.
             logger.info(
-                "heartbeat rejected worker_id=%s sequence=%d detail=%s",
+                "heartbeat rejected worker_id=%s sequence=%d reason=%s detail=%s",
                 request.worker_id,
                 request.sequence_number,
-                detail,
+                rejection.reason.value,
+                rejection.detail,
             )
-            return HeartbeatResponse(accepted=False, detail=detail)
+            return HeartbeatResponse(
+                accepted=False, detail=rejection.detail, reason=rejection.reason
+            )
 
         self._sessions.record_accepted_sequence(request.worker_id, request.sequence_number)
         self._states.record(
@@ -198,7 +217,6 @@ class MasterService:
             monotonic=self._monotonic(),
             wall=self._wall(),
         )
-        self._warn_on_revision_drift(request.worker_id, request.capability_revision)
         logger.info(
             "heartbeat worker_id=%s session_id=%s sequence=%d",
             request.worker_id,
@@ -207,23 +225,57 @@ class MasterService:
         )
         return HeartbeatResponse(accepted=True)
 
+    def _check_heartbeat_revision(self, request: HeartbeatRequest) -> Rejection | None:
+        """Reject a heartbeat whose capability_revision the Master does not store.
+
+        The reported state was sampled against the Worker's *current*
+        capability; pairing it with a different stored capability could
+        reference unknown devices/pools and break snapshot cross-validation
+        (§38). The Worker must send UpdateCapability (which carries the
+        matching state) or re-register — never have the Master guess.
+        """
+        record = self._registry.find(request.worker_id)
+        if record is None:  # pragma: no cover - session check rejects first
+            return Rejection(RejectionReason.UNKNOWN_WORKER, "unknown worker")
+        if record.capability_revision != request.capability_revision:
+            return Rejection(
+                RejectionReason.REREGISTER_REQUIRED,
+                f"capability revision mismatch: heartbeat reports "
+                f"{request.capability_revision!r} but Master stores "
+                f"{record.capability_revision!r}; send UpdateCapability "
+                f"or re-register",
+            )
+        return None
+
     async def update_capability(
         self, request: UpdateCapabilityRequest
     ) -> UpdateCapabilityResponse:
-        detail = self._sessions.check_session(
+        rejection = self._sessions.check_session(
             request.worker_id, request.instance_id, request.session_id
         )
-        if detail is not None:
+        if rejection is not None:
             logger.info(
-                "capability update rejected worker_id=%s detail=%s",
+                "capability update rejected worker_id=%s reason=%s detail=%s",
                 request.worker_id,
-                detail,
+                rejection.reason.value,
+                rejection.detail,
             )
-            return UpdateCapabilityResponse(accepted=False, detail=detail)
+            return UpdateCapabilityResponse(
+                accepted=False, detail=rejection.detail, reason=rejection.reason
+            )
 
         self._check_capability_revision(request.capability)
         record = self._registry.get(request.worker_id)
+        # Atomic capability+state replacement (no await between the two):
+        # a snapshot built at any instant pairs the new capability with the
+        # state sampled alongside it, never with the pre-update state (§38).
         self._registry.upsert(record.identity, request.capability)
+        self._states.record(
+            request.worker_id,
+            request.state,
+            monotonic=self._monotonic(),
+            wall=self._wall(),
+        )
         logger.info(
             "capability updated worker_id=%s revision=%s",
             request.worker_id,
@@ -258,15 +310,4 @@ class MasterService:
             raise ControlProtocolError(
                 f"capability_revision mismatch: reported {capability.capability_revision!r}, "
                 f"recomputed {expected!r}"
-            )
-
-    def _warn_on_revision_drift(self, worker_id: str, reported_revision: str) -> None:
-        record = self._registry.find(worker_id)
-        if record is not None and record.capability_revision != reported_revision:
-            logger.warning(
-                "heartbeat worker_id=%s reports capability_revision=%s but Master "
-                "stores %s; capability drift — expected an UpdateCapability",
-                worker_id,
-                reported_revision,
-                record.capability_revision,
             )

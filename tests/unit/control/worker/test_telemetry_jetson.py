@@ -38,6 +38,25 @@ XAVIER_R32_LINE = (
     "thermal@40.1C VDD_IN 4.5W VDD_CPU 1.2W VDD_GPU 0.9W VDD_SOC 1.1W"
 )
 
+# JetPack 6 (L4T r36) on Orin: lower-case thermal zones, milliwatt rails
+# with current/average pairs, MHz suffixes on CPU clocks.
+ORIN_R36_LINE = (
+    "12-01-2025 09:15:00 RAM 3036/70612MB (lfb 15x4MB) SWAP 0/35306MB "
+    "(lfb 35306MB) CPU [2%@1728MHz,0%@1728MHz,1%@1728MHz,0%@1728MHz] "
+    "EMC_FREQ 0% GR3D_FREQ 7% pll@48C cpu@48.5C PMIC@100C gpu@45C "
+    "AO@44C thermal@48.25C VDD_CPU_GPU_CV 15123mW/4321mW "
+    "VDD_SOC 1234mW/1100mW VDD_IN 18792mW/5552mW"
+)
+
+# JetPack 5 (L4T r35) on Xavier NX / AGX: mW pairs and a dedicated
+# VDD_GPU_SOC rail taking precedence over the whole-module VDD_IN.
+XAVIER_R35_MW_LINE = (
+    "RAM 2345/30536MB (lfb 4x4MB) CPU [12%@1728MHz,5%@1728MHz] "
+    "GR3D_FREQ 34% PLL@20C CPU@22.5C PMIC@100C GPU@21.5C AO@25C "
+    "thermal@22.25C VDD_GPU_SOC 5210mW/5183mW VDD_CPU_CORE 2464mW/2464mW "
+    "VDD_IN 12345mW/12000mW"
+)
+
 MB = 1024 * 1024
 
 
@@ -62,6 +81,49 @@ def test_parser_maps_xavier_r32_line() -> None:
     assert sample.cpu_temperature_c == 42.5
     assert sample.gpu_power_w == 0.9  # VDD_GPU on r32
     assert sample.ram_total_bytes == 15467 * MB
+
+
+def test_parser_maps_jetpack6_r36_lowercase_zones_and_mw_pairs() -> None:
+    """JetPack 6: ``gpu@``/``cpu@`` lower-case zones, mW current/average pairs."""
+    sample = TegrastatsParser().parse(ORIN_R36_LINE)
+    assert sample is not None
+    assert sample.gpu_utilization == 7.0
+    assert sample.gpu_temperature_c == 45.0  # lower-case gpu@ zone
+    assert sample.cpu_temperature_c == 48.5  # lower-case cpu@ zone
+    # VDD_CPU_GPU_CV 15123mW/4321mW: mW converted, *current* (first) value.
+    assert sample.gpu_power_w == 15.123
+    assert sample.ram_used_bytes == 3036 * MB
+    assert sample.ram_total_bytes == 70612 * MB
+
+
+def test_parser_maps_jetpack5_r35_mw_pair_and_prefers_gpu_rail() -> None:
+    sample = TegrastatsParser().parse(XAVIER_R35_MW_LINE)
+    assert sample is not None
+    assert sample.gpu_temperature_c == 21.5
+    assert sample.cpu_temperature_c == 22.5
+    # VDD_GPU_SOC outranks both VDD_IN and any later rail; 5210mW -> 5.21W.
+    assert sample.gpu_power_w == 5.21
+
+
+def test_parser_never_maps_vdd_in_to_gpu_power() -> None:
+    """VDD_IN is whole-module input power, not a GPU rail (spec §23)."""
+    sample = TegrastatsParser().parse(
+        "RAM 1/2MB GR3D_FREQ 0% VDD_IN 18792mW/5552mW VDD_SOC 1234mW"
+    )
+    assert sample is not None
+    assert sample.gpu_power_w is None
+
+
+def test_parser_gpu_power_mw_without_average() -> None:
+    sample = TegrastatsParser().parse("RAM 1/2MB VDD_GPU 310mW")
+    assert sample is not None
+    assert sample.gpu_power_w == 0.31
+
+
+def test_parser_gpu_power_watts_without_average() -> None:
+    sample = TegrastatsParser().parse("RAM 1/2MB VDD_GPU 5.2W")
+    assert sample is not None
+    assert sample.gpu_power_w == 5.2
 
 
 def test_parser_tolerates_missing_gr3d() -> None:

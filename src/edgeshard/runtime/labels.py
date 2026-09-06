@@ -20,6 +20,14 @@ RUNTIME_ID = "io.edgeshard.runtime_id"
 BACKEND = "io.edgeshard.backend"
 """The runtime backend owning the container's lifecycle."""
 
+MODEL_LOCAL_NAME = "io.edgeshard.model_local_name"
+"""Optional label carrying the ModelStore local name a runtime serves.
+
+Phase 0 drivers do not apply it; the Phase 1 runtime inventory reads it
+when present so ``RuntimeInstanceState.model_local_name`` can be filled
+without guessing (spec §19).
+"""
+
 
 def managed_container_labels(
     *, execution_id: str, runtime_id: str, backend: str

@@ -63,11 +63,18 @@ class WorkerSection(BaseModel):
     master: MasterConfig | None = None
     heartbeat_interval_s: float = 5.0
     reconnect: ReconnectConfig = ReconnectConfig()
+    capability_refresh_interval_s: float = 300.0
+    """Static capability is discovered once at startup and cached; it is only
+    re-discovered when a registration is refused for a stale revision or this
+    interval elapses — never on every heartbeat (§16: capabilities rarely
+    change, and re-probing NVML/Jetson/docker per beat is pure overhead)."""
 
     @model_validator(mode="after")
-    def _check_heartbeat(self) -> WorkerSection:
+    def _check_intervals(self) -> WorkerSection:
         if self.heartbeat_interval_s <= 0:
             raise ValueError("heartbeat_interval_s must be positive")
+        if self.capability_refresh_interval_s <= 0:
+            raise ValueError("capability_refresh_interval_s must be positive")
         return self
 
 
@@ -77,6 +84,40 @@ class ModelStoreSection(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     root: Path = DEFAULT_MODEL_ROOT
+    inventory_refresh_interval_s: float = 300.0
+    """The model tree is re-scanned at most this often; a full recursive walk
+    every heartbeat interval would hammer the disk for no benefit (§22)."""
+
+    @model_validator(mode="after")
+    def _check_interval(self) -> ModelStoreSection:
+        if self.inventory_refresh_interval_s <= 0:
+            raise ValueError("inventory_refresh_interval_s must be positive")
+        return self
+
+
+class RuntimePlatformConfig(BaseModel):
+    """One operator-declared runtime platform the Worker can host (§15).
+
+    Declared, never auto-guessed: the Worker reports the backends/images an
+    operator has actually provisioned; discovery cannot infer which engines
+    are *usable* from what happens to be installed.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    backend: str
+    platform: str
+    image: str | None = None
+
+    @model_validator(mode="after")
+    def _check_fields(self) -> RuntimePlatformConfig:
+        if not self.backend.strip():
+            raise ValueError("runtime platform backend must be non-empty")
+        if not self.platform.strip():
+            raise ValueError("runtime platform platform must be non-empty")
+        if self.image is not None and not self.image.strip():
+            raise ValueError("runtime platform image must be non-empty when set")
+        return self
 
 
 class RuntimeSection(BaseModel):
@@ -85,14 +126,43 @@ class RuntimeSection(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     discover_managed_containers: bool = True
+    platforms: list[RuntimePlatformConfig] = []
+
+    @model_validator(mode="after")
+    def _check_platforms(self) -> RuntimeSection:
+        seen: set[tuple[str, str]] = set()
+        for entry in self.platforms:
+            key = (entry.backend, entry.platform)
+            if key in seen:
+                raise ValueError(
+                    f"duplicate declared runtime platform backend={key[0]!r} "
+                    f"platform={key[1]!r}"
+                )
+            seen.add(key)
+        return self
 
 
 class TlsSection(BaseModel):
-    """Transport security placeholder (spec §48): TLS lands later."""
+    """Transport security placeholder (spec §48): TLS lands later.
+
+    Requesting TLS while it is unimplemented is a hard configuration error —
+    silently serving insecure gRPC under ``tls.enabled=true`` would be a
+    security lie (§47: fail loudly, never degrade silently).
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     enabled: bool = False
+
+    @model_validator(mode="after")
+    def _check_implemented(self) -> TlsSection:
+        if self.enabled:
+            raise ValueError(
+                "tls.enabled=true is not supported yet: Phase 1 transport is "
+                "insecure gRPC only (spec §48); refusing to start rather "
+                "than serve an insecure channel as if it were secure"
+            )
+        return self
 
 
 class WorkerConfig(BaseModel):

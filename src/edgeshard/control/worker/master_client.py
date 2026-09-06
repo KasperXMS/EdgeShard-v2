@@ -3,15 +3,27 @@
 ``WorkerAgent.run`` implements the second half of the §27 lifecycle:
 register with the Master, then heartbeat a fresh local inspection at the
 cadence the Master dictates. On Master loss the Agent backs off
-exponentially and re-registers; on session invalidation it re-registers
-immediately. A stale registration session is never restored (§27) — every
-reconnect performs a full ``RegisterWorker`` with the *current* local state
-under a stable per-process ``instance_id`` (§10.2) and a fresh sequence
-starting at 1 (§30).
+exponentially and re-registers. A stale registration session is never
+restored (§27) — every reconnect performs a full ``RegisterWorker`` with
+the *current* local state under a stable per-process ``instance_id``
+(§10.2) and a fresh sequence starting at 1 (§30).
+
+Rejections are typed (``RejectionReason``, §30/§46) and each reason maps to
+exactly one recovery — never a blind re-register, which would let two
+Agents claiming the same ``worker_id`` steal the session back and forth:
+
+* ``UNKNOWN_WORKER`` / ``REREGISTER_REQUIRED`` — the Master lost or refused
+  this registration; re-register immediately (no backoff);
+* ``STALE_SESSION`` — a *newer* registration superseded this Agent, so this
+  Agent stops entirely (the newer one owns the session);
+* ``INSTANCE_MISMATCH`` / ``OUT_OF_ORDER`` — Agent-side protocol violations
+  that must never silently retry: fail loudly (§47).
 
 Capability revisions are checked every cycle: if local discovery now
 produces a different revision than the Master acknowledged, a full
-``UpdateCapability`` is sent before the next heartbeat (§16).
+``UpdateCapability`` — carrying the state sampled alongside the new
+capability — is sent before the next heartbeat, so the Master replaces
+capability and state atomically (§16, §38).
 
 Transport failures (unreachable Master, deadline exceeded, connection
 reset) are transient and trigger backoff. ``INVALID_ARGUMENT`` aborts are
@@ -31,11 +43,11 @@ import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Protocol
+from typing import NoReturn, Protocol
 
 import grpc
 
-from edgeshard.control.worker.agent import LocalInspection, inspect_local_worker
+from edgeshard.control.worker.agent import LocalInspection, LocalWorkerInspector
 from edgeshard.control.worker.config import WorkerConfig
 from edgeshard.control.worker.identity import new_instance_id
 from edgeshard.model.errors import EdgeShardError
@@ -46,6 +58,7 @@ from edgeshard.protocol.control.mapper import (
     HeartbeatResponse,
     RegisterWorkerRequest,
     RegisterWorkerResponse,
+    RejectionReason,
     UpdateCapabilityRequest,
     UpdateCapabilityResponse,
 )
@@ -66,7 +79,17 @@ class _MasterUnavailable(Exception):
 
 
 class _SessionInvalid(Exception):
-    """Master rejected session or sequence: re-register immediately (§27)."""
+    """Master lost/refused this registration: re-register immediately (§27)."""
+
+
+class _Superseded(Exception):
+    """A newer registration owns the session: this Agent must stop (§27).
+
+    Re-registering here would invalidate the *newer* Agent's session and
+    start a ping-pong war between two processes claiming the same
+    ``worker_id``; the superseded process exiting is the only stable
+    outcome.
+    """
 
 
 class ControlClient(Protocol):
@@ -87,13 +110,47 @@ class ControlClient(Protocol):
     async def close(self) -> None: ...
 
 
-Inspector = Callable[[WorkerConfig], Awaitable[LocalInspection]]
+class Inspector(Protocol):
+    """The local-inspection lifecycle the Agent drives (spec §27, §24).
+
+    ``start`` runs the one-time static work (identity, capability
+    discovery, shared Docker client, tegrastats subprocess); ``inspect``
+    yields fresh state per registration/heartbeat against that cache;
+    ``close`` releases the inspector's resources when the Agent stops.
+    """
+
+    async def start(self) -> None: ...
+    async def inspect(self) -> LocalInspection: ...
+    async def close(self) -> None: ...
+
+
 Sleeper = Callable[[float], Awaitable[None]]
 Clock = Callable[[], datetime]
 
 
 def _utc_now() -> datetime:
     return datetime.now(UTC)
+
+
+def _raise_for_rejection(
+    reason: RejectionReason | None, detail: str, label: str
+) -> NoReturn:
+    """Map a typed Master rejection onto the Agent's only correct recovery.
+
+    ``UNKNOWN_WORKER``/``REREGISTER_REQUIRED`` → :class:`_SessionInvalid`
+    (re-register); ``STALE_SESSION`` → :class:`_Superseded` (this Agent
+    stops); ``INSTANCE_MISMATCH``/``OUT_OF_ORDER``/missing reason →
+    :class:`WorkerAgentError` (fail loudly, §47) — these mean *this* Agent
+    violated the protocol, so silently retrying is never a safe default.
+    """
+    if reason in (RejectionReason.UNKNOWN_WORKER, RejectionReason.REREGISTER_REQUIRED):
+        raise _SessionInvalid(f"{label} rejected ({reason.value}): {detail}")
+    if reason is RejectionReason.STALE_SESSION:
+        raise _Superseded(f"{label} rejected ({reason.value}): {detail}")
+    reason_text = reason.value if reason is not None else "unspecified"
+    raise WorkerAgentError(
+        f"{label} rejected with non-recoverable reason {reason_text!r}: {detail}"
+    )
 
 
 @dataclass
@@ -111,7 +168,11 @@ class WorkerAgent:
 
     ``client``, ``inspector``, ``sleeper`` and ``clock`` are injectable for
     tests; an injected client is owned by the caller, a default-constructed
-    :class:`WorkerRegistryClient` is closed by ``run``.
+    :class:`WorkerRegistryClient` is closed by ``run``. The inspector's
+    lifecycle belongs to ``run`` either way: it is started before the first
+    registration and closed when the Agent stops, so long-lived resources
+    (Docker client, tegrastats subprocess) span the whole serve lifetime
+    (spec §24).
     """
 
     def __init__(
@@ -119,7 +180,7 @@ class WorkerAgent:
         config: WorkerConfig,
         *,
         client: ControlClient | None = None,
-        inspector: Inspector = inspect_local_worker,
+        inspector: Inspector | None = None,
         sleeper: Sleeper = asyncio.sleep,
         clock: Clock = _utc_now,
         rpc_timeout_s: float = DEFAULT_RPC_TIMEOUT_S,
@@ -132,7 +193,7 @@ class WorkerAgent:
         self._config = config
         self._endpoint = config.worker.master.endpoint
         self._client = client
-        self._inspector = inspector
+        self._inspector: Inspector = inspector or LocalWorkerInspector(config)
         self._sleeper = sleeper
         self._clock = clock
         self._rpc_timeout_s = rpc_timeout_s
@@ -161,6 +222,7 @@ class WorkerAgent:
         reconnect = self._config.worker.reconnect
         delay = reconnect.initial_delay_s
         try:
+            await self._inspector.start()
             while not self._stopping:
                 try:
                     session = await self._register(client)
@@ -190,7 +252,16 @@ class WorkerAgent:
                     logger.warning(
                         "session invalidated (%s); re-registering immediately", exc
                     )
+                except _Superseded as exc:
+                    # A newer registration owns this worker_id; stopping is
+                    # the only outcome that does not steal its session back.
+                    logger.error(
+                        "superseded by a newer registration (%s); this agent stops",
+                        exc,
+                    )
+                    return
         finally:
+            await self._inspector.close()
             if owns_client:
                 await client.close()
 
@@ -200,7 +271,7 @@ class WorkerAgent:
 
     async def _register(self, client: ControlClient) -> _Session:
         """One full §27 registration: fresh inspection, fresh session."""
-        inspection = await self._inspector(self._config)
+        inspection = await self._inspector.inspect()
         request = RegisterWorkerRequest(
             protocol_version=CONTROL_PROTOCOL_VERSION,
             instance_id=self._instance_id,
@@ -240,7 +311,7 @@ class WorkerAgent:
             await self._sleeper(session.heartbeat_interval_s)
             if self._stopping:
                 return
-            inspection = await self._inspector(self._config)
+            inspection = await self._inspector.inspect()
             revision = inspection.capability.capability_revision
             if revision != session.acknowledged_revision:
                 await self._update_capability(client, session, inspection)
@@ -256,7 +327,7 @@ class WorkerAgent:
             )
             response = await self._call(client.heartbeat, request, "heartbeat")
             if not response.accepted:
-                raise _SessionInvalid(f"heartbeat rejected: {response.detail}")
+                _raise_for_rejection(response.reason, response.detail, "heartbeat")
             logger.info(
                 "heartbeat accepted worker_id=%s sequence=%d revision=%s",
                 session.worker_id,
@@ -268,7 +339,12 @@ class WorkerAgent:
     async def _update_capability(
         self, client: ControlClient, session: _Session, inspection: LocalInspection
     ) -> None:
-        """§16: a revision change requires a full capability retransmission."""
+        """§16: a revision change requires a full capability retransmission.
+
+        The request carries the state sampled alongside the new capability so
+        the Master replaces both atomically (§38) — a snapshot never pairs a
+        new capability with an old state it cannot cross-validate.
+        """
         revision = inspection.capability.capability_revision
         logger.info(
             "capability revision changed %s -> %s; sending UpdateCapability",
@@ -280,12 +356,15 @@ class WorkerAgent:
             instance_id=self._instance_id,
             session_id=session.session_id,
             capability=inspection.capability,
+            state=inspection.state,
         )
         response = await self._call(
             client.update_capability, request, "capability update"
         )
         if not response.accepted:
-            raise _SessionInvalid(f"capability update rejected: {response.detail}")
+            _raise_for_rejection(
+                response.reason, response.detail, "capability update"
+            )
 
     # ------------------------------------------------------------------
     # Transport error classification (§47: transient vs fatal)

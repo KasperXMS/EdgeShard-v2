@@ -4,9 +4,12 @@ Uses ``nvidia-ml-py`` (NVML) directly - never parses ``nvidia-smi``. NVML
 types stay inside this adapter (spec §60); the emitted fragment is pure
 cluster domain.
 
-Device identity (spec §11): the stable NVIDIA GPU UUID when available. Each
-GPU contributes an independent DISCRETE VRAM pool (spec §13) named
-``gpu-<uuid>-vram``.
+Device identity (spec §11): the stable NVIDIA GPU UUID, else an id derived
+from the PCI bus id, else an enumeration ordinal as last resort — resolved
+by :func:`derive_gpu_device_id`, which telemetry reuses (together with the
+``discovered_device_ids`` mapping exposed here) so state never references a
+device id the capability does not carry. Each GPU contributes an independent
+DISCRETE VRAM pool (spec §13) named ``gpu-<uuid>-vram``.
 
 An absent NVIDIA library or driver is non-fatal (spec §47): the probe
 reports an empty fragment, so ``worker inspect`` works unchanged on hosts
@@ -45,12 +48,58 @@ def gpu_memory_pool_id(gpu_device_id: str) -> str:
 
 
 def fallback_device_id(index: int) -> str:
-    """Device id used when NVML reports no GPU UUID (spec §11 fallback).
+    """Device id used when NVML reports no GPU UUID *and* no PCI bus id
+    (spec §11 last-resort fallback).
 
     Enumeration-index ids are not guaranteed stable across reboots; callers
     warn whenever this fallback is used.
     """
     return f"nvml-gpu-{index}"
+
+
+def pci_bus_device_id(bus_id: str) -> str:
+    """Device id derived from the PCI bus id (middle of the §11 chain).
+
+    The bus id is stable as long as the card stays in its slot — far more
+    reliable than NVML/CUDA enumeration order, which can shift across
+    driver reinitializations.
+    """
+    return f"pci-{bus_id.upper()}"
+
+
+def derive_gpu_device_id(nvml: Any, handle: Any, index: int) -> str:
+    """Stable device id of one GPU: UUID → PCI bus id → ordinal (spec §11).
+
+    Shared by discovery *and* telemetry so a state fragment always
+    references the same device id the capability advertised — a transient
+    UUID-query failure in telemetry must never degrade an id the Master
+    already knows to ``nvml-gpu-<index>``.
+    """
+    try:
+        uuid = as_nvml_text(nvml.nvmlDeviceGetUUID(handle))
+    except Exception as exc:
+        logger.warning("metric=gpu_uuid unavailable for GPU %d: %s", index, exc)
+        uuid = ""
+    if uuid:
+        return uuid
+    try:
+        bus_id = as_nvml_text(nvml.nvmlDeviceGetPciInfo(handle).busId)
+    except Exception as exc:
+        logger.warning("metric=gpu_pci_bus_id unavailable for GPU %d: %s", index, exc)
+        bus_id = ""
+    if bus_id:
+        logger.warning(
+            "GPU %d has no NVML UUID; deriving its device id from PCI bus id %s",
+            index,
+            bus_id,
+        )
+        return pci_bus_device_id(bus_id)
+    logger.warning(
+        "GPU %d has neither NVML UUID nor PCI bus id; falling back to an "
+        "enumeration-order id that is not guaranteed stable (spec §11, §58)",
+        index,
+    )
+    return fallback_device_id(index)
 
 
 def as_nvml_text(value: Any) -> str:
@@ -75,13 +124,29 @@ def dtypes_for_compute_capability(major: int, minor: int) -> tuple[str, ...]:
 
 
 class NvidiaCapabilityProbe:
-    """Static discovery of discrete NVIDIA GPUs (spec §22)."""
+    """Static discovery of discrete NVIDIA GPUs (spec §22).
+
+    The device ids produced by the most recent :meth:`discover` are exposed
+    as :attr:`discovered_device_ids`, in enumeration order (a GPU whose
+    discovery failed is simply absent).
+    :class:`~edgeshard.control.worker.telemetry.nvidia.NvidiaTelemetryProbe`
+    reuses that mapping when it covers every enumerated GPU, so a transient
+    telemetry-side UUID failure can never mint a device id the capability
+    does not know.
+    """
 
     def __init__(self, nvml: Any | None = None) -> None:
         self._nvml = nvml
+        self._discovered_device_ids: tuple[str, ...] = ()
+
+    @property
+    def discovered_device_ids(self) -> tuple[str, ...]:
+        """Device ids of the last successful discovery, in enumeration order."""
+        return self._discovered_device_ids
 
     def discover(self) -> CapabilityFragment:
         nvml = self._nvml if self._nvml is not None else import_nvml()
+        self._discovered_device_ids = ()
         try:
             nvml.nvmlInit()
         except Exception as exc:  # no driver/library is non-fatal (spec §47)
@@ -115,6 +180,9 @@ class NvidiaCapabilityProbe:
             devices.append(device)
             if pool is not None:
                 pools.append(pool)
+        self._discovered_device_ids = tuple(
+            device.identity.device_id for device in devices
+        )
         return CapabilityFragment(devices=tuple(devices), memory_pools=tuple(pools))
 
     def _driver_version(self, nvml: Any) -> str | None:
@@ -127,7 +195,7 @@ class NvidiaCapabilityProbe:
     def _discover_gpu(
         self, nvml: Any, handle: Any, index: int, driver_version: str | None
     ) -> tuple[DeviceCapability, MemoryPoolCapability | None]:
-        device_id = self._device_id(nvml, handle, index)
+        device_id = derive_gpu_device_id(nvml, handle, index)
         model = self._model(nvml, handle)
         compute_capability, dtypes = self._compute_capability(nvml, handle)
         pool = self._vram_pool(nvml, handle, device_id)
@@ -148,21 +216,6 @@ class NvidiaCapabilityProbe:
             platform_tags=("cuda",),
         )
         return device, pool
-
-    def _device_id(self, nvml: Any, handle: Any, index: int) -> str:
-        try:
-            uuid = as_nvml_text(nvml.nvmlDeviceGetUUID(handle))
-        except Exception as exc:
-            logger.warning("metric=gpu_uuid unavailable for GPU %d: %s", index, exc)
-            uuid = ""
-        if uuid:
-            return uuid
-        logger.warning(
-            "GPU %d has no NVML UUID; falling back to an enumeration-order id "
-            "that is not guaranteed stable (spec §11, §58)",
-            index,
-        )
-        return fallback_device_id(index)
 
     def _model(self, nvml: Any, handle: Any) -> str:
         try:

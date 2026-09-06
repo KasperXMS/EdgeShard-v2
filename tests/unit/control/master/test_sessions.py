@@ -6,7 +6,19 @@ import itertools
 
 import pytest
 
-from edgeshard.control.master.sessions import SessionInfo, SessionManager
+from edgeshard.control.master.sessions import Rejection, SessionInfo, SessionManager
+from edgeshard.protocol.control.mapper import RejectionReason
+
+
+def rejection(reason: RejectionReason) -> Rejection:
+    """The canonical Rejection for a reason (details are fixed strings)."""
+    details = {
+        RejectionReason.UNKNOWN_WORKER: "unknown worker",
+        RejectionReason.STALE_SESSION: "stale session",
+        RejectionReason.INSTANCE_MISMATCH: "instance mismatch",
+        RejectionReason.OUT_OF_ORDER: "out-of-order heartbeat",
+    }
+    return Rejection(reason, details[reason])
 
 WORKER = "worker-1"
 INSTANCE = "instance-1"
@@ -38,10 +50,10 @@ def test_second_registration_invalidates_old_session_immediately() -> None:
     assert second.session_id != first.session_id
     assert manager.current(WORKER) == second
     # The old session is rejected the moment the new one exists (§35),
-    # even though the old instance_id was also valid once.
-    assert (
-        manager.check_heartbeat(WORKER, INSTANCE, first.session_id, 1)
-        == "stale session"
+    # even though the old instance_id was also valid once. The typed reason
+    # tells the superseded Agent to stop rather than re-register (§30).
+    assert manager.check_heartbeat(WORKER, INSTANCE, first.session_id, 1) == rejection(
+        RejectionReason.STALE_SESSION
     )
 
 
@@ -52,13 +64,17 @@ def test_check_heartbeat_acceptance_then_rejections() -> None:
     assert manager.check_heartbeat(WORKER, INSTANCE, info.session_id, 1) is None
     manager.record_accepted_sequence(WORKER, 1)
 
-    assert manager.check_heartbeat("unknown", INSTANCE, info.session_id, 2) == "unknown worker"
-    assert manager.check_heartbeat(WORKER, INSTANCE, "bogus-session", 2) == "stale session"
-    assert manager.check_heartbeat(WORKER, "bogus-instance", info.session_id, 2) == (
-        "instance mismatch"
+    assert manager.check_heartbeat("unknown", INSTANCE, info.session_id, 2) == rejection(
+        RejectionReason.UNKNOWN_WORKER
     )
-    assert manager.check_heartbeat(WORKER, INSTANCE, info.session_id, 1) == (
-        "out-of-order heartbeat"
+    assert manager.check_heartbeat(WORKER, INSTANCE, "bogus-session", 2) == rejection(
+        RejectionReason.STALE_SESSION
+    )
+    assert manager.check_heartbeat(WORKER, "bogus-instance", info.session_id, 2) == rejection(
+        RejectionReason.INSTANCE_MISMATCH
+    )
+    assert manager.check_heartbeat(WORKER, INSTANCE, info.session_id, 1) == rejection(
+        RejectionReason.OUT_OF_ORDER
     )
 
 
@@ -67,14 +83,15 @@ def test_heartbeat_order_per_spec_51() -> None:
     manager = SessionManager()
     info = manager.open_session(WORKER, INSTANCE)
 
-    def check(sequence: int) -> str | None:
+    def check(sequence: int) -> Rejection | None:
         return manager.check_heartbeat(WORKER, INSTANCE, info.session_id, sequence)
 
+    out_of_order = rejection(RejectionReason.OUT_OF_ORDER)
     assert check(5) is None
     manager.record_accepted_sequence(WORKER, 5)
 
-    assert check(4) == "out-of-order heartbeat"
-    assert check(5) == "out-of-order heartbeat"  # duplicate, not just older
+    assert check(4) == out_of_order
+    assert check(5) == out_of_order  # duplicate, not just older
     assert check(6) is None
     manager.record_accepted_sequence(WORKER, 6)
 
@@ -112,9 +129,15 @@ def test_check_session_for_updates() -> None:
     info = manager.open_session(WORKER, INSTANCE)
 
     assert manager.check_session(WORKER, INSTANCE, info.session_id) is None
-    assert manager.check_session("unknown", INSTANCE, info.session_id) == "unknown worker"
-    assert manager.check_session(WORKER, INSTANCE, "bogus") == "stale session"
-    assert manager.check_session(WORKER, "bogus", info.session_id) == "instance mismatch"
+    assert manager.check_session("unknown", INSTANCE, info.session_id) == rejection(
+        RejectionReason.UNKNOWN_WORKER
+    )
+    assert manager.check_session(WORKER, INSTANCE, "bogus") == rejection(
+        RejectionReason.STALE_SESSION
+    )
+    assert manager.check_session(WORKER, "bogus", info.session_id) == rejection(
+        RejectionReason.INSTANCE_MISMATCH
+    )
 
 
 def test_session_info_validation() -> None:

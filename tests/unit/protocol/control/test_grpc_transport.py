@@ -27,6 +27,7 @@ from edgeshard.protocol.control.mapper import (
     HeartbeatResponse,
     RegisterWorkerRequest,
     RegisterWorkerResponse,
+    RejectionReason,
     UpdateCapabilityRequest,
     UpdateCapabilityResponse,
 )
@@ -130,10 +131,12 @@ async def test_heartbeat_accepted_roundtrip(transport) -> None:
     assert handler.heartbeats == [request]
 
 
-async def test_heartbeat_rejection_carries_detail(transport) -> None:
+async def test_heartbeat_rejection_carries_detail_and_reason(transport) -> None:
     handler, client, _port = transport
     handler.heartbeat_response = HeartbeatResponse(
-        accepted=False, detail="stale session"
+        accepted=False,
+        detail="stale session",
+        reason=RejectionReason.STALE_SESSION,
     )
     request = make_heartbeat_request(str(uuid.uuid4()), sequence_number=1)
 
@@ -141,6 +144,7 @@ async def test_heartbeat_rejection_carries_detail(transport) -> None:
 
     assert response.accepted is False
     assert response.detail == "stale session"
+    assert response.reason is RejectionReason.STALE_SESSION
 
 
 async def test_update_capability_roundtrip(transport) -> None:
@@ -151,12 +155,15 @@ async def test_update_capability_roundtrip(transport) -> None:
         instance_id=str(uuid.uuid4()),
         session_id="session-1",
         capability=make_rtx_capability(),
+        state=make_worker_state(worker_id),
     )
 
     response = await client.update_capability(request)
 
     assert response == UpdateCapabilityResponse(accepted=True)
     assert handler.updates == [request]
+    # The atomic state sample crossed the wire with the capability (§16).
+    assert handler.updates[0].state == request.state
 
 
 async def test_handler_protocol_error_aborts_rpc(transport) -> None:

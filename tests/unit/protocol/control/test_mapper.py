@@ -22,6 +22,7 @@ from edgeshard.protocol.control.mapper import (
     HeartbeatResponse,
     RegisterWorkerRequest,
     RegisterWorkerResponse,
+    RejectionReason,
     UpdateCapabilityRequest,
     UpdateCapabilityResponse,
 )
@@ -179,6 +180,15 @@ def test_register_request_rejects_protocol_version_mismatch() -> None:
         mapper.register_request_from_wire(wire)
 
 
+def test_register_request_rejects_identity_protocol_version_mismatch() -> None:
+    """§47: the redundant identity copy must agree with the request version."""
+    identity = dataclasses.replace(
+        make_worker_identity(WORKER_ID), protocol_version="999"
+    )
+    with pytest.raises(ControlProtocolError, match="identity protocol_version"):
+        make_register_request(identity=identity)
+
+
 def test_register_request_rejects_worker_id_mismatch() -> None:
     wire = mapper.register_request_to_wire(make_register_request())
     wire.worker_id = str(uuid.uuid4())
@@ -307,11 +317,26 @@ def test_heartbeat_request_requires_aware_timestamp() -> None:
 def test_heartbeat_response_roundtrip() -> None:
     for response in (
         HeartbeatResponse(accepted=True),
-        HeartbeatResponse(accepted=False, detail="stale session"),
+        HeartbeatResponse(
+            accepted=False,
+            detail="stale session",
+            reason=RejectionReason.STALE_SESSION,
+        ),
     ):
         assert mapper.heartbeat_response_from_wire(
             mapper.heartbeat_response_to_wire(response)
         ) == response
+
+
+def test_every_rejection_reason_survives_the_wire() -> None:
+    for reason in RejectionReason:
+        response = HeartbeatResponse(
+            accepted=False, detail=f"rejected: {reason.value}", reason=reason
+        )
+        restored = mapper.heartbeat_response_from_wire(
+            mapper.heartbeat_response_to_wire(response)
+        )
+        assert restored.reason is reason
 
 
 def test_rejected_heartbeat_requires_detail() -> None:
@@ -319,12 +344,34 @@ def test_rejected_heartbeat_requires_detail() -> None:
         HeartbeatResponse(accepted=False)
 
 
-def make_update_request(capability=None) -> UpdateCapabilityRequest:
+def test_rejected_heartbeat_requires_reason() -> None:
+    with pytest.raises(ValueError, match="reason"):
+        HeartbeatResponse(accepted=False, detail="stale session")
+
+
+def test_accepted_heartbeat_forbids_reason() -> None:
+    with pytest.raises(ValueError, match="reason"):
+        HeartbeatResponse(accepted=True, reason=RejectionReason.STALE_SESSION)
+
+
+def test_unknown_wire_rejection_reason_rejected() -> None:
+    wire = mapper.heartbeat_response_to_wire(
+        HeartbeatResponse(
+            accepted=False, detail="x", reason=RejectionReason.UNKNOWN_WORKER
+        )
+    )
+    wire.reason = 99  # proto3 enums are open; decode must reject
+    with pytest.raises(ControlProtocolError, match="rejection reason"):
+        mapper.heartbeat_response_from_wire(wire)
+
+
+def make_update_request(capability=None, state=None) -> UpdateCapabilityRequest:
     return UpdateCapabilityRequest(
         worker_id=WORKER_ID,
         instance_id=INSTANCE_ID,
         session_id="session-1",
         capability=capability or make_jetson_capability(),
+        state=state or make_worker_state(WORKER_ID),
     )
 
 
@@ -335,10 +382,27 @@ def test_update_capability_roundtrip() -> None:
     ) == request
 
 
+def test_update_capability_requires_state_on_wire() -> None:
+    """§16: an update without its atomic state sample cannot be applied."""
+    wire = mapper.update_capability_request_to_wire(make_update_request())
+    wire.ClearField("state")
+    with pytest.raises(ControlProtocolError, match="atomically"):
+        mapper.update_capability_request_from_wire(wire)
+
+
+def test_update_capability_requires_matching_state_worker() -> None:
+    with pytest.raises(ValueError, match="worker_id mismatch"):
+        make_update_request(state=make_worker_state(str(uuid.uuid4())))
+
+
 def test_update_capability_response_roundtrip() -> None:
     for response in (
         UpdateCapabilityResponse(accepted=True),
-        UpdateCapabilityResponse(accepted=False, detail="stale session"),
+        UpdateCapabilityResponse(
+            accepted=False,
+            detail="stale session",
+            reason=RejectionReason.STALE_SESSION,
+        ),
     ):
         assert mapper.update_capability_response_from_wire(
             mapper.update_capability_response_to_wire(response)
@@ -348,6 +412,11 @@ def test_update_capability_response_roundtrip() -> None:
 def test_rejected_capability_update_requires_detail() -> None:
     with pytest.raises(ValueError, match="detail"):
         UpdateCapabilityResponse(accepted=False)
+
+
+def test_rejected_capability_update_requires_reason() -> None:
+    with pytest.raises(ValueError, match="reason"):
+        UpdateCapabilityResponse(accepted=False, detail="stale session")
 
 
 def test_capability_revision_roundtrip_is_stable() -> None:

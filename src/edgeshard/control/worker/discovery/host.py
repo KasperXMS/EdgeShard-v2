@@ -87,9 +87,9 @@ class HostCapabilityProbe:
                     total_bytes=int(psutil.virtual_memory().total),
                 ),
             ),
-            # Runtime platforms (backend/image facts) are discovered once the
-            # container-image plumbing lands; P1B reports none rather than
-            # guessing.
+            # Runtime platforms are operator-declared via worker config
+            # (runtime.platforms) and merged in by the inspector; a probe
+            # never guesses which engines are actually provisioned (§15).
             runtime_platforms=(),
         )
 

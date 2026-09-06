@@ -18,6 +18,20 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 
+from edgeshard.protocol.control.mapper import RejectionReason
+
+
+@dataclass(frozen=True)
+class Rejection:
+    """A typed session/sequence rejection: reason for the Agent, detail for logs.
+
+    The reason drives the Worker Agent's recovery (re-register, stop, or fail
+    loudly); the detail is the mandatory human-readable explanation (§46).
+    """
+
+    reason: RejectionReason
+    detail: str
+
 
 @dataclass(frozen=True)
 class SessionInfo:
@@ -75,37 +89,44 @@ class SessionManager:
         instance_id: str,
         session_id: str,
         sequence_number: int,
-    ) -> str | None:
+    ) -> Rejection | None:
         """Validate a heartbeat against the current session (spec §30).
 
-        Returns ``None`` when the heartbeat must be accepted, otherwise the
-        rejection detail. Acceptance requires all four conditions: the
-        Worker exists, the session is current, the instance matches, and
-        the sequence strictly increases over the last accepted one — a
+        Returns ``None`` when the heartbeat must be accepted, otherwise a
+        typed :class:`Rejection`. Acceptance requires all four conditions:
+        the Worker exists, the session is current, the instance matches,
+        and the sequence strictly increases over the last accepted one — a
         duplicate or late sequence never overwrites newer state.
+
+        A non-current ``session_id`` means a newer registration superseded
+        this one, so it maps to ``STALE_SESSION``: the superseded Agent must
+        stop rather than re-register and fight for the session (no
+        ping-pong). Validation order matters — session identity is checked
+        before instance identity, so a superseded Agent reports
+        ``stale session`` even though its instance_id is also outdated.
         """
         info = self._sessions.get(worker_id)
         if info is None:
-            return "unknown worker"
+            return Rejection(RejectionReason.UNKNOWN_WORKER, "unknown worker")
         if info.session_id != session_id:
-            return "stale session"
+            return Rejection(RejectionReason.STALE_SESSION, "stale session")
         if info.instance_id != instance_id:
-            return "instance mismatch"
+            return Rejection(RejectionReason.INSTANCE_MISMATCH, "instance mismatch")
         if sequence_number <= info.last_accepted_sequence:
-            return "out-of-order heartbeat"
+            return Rejection(RejectionReason.OUT_OF_ORDER, "out-of-order heartbeat")
         return None
 
     def check_session(
         self, worker_id: str, instance_id: str, session_id: str
-    ) -> str | None:
+    ) -> Rejection | None:
         """Session-only validation for non-heartbeat RPCs (UpdateCapability)."""
         info = self._sessions.get(worker_id)
         if info is None:
-            return "unknown worker"
+            return Rejection(RejectionReason.UNKNOWN_WORKER, "unknown worker")
         if info.session_id != session_id:
-            return "stale session"
+            return Rejection(RejectionReason.STALE_SESSION, "stale session")
         if info.instance_id != instance_id:
-            return "instance mismatch"
+            return Rejection(RejectionReason.INSTANCE_MISMATCH, "instance mismatch")
         return None
 
     def record_accepted_sequence(self, worker_id: str, sequence_number: int) -> None:

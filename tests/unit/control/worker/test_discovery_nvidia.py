@@ -16,6 +16,7 @@ from edgeshard.control.worker.discovery.nvidia import (
     dtypes_for_compute_capability,
     fallback_device_id,
     gpu_memory_pool_id,
+    pci_bus_device_id,
 )
 
 
@@ -77,7 +78,12 @@ def test_bytes_strings_are_decoded() -> None:
 @pytest.mark.parametrize(
     ("failed_metric", "check"),
     [
-        ("uuid", lambda device: device.identity.device_id == fallback_device_id(0)),
+        # uuid alone: the §11 chain drops to the PCI bus id, never the ordinal.
+        (
+            "uuid",
+            lambda device: device.identity.device_id
+            == pci_bus_device_id("00000000:01:00.0"),
+        ),
         ("name", lambda device: device.model == "unknown-nvidia-gpu"),
         ("compute_capability", lambda device: device.compute_capability is None),
         ("compute_capability", lambda device: device.supported_dtypes == ("fp32",)),
@@ -93,6 +99,68 @@ def test_metric_failure_degrades_only_that_metric(
     assert check(device)
     if failed_metric == "memory":
         assert fragment.memory_pools == ()
+
+
+def test_device_id_chain_uuid_then_pci_then_ordinal() -> None:
+    """Spec §11: UUID → PCI bus id → enumeration ordinal, in that order."""
+    # 1) UUID available: it wins even when PCI would also work.
+    gpu = FakeGpu(uuid="GPU-aaa", pci_bus_id="00000000:2a:00.0")
+    (device,) = NvidiaCapabilityProbe(FakeNvml([gpu])).discover().devices
+    assert device.identity.device_id == "GPU-aaa"
+
+    # 2) UUID fails, PCI available: uppercased PCI bus id, and the VRAM pool
+    #    follows the derived id so state/capability stay consistent.
+    gpu = FakeGpu(fails=frozenset({"uuid"}), pci_bus_id="00000000:2a:00.0")
+    (device,) = NvidiaCapabilityProbe(FakeNvml([gpu])).discover().devices
+    assert device.identity.device_id == "pci-00000000:2A:00.0"
+    assert device.memory_pool_id == gpu_memory_pool_id("pci-00000000:2A:00.0")
+
+    # 3) Both fail: last-resort ordinal, warned about loudly.
+    gpu = FakeGpu(fails=frozenset({"uuid", "pci"}))
+    (device,) = NvidiaCapabilityProbe(FakeNvml([gpu])).discover().devices
+    assert device.identity.device_id == fallback_device_id(0)
+
+
+def test_pci_bus_id_bytes_are_decoded() -> None:
+    gpu = FakeGpu(fails=frozenset({"uuid"}), pci_bus_id=b"00000000:01:00.0\x00")
+    (device,) = NvidiaCapabilityProbe(FakeNvml([gpu])).discover().devices
+    assert device.identity.device_id == "pci-00000000:01:00.0"
+
+
+def test_discovered_device_ids_track_enumeration_order() -> None:
+    """Telemetry reuses this mapping; it must mirror exactly what was found."""
+    probe = NvidiaCapabilityProbe(
+        FakeNvml([FakeGpu(uuid="GPU-aaa"), FakeGpu(uuid="GPU-bbb")])
+    )
+    assert probe.discovered_device_ids == ()  # nothing discovered yet
+
+    probe.discover()
+    assert probe.discovered_device_ids == ("GPU-aaa", "GPU-bbb")
+
+    # A GPU whose discovery failed is absent — the mapping never carries ids
+    # the capability does not, and never pads with placeholders.
+    class ExplodingNvml(FakeNvml):
+        def nvmlDeviceGetHandleByIndex(self, index: int) -> FakeGpu:
+            if index == 0:
+                raise AssertionError("handle 0 unavailable")
+            return super().nvmlDeviceGetHandleByIndex(index)
+
+    degraded = NvidiaCapabilityProbe(
+        ExplodingNvml([FakeGpu(uuid="GPU-broken"), FakeGpu(uuid="GPU-healthy")])
+    )
+    degraded.discover()
+    assert degraded.discovered_device_ids == ("GPU-healthy",)
+
+
+def test_discovered_device_ids_reset_when_nvml_unavailable() -> None:
+    probe = NvidiaCapabilityProbe(FakeNvml([FakeGpu(uuid="GPU-aaa")]))
+    probe.discover()
+    assert probe.discovered_device_ids == ("GPU-aaa",)
+
+    # A later discovery without a driver must not keep serving stale ids.
+    probe._nvml = FakeNvml(init_error="driver not loaded")
+    probe.discover()
+    assert probe.discovered_device_ids == ()
 
 
 def test_handle_failure_skips_only_that_device() -> None:

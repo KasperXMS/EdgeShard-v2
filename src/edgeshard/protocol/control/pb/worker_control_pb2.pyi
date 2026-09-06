@@ -43,6 +43,15 @@ class ModelAvailability(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
     MODEL_AVAILABILITY_READY: _ClassVar[ModelAvailability]
     MODEL_AVAILABILITY_INCOMPLETE: _ClassVar[ModelAvailability]
     MODEL_AVAILABILITY_INVALID: _ClassVar[ModelAvailability]
+
+class RejectionReason(int, metaclass=_enum_type_wrapper.EnumTypeWrapper):
+    __slots__ = ()
+    REJECTION_REASON_UNSPECIFIED: _ClassVar[RejectionReason]
+    REJECTION_REASON_UNKNOWN_WORKER: _ClassVar[RejectionReason]
+    REJECTION_REASON_STALE_SESSION: _ClassVar[RejectionReason]
+    REJECTION_REASON_INSTANCE_MISMATCH: _ClassVar[RejectionReason]
+    REJECTION_REASON_OUT_OF_ORDER: _ClassVar[RejectionReason]
+    REJECTION_REASON_REREGISTER_REQUIRED: _ClassVar[RejectionReason]
 DEVICE_KIND_UNSPECIFIED: DeviceKind
 DEVICE_KIND_CPU: DeviceKind
 DEVICE_KIND_GPU: DeviceKind
@@ -65,6 +74,12 @@ MODEL_AVAILABILITY_UNSPECIFIED: ModelAvailability
 MODEL_AVAILABILITY_READY: ModelAvailability
 MODEL_AVAILABILITY_INCOMPLETE: ModelAvailability
 MODEL_AVAILABILITY_INVALID: ModelAvailability
+REJECTION_REASON_UNSPECIFIED: RejectionReason
+REJECTION_REASON_UNKNOWN_WORKER: RejectionReason
+REJECTION_REASON_STALE_SESSION: RejectionReason
+REJECTION_REASON_INSTANCE_MISMATCH: RejectionReason
+REJECTION_REASON_OUT_OF_ORDER: RejectionReason
+REJECTION_REASON_REREGISTER_REQUIRED: RejectionReason
 
 class WorkerIdentity(_message.Message):
     __slots__ = ("worker_id", "hostname", "agent_version", "protocol_version")
@@ -299,29 +314,35 @@ class HeartbeatRequest(_message.Message):
     def __init__(self, worker_id: _Optional[str] = ..., instance_id: _Optional[str] = ..., session_id: _Optional[str] = ..., sequence_number: _Optional[int] = ..., worker_reported_at_ms: _Optional[int] = ..., capability_revision: _Optional[str] = ..., state: _Optional[_Union[WorkerState, _Mapping]] = ...) -> None: ...
 
 class HeartbeatResponse(_message.Message):
-    __slots__ = ("accepted", "detail")
+    __slots__ = ("accepted", "detail", "reason")
     ACCEPTED_FIELD_NUMBER: _ClassVar[int]
     DETAIL_FIELD_NUMBER: _ClassVar[int]
+    REASON_FIELD_NUMBER: _ClassVar[int]
     accepted: bool
     detail: str
-    def __init__(self, accepted: _Optional[bool] = ..., detail: _Optional[str] = ...) -> None: ...
+    reason: RejectionReason
+    def __init__(self, accepted: _Optional[bool] = ..., detail: _Optional[str] = ..., reason: _Optional[_Union[RejectionReason, str]] = ...) -> None: ...
 
 class UpdateCapabilityRequest(_message.Message):
-    __slots__ = ("worker_id", "instance_id", "session_id", "capability")
+    __slots__ = ("worker_id", "instance_id", "session_id", "capability", "state")
     WORKER_ID_FIELD_NUMBER: _ClassVar[int]
     INSTANCE_ID_FIELD_NUMBER: _ClassVar[int]
     SESSION_ID_FIELD_NUMBER: _ClassVar[int]
     CAPABILITY_FIELD_NUMBER: _ClassVar[int]
+    STATE_FIELD_NUMBER: _ClassVar[int]
     worker_id: str
     instance_id: str
     session_id: str
     capability: WorkerCapability
-    def __init__(self, worker_id: _Optional[str] = ..., instance_id: _Optional[str] = ..., session_id: _Optional[str] = ..., capability: _Optional[_Union[WorkerCapability, _Mapping]] = ...) -> None: ...
+    state: WorkerState
+    def __init__(self, worker_id: _Optional[str] = ..., instance_id: _Optional[str] = ..., session_id: _Optional[str] = ..., capability: _Optional[_Union[WorkerCapability, _Mapping]] = ..., state: _Optional[_Union[WorkerState, _Mapping]] = ...) -> None: ...
 
 class UpdateCapabilityResponse(_message.Message):
-    __slots__ = ("accepted", "detail")
+    __slots__ = ("accepted", "detail", "reason")
     ACCEPTED_FIELD_NUMBER: _ClassVar[int]
     DETAIL_FIELD_NUMBER: _ClassVar[int]
+    REASON_FIELD_NUMBER: _ClassVar[int]
     accepted: bool
     detail: str
-    def __init__(self, accepted: _Optional[bool] = ..., detail: _Optional[str] = ...) -> None: ...
+    reason: RejectionReason
+    def __init__(self, accepted: _Optional[bool] = ..., detail: _Optional[str] = ..., reason: _Optional[_Union[RejectionReason, str]] = ...) -> None: ...

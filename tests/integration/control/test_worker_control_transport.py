@@ -224,10 +224,15 @@ async def test_rtx_and_jetson_workers_share_one_master() -> None:
                     instance_id=instance_id,
                     session_id=session_id,
                     capability=evolved,
+                    # §16: the state sampled atomically with the capability.
+                    state=rtx_state,
                 )
             )
             assert update.accepted
             assert service.registry.get(rtx_identity.worker_id).capability == evolved
+            stored_after_update = service.states.get(rtx_identity.worker_id)
+            assert stored_after_update is not None
+            assert stored_after_update.state == rtx_state
             snapshot_of(service, rtx_identity.worker_id)  # still cross-validates
 
             # --- Re-registration (§52 Test C shape) ---------------------------

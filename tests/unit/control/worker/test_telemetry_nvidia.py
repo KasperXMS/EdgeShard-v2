@@ -78,6 +78,77 @@ async def test_device_and_pool_ids_match_discovery() -> None:
     assert {m.memory_pool_id for m in state.memory_states} <= capability_pool_ids
 
 
+async def test_static_device_ids_survive_transient_uuid_failure() -> None:
+    """§11/§27: telemetry must never mint an id the capability does not know.
+
+    The Master stores ``GPU-aaa``/``GPU-bbb`` from static discovery; a UUID
+    query failing during one heartbeat sample must still report those ids
+    (via the injected static mapping), not degrade them to PCI or ordinal
+    ids and desynchronize state from capability.
+    """
+    gpus = [FakeGpu(uuid="GPU-aaa"), FakeGpu(uuid="GPU-bbb")]
+    capability_probe = NvidiaCapabilityProbe(FakeNvml(gpus))
+    capability_probe.discover()
+
+    flaky = FakeNvml(
+        [
+            FakeGpu(uuid="GPU-aaa", fails=frozenset({"uuid"})),
+            FakeGpu(uuid="GPU-bbb", fails=frozenset({"uuid"})),
+        ]
+    )
+    fragment = await NvidiaTelemetryProbe(
+        flaky, static_device_ids=lambda: capability_probe.discovered_device_ids
+    ).sample()
+
+    assert [s.device_id for s in fragment.device_states] == ["GPU-aaa", "GPU-bbb"]
+    assert [m.memory_pool_id for m in fragment.memory_states] == [
+        gpu_memory_pool_id("GPU-aaa"),
+        gpu_memory_pool_id("GPU-bbb"),
+    ]
+
+
+async def test_static_mapping_count_mismatch_falls_back_to_chain() -> None:
+    """Hot-plug since discovery: the stale mapping must not be misaligned."""
+    stale = FakeNvml([FakeGpu(uuid="GPU-aaa")])
+    capability_probe = NvidiaCapabilityProbe(stale)
+    capability_probe.discover()  # mapping covers 1 GPU
+
+    nvml = FakeNvml(
+        [
+            FakeGpu(uuid="GPU-aaa", fails=frozenset({"uuid"})),  # -> PCI chain
+            FakeGpu(uuid="GPU-bbb"),
+        ]
+    )
+    fragment = await NvidiaTelemetryProbe(
+        nvml, static_device_ids=lambda: capability_probe.discovered_device_ids
+    ).sample()
+
+    # Re-derived per GPU: PCI bus id for the first, UUID for the second —
+    # never the stale mapping shifted onto the wrong device.
+    assert [s.device_id for s in fragment.device_states] == [
+        "pci-00000000:01:00.0",
+        "GPU-bbb",
+    ]
+
+
+async def test_static_mapping_failure_falls_back_to_chain() -> None:
+    def explode() -> tuple[str, ...]:
+        raise RuntimeError("mapping unavailable")
+
+    fragment = await NvidiaTelemetryProbe(
+        FakeNvml([FakeGpu(uuid="GPU-aaa")]), static_device_ids=explode
+    ).sample()
+    (state,) = fragment.device_states
+    assert state.device_id == "GPU-aaa"  # the ordinary chain still works
+
+
+async def test_without_static_mapping_uuid_failure_degrades_to_pci() -> None:
+    gpu = FakeGpu(fails=frozenset({"uuid"}), pci_bus_id="00000000:2a:00.0")
+    fragment = await NvidiaTelemetryProbe(FakeNvml([gpu])).sample()
+    (state,) = fragment.device_states
+    assert state.device_id == "pci-00000000:2A:00.0"
+
+
 async def test_handle_failure_skips_only_that_device() -> None:
     class ExplodingNvml(FakeNvml):
         def nvmlDeviceGetHandleByIndex(self, index: int) -> FakeGpu:

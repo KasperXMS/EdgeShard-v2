@@ -29,6 +29,11 @@ class MemoryInfo:
         self.used = used
 
 
+class PciInfo:
+    def __init__(self, bus_id: str | bytes) -> None:
+        self.busId = bus_id
+
+
 class FakeGpu:
     """One fake GPU handle with default RTX4090-like facts."""
 
@@ -37,6 +42,7 @@ class FakeGpu:
         *,
         uuid: str | bytes = DEFAULT_UUID,
         name: str | bytes = "NVIDIA GeForce RTX 4090",
+        pci_bus_id: str | bytes = "00000000:01:00.0",
         vram_total: int = 24 * 2**30,
         vram_free: int = 18 * 2**30,
         compute_capability: tuple[int, int] = (8, 9),
@@ -47,6 +53,7 @@ class FakeGpu:
     ) -> None:
         self.uuid = uuid
         self.name = name
+        self.pci_bus_id = pci_bus_id
         self.vram_total = vram_total
         self.vram_free = vram_free
         self.compute_capability = compute_capability
@@ -101,6 +108,10 @@ class FakeNvml:
     def nvmlDeviceGetName(self, handle: FakeGpu) -> str | bytes:
         self._check(handle, "name")
         return handle.name
+
+    def nvmlDeviceGetPciInfo(self, handle: FakeGpu) -> PciInfo:
+        self._check(handle, "pci")
+        return PciInfo(handle.pci_bus_id)
 
     def nvmlDeviceGetMemoryInfo(self, handle: FakeGpu) -> MemoryInfo:
         self._check(handle, "memory")

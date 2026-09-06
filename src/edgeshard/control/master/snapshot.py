@@ -25,6 +25,7 @@ state of its own; ``wall`` and ``snapshot_factory`` are injectable so
 
 from __future__ import annotations
 
+import time
 import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -50,6 +51,7 @@ class SnapshotBuilder:
         states: StateStore,
         liveness: LivenessManager,
         *,
+        monotonic: Callable[[], float] = time.monotonic,
         wall: Callable[[], datetime] = _utc_now,
         snapshot_factory: Callable[[], str] = lambda: str(uuid.uuid4()),
     ) -> None:
@@ -57,6 +59,7 @@ class SnapshotBuilder:
         self._sessions = sessions
         self._states = states
         self._liveness = liveness
+        self._monotonic = monotonic
         self._wall = wall
         self._snapshot_factory = snapshot_factory
 
@@ -65,10 +68,13 @@ class SnapshotBuilder:
 
         Synchronous and side-effect free: concurrent heartbeats cannot
         interleave (no ``await``), so the result is internally consistent
-        and never changes after it is returned (spec §38, §51).
+        and never changes after it is returned (spec §38, §51). Liveness for
+        every Worker is classified against a single ``monotonic`` instant, so
+        one snapshot never mixes two clock reads.
         """
+        now = self._monotonic()
         workers = tuple(
-            self._build_worker(record) for record in self._registry.list_workers()
+            self._build_worker(record, now) for record in self._registry.list_workers()
         )
         return ClusterSnapshot(
             snapshot_id=self._snapshot_factory(),
@@ -76,7 +82,7 @@ class SnapshotBuilder:
             workers=workers,
         )
 
-    def _build_worker(self, record: WorkerRecord) -> WorkerSnapshot:
+    def _build_worker(self, record: WorkerRecord, now: float) -> WorkerSnapshot:
         worker_id = record.worker_id
         stored = self._states.get(worker_id)
         if stored is None:
@@ -92,7 +98,7 @@ class SnapshotBuilder:
             identity=record.identity,
             capability=record.capability,
             state=stored.state,
-            status=self._liveness.status_of(worker_id),
+            status=self._liveness.status_at(worker_id, now),
             session_id=session.session_id if session is not None else None,
             last_seen_at=stored.received_wall,
         )

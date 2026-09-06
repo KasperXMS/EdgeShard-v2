@@ -29,6 +29,92 @@ def make_snapshot(
     return directory
 
 
+def write_index(directory: Path, payload: object, *, raw: str | None = None) -> None:
+    text = raw if raw is not None else json.dumps(payload)
+    (directory / "model.safetensors.index.json").write_text(text, encoding="utf-8")
+
+
+SHARD_1 = "model-00001-of-00002.safetensors"
+SHARD_2 = "model-00002-of-00002.safetensors"
+TWO_SHARD_INDEX = {
+    "metadata": {"total_size": 32},
+    "weight_map": {"layer.a": SHARD_1, "layer.b": SHARD_2, "layer.c": SHARD_1},
+}
+
+
+def test_index_with_all_shards_present_is_ready(tmp_path: Path) -> None:
+    """§20: a multi-shard snapshot is READY when every referenced shard exists."""
+    root = tmp_path / "models"
+    directory = make_snapshot(root, "sharded", config_payload={"_name_or_path": "tiny/llama"})
+    write_index(directory, TWO_SHARD_INDEX)
+    (directory / SHARD_1).write_bytes(b"\x00" * 16)
+    (directory / SHARD_2).write_bytes(b"\x00" * 16)
+    (entry,) = scan_model_inventory(ModelStore(model_root=root))
+    assert entry.status is ModelAvailability.READY
+
+
+def test_index_with_missing_shard_is_incomplete(tmp_path: Path) -> None:
+    """An interrupted multi-shard download must never claim READY."""
+    root = tmp_path / "models"
+    directory = make_snapshot(root, "sharded", config_payload={})
+    write_index(directory, TWO_SHARD_INDEX)
+    (directory / SHARD_1).write_bytes(b"\x00" * 16)
+    # SHARD_2 missing — even an unrelated stray weight file does not help:
+    # the index is authoritative for completeness.
+    (directory / "model.safetensors").write_bytes(b"\x00" * 16)
+    (entry,) = scan_model_inventory(ModelStore(model_root=root))
+    assert entry.status is ModelAvailability.INCOMPLETE
+
+
+def test_unparseable_index_is_incomplete(tmp_path: Path) -> None:
+    root = tmp_path / "models"
+    directory = make_snapshot(root, "sharded", config_payload={}, weight_files=(SHARD_1,))
+    write_index(directory, None, raw="{ not json")
+    (entry,) = scan_model_inventory(ModelStore(model_root=root))
+    assert entry.status is ModelAvailability.INCOMPLETE
+
+
+def test_index_without_weight_map_is_incomplete(tmp_path: Path) -> None:
+    root = tmp_path / "models"
+    directory = make_snapshot(root, "sharded", config_payload={}, weight_files=(SHARD_1,))
+    write_index(directory, {"metadata": {"total_size": 16}})
+    (entry,) = scan_model_inventory(ModelStore(model_root=root))
+    assert entry.status is ModelAvailability.INCOMPLETE
+
+
+def test_empty_weight_map_is_incomplete(tmp_path: Path) -> None:
+    root = tmp_path / "models"
+    directory = make_snapshot(root, "sharded", config_payload={}, weight_files=(SHARD_1,))
+    write_index(directory, {"weight_map": {}})
+    (entry,) = scan_model_inventory(ModelStore(model_root=root))
+    assert entry.status is ModelAvailability.INCOMPLETE
+
+
+def test_index_with_non_string_shard_is_incomplete(tmp_path: Path) -> None:
+    root = tmp_path / "models"
+    directory = make_snapshot(root, "sharded", config_payload={})
+    write_index(directory, {"weight_map": {"layer.a": 3}})
+    (entry,) = scan_model_inventory(ModelStore(model_root=root))
+    assert entry.status is ModelAvailability.INCOMPLETE
+
+
+def test_index_shard_with_path_separator_is_rejected(tmp_path: Path) -> None:
+    """An index is untrusted input: shard names never escape the snapshot dir."""
+    root = tmp_path / "models"
+    directory = make_snapshot(root, "sharded", config_payload={})
+    write_index(directory, {"weight_map": {"layer.a": "../../evil.safetensors"}})
+    (entry,) = scan_model_inventory(ModelStore(model_root=root))
+    assert entry.status is ModelAvailability.INCOMPLETE
+
+    write_index(directory, {"weight_map": {"layer.a": "shards/model.safetensors"}})
+    (entry,) = scan_model_inventory(ModelStore(model_root=root))
+    assert entry.status is ModelAvailability.INCOMPLETE
+
+    write_index(directory, {"weight_map": {"layer.a": ".hidden.safetensors"}})
+    (entry,) = scan_model_inventory(ModelStore(model_root=root))
+    assert entry.status is ModelAvailability.INCOMPLETE
+
+
 def test_missing_store_root_is_empty(tmp_path: Path) -> None:
     assert scan_model_inventory(ModelStore(model_root=tmp_path / "missing")) == ()
 

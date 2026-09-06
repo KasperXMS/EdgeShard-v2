@@ -8,9 +8,14 @@ downloaded, repaired, or evicted.
 
 Classification is deliberately conservative:
 
-* ``ready`` - parseable ``config.json`` and at least one weight file;
-* ``incomplete`` - ``config.json`` present but no weight files (e.g. an
-  interrupted snapshot download);
+* ``ready`` - parseable ``config.json`` and complete weights: when a
+  safetensors index (``model.safetensors.index.json``) exists, *every*
+  shard its ``weight_map`` references must be present; without an index, at
+  least one weight file is the best observable evidence;
+* ``incomplete`` - ``config.json`` present but weights missing, or an index
+  referencing shards that are not all on disk (e.g. an interrupted
+  multi-shard download); an unparseable index also lands here rather than
+  claiming readiness that cannot be proven;
 * ``invalid`` - ``config.json`` missing/unparseable, or a directory name the
   ModelStore cannot address.
 
@@ -31,6 +36,11 @@ from edgeshard.runtime.model_store import ModelStore, ModelStoreError, validate_
 logger = logging.getLogger("worker.inventory.models")
 
 _WEIGHT_SUFFIXES = frozenset({".safetensors", ".bin", ".pt", ".pth", ".gguf"})
+_INDEX_FILENAME = "model.safetensors.index.json"
+"""Multi-shard safetensors index; when present it is authoritative for
+completeness (mirrors :mod:`edgeshard.model.weights.safetensors` but parsed
+with plain ``json`` — importing torch here would be absurd overhead for an
+inventory scan)."""
 
 
 def scan_model_inventory(store: ModelStore) -> tuple[ModelInventoryEntry, ...]:
@@ -77,12 +87,7 @@ def _scan_entry(path: Path) -> ModelInventoryEntry:
                 # Never let host paths cross to the Master (spec §20).
                 model_id = candidate
 
-    if has_config and _has_weight_files(path):
-        status = ModelAvailability.READY
-    elif has_config:
-        status = ModelAvailability.INCOMPLETE
-    else:
-        status = ModelAvailability.INVALID
+    status = _weight_status(path) if has_config else ModelAvailability.INVALID
 
     return ModelInventoryEntry(
         local_name=local_name,
@@ -103,6 +108,57 @@ def _read_json(path: Path) -> object:
 def _looks_like_host_path(candidate: str) -> bool:
     """POSIX-absolute check plus ``Path.is_absolute`` for Windows forms."""
     return candidate.startswith(("/", "\\")) or Path(candidate).is_absolute()
+
+
+def _weight_status(path: Path) -> ModelAvailability:
+    """READY/INCOMPLETE for a snapshot directory whose config parsed."""
+    index_path = path / _INDEX_FILENAME
+    if index_path.is_file():
+        shards = _index_shards(index_path)
+        if shards is None or not shards:
+            # Unparseable or empty index: completeness cannot be proven, so
+            # never claim READY (spec §20: observational, conservative).
+            logger.warning(
+                "model %s: safetensors index unreadable or empty; incomplete",
+                path.name,
+            )
+            return ModelAvailability.INCOMPLETE
+        missing = sorted(shard for shard in shards if not (path / shard).is_file())
+        if missing:
+            logger.warning(
+                "model %s: %d referenced weight shards missing (e.g. %s); incomplete",
+                path.name,
+                len(missing),
+                missing[0],
+            )
+            return ModelAvailability.INCOMPLETE
+        return ModelAvailability.READY
+    if _has_weight_files(path):
+        return ModelAvailability.READY
+    return ModelAvailability.INCOMPLETE
+
+
+def _index_shards(index_path: Path) -> frozenset[str] | None:
+    """Distinct shard filenames referenced by the index's ``weight_map``.
+
+    ``None`` when the index cannot be parsed or references anything but
+    plain relative filenames: an index is untrusted input, so a value with
+    a path separator or a leading dot is never joined onto the store root.
+    """
+    payload = _read_json(index_path)
+    if not isinstance(payload, dict):
+        return None
+    weight_map = payload.get("weight_map")
+    if not isinstance(weight_map, dict):
+        return None
+    shards: set[str] = set()
+    for shard in weight_map.values():
+        if not isinstance(shard, str) or not shard:
+            return None
+        if "/" in shard or "\\" in shard or shard.startswith("."):
+            return None
+        shards.add(shard)
+    return frozenset(shards)
 
 
 def _has_weight_files(path: Path) -> bool:

@@ -43,7 +43,15 @@ _TEGRAMARKERS = ("RAM ", "GR3D_FREQ", "CPU [")
 _GR3D_RE = re.compile(r"GR3D_FREQ\s+(\d+(?:\.\d+)?)\s*%")
 _ZONE_RE = re.compile(r"\b([A-Za-z][A-Za-z0-9_]*)@(\d+(?:\.\d+)?)C\b")
 _RAM_RE = re.compile(r"RAM\s+(\d+)/(\d+)MB")
-_GPU_POWER_RE = re.compile(r"VDD_GPU(?:_SOC)?\s+(\d+(?:\.\d+)?)W")
+_POWER_RAIL_RE = re.compile(
+    r"\b(VDD_[A-Za-z0-9_]+)\s+(\d+(?:\.\d+)?)(m?)W(?:\s*/\s*(\d+(?:\.\d+)?)(m?)W)?"
+)
+"""One INA rail reading: ``VDD_X 5.2W``, ``VDD_X 18792mW`` or the
+current/average pair ``VDD_X 18792mW/5552mW`` (first value = current)."""
+
+_GPU_POWER_RAILS = ("VDD_GPU_SOC", "VDD_GPU", "VDD_CPU_GPU_CV")
+"""GPU power rail preference across JetPack releases. ``VDD_IN`` is the
+whole-module input power and is deliberately *not* a GPU rail."""
 
 
 @dataclass(frozen=True)
@@ -68,20 +76,41 @@ class TegrastatsParser:
 
         zones: dict[str, float] = {}
         for name, value in _ZONE_RE.findall(stripped):
-            zones.setdefault(name, float(value))
+            # Zone-name case differs by release (r32: GPU@/BCPU@/MCPU@,
+            # Orin r35/r36: gpu@/cpu@) — normalize to upper case.
+            zones.setdefault(name.upper(), float(value))
 
         gr3d = _GR3D_RE.search(stripped)
         ram = _RAM_RE.search(stripped)
-        gpu_power = _GPU_POWER_RE.search(stripped)
 
         return TegrastatsSample(
             gpu_utilization=float(gr3d.group(1)) if gr3d else None,
             gpu_temperature_c=zones.get("GPU"),
-            gpu_power_w=float(gpu_power.group(1)) if gpu_power else None,
+            gpu_power_w=self._gpu_power(stripped),
             cpu_temperature_c=self._cpu_temperature(zones),
             ram_used_bytes=int(ram.group(1)) * 1024 * 1024 if ram else None,
             ram_total_bytes=int(ram.group(2)) * 1024 * 1024 if ram else None,
         )
+
+    @staticmethod
+    def _gpu_power(line: str) -> float | None:
+        """GPU power in watts from the INA power rails (spec §24).
+
+        Supports every observed JetPack spelling: ``VDD_GPU 5.2W`` (r32
+        Nano), ``VDD_GPU_SOC 310mW`` / ``VDD_CPU_GPU_CV 15123mW/4321mW``
+        (Xavier/Orin, mW and current/average pairs — the first value is the
+        current draw, the second the since-boot average). Rails are matched
+        in :data:`_GPU_POWER_RAILS` preference order; ``VDD_IN`` is the
+        whole-module input power and never stands in for GPU power.
+        """
+        rails: dict[str, float] = {}
+        for name, value, milli, _average, _average_milli in _POWER_RAIL_RE.findall(line):
+            watts = float(value) / 1000.0 if milli else float(value)
+            rails.setdefault(name.upper(), watts)
+        for rail in _GPU_POWER_RAILS:
+            if rail in rails:
+                return rails[rail]
+        return None
 
     @staticmethod
     def _cpu_temperature(zones: dict[str, float]) -> float | None:

@@ -18,6 +18,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 
 from edgeshard.cluster.capability import (
     ContainerRuntimeCapability,
@@ -53,6 +54,25 @@ class ControlProtocolError(EdgeShardError):
     """Control protocol violation: version, identity, revision, or wire shape."""
 
 
+class RejectionReason(StrEnum):
+    """Why the Master rejected a heartbeat or capability update (spec §30, §35).
+
+    The Worker Agent's recovery keys off this enum, never off the detail
+    string: ``UNKNOWN_WORKER``/``REREGISTER_REQUIRED`` mean "register again
+    with a fresh inspection"; ``STALE_SESSION`` means a newer registration
+    superseded this Agent, so it must stop instead of fighting for the
+    session (two same-worker_id Agents must not ping-pong);
+    ``INSTANCE_MISMATCH``/``OUT_OF_ORDER`` are Agent-side protocol
+    violations and must fail loudly (§47).
+    """
+
+    UNKNOWN_WORKER = "unknown_worker"
+    STALE_SESSION = "stale_session"
+    INSTANCE_MISMATCH = "instance_mismatch"
+    OUT_OF_ORDER = "out_of_order"
+    REREGISTER_REQUIRED = "reregister_required"
+
+
 # ---------------------------------------------------------------------------
 # Domain request/response objects (spec §29-30)
 # ---------------------------------------------------------------------------
@@ -78,6 +98,14 @@ class RegisterWorkerRequest:
             raise ControlProtocolError(
                 f"unsupported control protocol version "
                 f"{self.protocol_version!r} (expected {CONTROL_PROTOCOL_VERSION!r})"
+            )
+        if self.identity.protocol_version != self.protocol_version:
+            # The redundant copies must agree (spec §47): an identity built
+            # for another protocol version never rides a v1 registration.
+            raise ControlProtocolError(
+                f"identity protocol_version {self.identity.protocol_version!r} "
+                f"does not match registration protocol_version "
+                f"{self.protocol_version!r}"
             )
         if not self.instance_id:
             raise ValueError("instance_id must not be empty")
@@ -155,24 +183,41 @@ class HeartbeatRequest:
 
 @dataclass(frozen=True)
 class HeartbeatResponse:
-    """Acceptance verdict for one heartbeat (spec §30: ignore/reject)."""
+    """Acceptance verdict for one heartbeat (spec §30: ignore/reject).
+
+    A rejection carries both a human-readable ``detail`` (§46) and the
+    machine-readable ``reason`` the Worker Agent's recovery keys off.
+    """
 
     accepted: bool
     detail: str = ""
+    reason: RejectionReason | None = None
 
     def __post_init__(self) -> None:
-        if not self.accepted and not self.detail:
-            raise ValueError("a rejected heartbeat must carry a detail")
+        if not self.accepted:
+            if not self.detail:
+                raise ValueError("a rejected heartbeat must carry a detail")
+            if self.reason is None:
+                raise ValueError("a rejected heartbeat must carry a reason")
+        elif self.reason is not None:
+            raise ValueError("an accepted heartbeat must not carry a rejection reason")
 
 
 @dataclass(frozen=True)
 class UpdateCapabilityRequest:
-    """A full capability retransmission after a revision change (spec §16)."""
+    """A full capability retransmission after a revision change (spec §16).
+
+    Carries the state sampled atomically with the new capability so the
+    Master can apply both in one step: a snapshot must never pair a new
+    capability with an old state that references devices/pools it no
+    longer contains (§38 cross-validation).
+    """
 
     worker_id: str
     instance_id: str
     session_id: str
     capability: WorkerCapability
+    state: WorkerState
 
     def __post_init__(self) -> None:
         if not self.worker_id:
@@ -181,6 +226,11 @@ class UpdateCapabilityRequest:
             raise ValueError("instance_id must not be empty")
         if not self.session_id:
             raise ValueError("session_id must not be empty")
+        if self.worker_id != self.state.worker_id:
+            raise ValueError(
+                f"capability update/state worker_id mismatch: "
+                f"{self.worker_id!r} vs {self.state.worker_id!r}"
+            )
 
 
 @dataclass(frozen=True)
@@ -189,10 +239,16 @@ class UpdateCapabilityResponse:
 
     accepted: bool
     detail: str = ""
+    reason: RejectionReason | None = None
 
     def __post_init__(self) -> None:
-        if not self.accepted and not self.detail:
-            raise ValueError("a rejected capability update must carry a detail")
+        if not self.accepted:
+            if not self.detail:
+                raise ValueError("a rejected capability update must carry a detail")
+            if self.reason is None:
+                raise ValueError("a rejected capability update must carry a reason")
+        elif self.reason is not None:
+            raise ValueError("an accepted capability update must not carry a reason")
 
 
 # ---------------------------------------------------------------------------
@@ -248,6 +304,17 @@ _MODEL_AVAILABILITY_TO_WIRE: dict[ModelAvailability, pb.ModelAvailability] = {
 }
 _WIRE_TO_MODEL_AVAILABILITY: dict[pb.ModelAvailability, ModelAvailability] = {
     v: k for k, v in _MODEL_AVAILABILITY_TO_WIRE.items()
+}
+
+_REJECTION_REASON_TO_WIRE: dict[RejectionReason, pb.RejectionReason] = {
+    RejectionReason.UNKNOWN_WORKER: pb.REJECTION_REASON_UNKNOWN_WORKER,
+    RejectionReason.STALE_SESSION: pb.REJECTION_REASON_STALE_SESSION,
+    RejectionReason.INSTANCE_MISMATCH: pb.REJECTION_REASON_INSTANCE_MISMATCH,
+    RejectionReason.OUT_OF_ORDER: pb.REJECTION_REASON_OUT_OF_ORDER,
+    RejectionReason.REREGISTER_REQUIRED: pb.REJECTION_REASON_REREGISTER_REQUIRED,
+}
+_WIRE_TO_REJECTION_REASON: dict[pb.RejectionReason, RejectionReason] = {
+    v: k for k, v in _REJECTION_REASON_TO_WIRE.items()
 }
 
 def _decode_enum[WireEnum, DomainEnum](
@@ -744,12 +811,44 @@ def heartbeat_request_from_wire(wire: pb.HeartbeatRequest) -> HeartbeatRequest:
     )
 
 
+def _rejection_reason_to_wire(reason: RejectionReason | None) -> pb.RejectionReason:
+    if reason is None:
+        return pb.REJECTION_REASON_UNSPECIFIED
+    return _REJECTION_REASON_TO_WIRE[reason]
+
+
+def _rejection_reason_from_wire(
+    wire_reason: pb.RejectionReason, *, accepted: bool, label: str
+) -> RejectionReason | None:
+    if accepted:
+        # An accepted verdict carries no reason; ignore whatever the wire says.
+        return None
+    reason = _WIRE_TO_REJECTION_REASON.get(wire_reason)
+    if reason is None:
+        # Fail loudly (§47): a rejection without a usable reason leaves the
+        # Worker Agent unable to choose a recovery path.
+        raise ControlProtocolError(
+            f"rejected {label} carries unknown rejection reason {wire_reason!r}"
+        )
+    return reason
+
+
 def heartbeat_response_to_wire(response: HeartbeatResponse) -> pb.HeartbeatResponse:
-    return pb.HeartbeatResponse(accepted=response.accepted, detail=response.detail)
+    return pb.HeartbeatResponse(
+        accepted=response.accepted,
+        detail=response.detail,
+        reason=_rejection_reason_to_wire(response.reason),
+    )
 
 
 def heartbeat_response_from_wire(wire: pb.HeartbeatResponse) -> HeartbeatResponse:
-    return HeartbeatResponse(accepted=wire.accepted, detail=wire.detail)
+    return HeartbeatResponse(
+        accepted=wire.accepted,
+        detail=wire.detail,
+        reason=_rejection_reason_from_wire(
+            wire.reason, accepted=wire.accepted, label="heartbeat"
+        ),
+    )
 
 
 def update_capability_request_to_wire(
@@ -760,17 +859,24 @@ def update_capability_request_to_wire(
         instance_id=request.instance_id,
         session_id=request.session_id,
         capability=capability_to_wire(request.capability),
+        state=state_to_wire(request.state),
     )
 
 
 def update_capability_request_from_wire(
     wire: pb.UpdateCapabilityRequest,
 ) -> UpdateCapabilityRequest:
+    if not wire.HasField("state"):
+        raise ControlProtocolError(
+            "capability update must carry the state sampled atomically with "
+            "the new capability (spec §16)"
+        )
     return UpdateCapabilityRequest(
         worker_id=wire.worker_id,
         instance_id=wire.instance_id,
         session_id=wire.session_id,
         capability=capability_from_wire(wire.capability),
+        state=state_from_wire(wire.state),
     )
 
 
@@ -778,11 +884,19 @@ def update_capability_response_to_wire(
     response: UpdateCapabilityResponse,
 ) -> pb.UpdateCapabilityResponse:
     return pb.UpdateCapabilityResponse(
-        accepted=response.accepted, detail=response.detail
+        accepted=response.accepted,
+        detail=response.detail,
+        reason=_rejection_reason_to_wire(response.reason),
     )
 
 
 def update_capability_response_from_wire(
     wire: pb.UpdateCapabilityResponse,
 ) -> UpdateCapabilityResponse:
-    return UpdateCapabilityResponse(accepted=wire.accepted, detail=wire.detail)
+    return UpdateCapabilityResponse(
+        accepted=wire.accepted,
+        detail=wire.detail,
+        reason=_rejection_reason_from_wire(
+            wire.reason, accepted=wire.accepted, label="capability update"
+        ),
+    )

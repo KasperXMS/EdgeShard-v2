@@ -84,11 +84,26 @@ class MasterServeSection(BaseModel):
 
 
 class TlsSection(BaseModel):
-    """Transport security placeholder (spec §48): TLS lands later."""
+    """Transport security placeholder (spec §48): TLS lands later.
+
+    Requesting TLS while it is unimplemented is a hard configuration error —
+    silently serving insecure gRPC under ``tls.enabled=true`` would be a
+    security lie (§47: fail loudly, never degrade silently).
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     enabled: bool = False
+
+    @model_validator(mode="after")
+    def _check_implemented(self) -> TlsSection:
+        if self.enabled:
+            raise ValueError(
+                "tls.enabled=true is not supported yet: Phase 1 transport is "
+                "insecure gRPC only (spec §48); refusing to start rather "
+                "than serve an insecure channel as if it were secure"
+            )
+        return self
 
 
 class MasterServeConfig(BaseModel):
