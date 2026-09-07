@@ -12,12 +12,17 @@ from __future__ import annotations
 import grpc
 import pytest
 from wire_fixtures import (
+    CHARACTERIZATION,
+    FAILURE,
     INSTANCE_ID,
+    MODEL,
     MODEL_CASE,
     MODEL_SESSION_REQUEST,
     NETWORK_FACTS,
     NETWORK_SESSION_REQUEST,
+    NOW,
     PROFILING_SESSION_ID,
+    RECORD,
     REGISTRATION_SESSION_ID,
     SESSION_FACTS,
     SUCCESS_OUTCOME,
@@ -25,17 +30,37 @@ from wire_fixtures import (
 )
 
 from edgeshard.profiling.codec import encode_json
-from edgeshard.profiling.domain.experiment import CaseState
+from edgeshard.profiling.domain.experiment import (
+    CaseState,
+    CaseStatus,
+    ExperimentState,
+    ExperimentStatus,
+    ProfilingErrorCategory,
+    ProfilingExperiment,
+    ProfilingRequest,
+)
+from edgeshard.profiling.domain.session import ProfilingSessionKind
+from edgeshard.profiling.domain.snapshot import ProfileSnapshot
 from edgeshard.protocol.profiling.grpc_client import (
+    ProfilingAdminClient,
     WorkerProfilingClient,
     profiling_channel_options,
 )
-from edgeshard.protocol.profiling.grpc_server import start_profiling_server
+from edgeshard.protocol.profiling.grpc_server import (
+    start_admin_server,
+    start_profiling_server,
+)
 from edgeshard.protocol.profiling.mapper import (
+    BuildProfileSnapshotRequest,
+    BuildProfileSnapshotResponse,
+    CancelExperimentRequest,
+    CancelExperimentResponse,
     CancelProfilingCaseRequest,
     CancelProfilingCaseResponse,
     CloseProfilingSessionRequest,
     CloseProfilingSessionResponse,
+    GetExperimentRequest,
+    GetExperimentResponse,
     GetProfilingCaseRequest,
     GetProfilingCaseResponse,
     PrepareProfilingSessionRequest,
@@ -44,6 +69,8 @@ from edgeshard.protocol.profiling.mapper import (
     ProfilingRejection,
     RunProfilingCaseRequest,
     RunProfilingCaseResponse,
+    StartExperimentRequest,
+    StartExperimentResponse,
 )
 from edgeshard.protocol.profiling.pb import profiling_pb2 as pb
 from edgeshard.protocol.profiling.pb import profiling_pb2_grpc as pb_grpc
@@ -322,3 +349,208 @@ async def test_client_context_manager_closes_channel() -> None:
             assert response.accepted is True
     finally:
         await server.stop(grace=None)
+
+
+# ---------------------------------------------------------------------------
+# ProfilingAdminService transport (§49)
+# ---------------------------------------------------------------------------
+
+ADMIN_INTENT = ProfilingRequest(
+    kind=ProfilingSessionKind.MODEL,
+    model=MODEL,
+    dtype="fp32",
+    worker_ids=(WORKER_ID,),
+    device_ids=("gpu-0",),
+    requested_by="operator",
+)
+ADMIN_EXPERIMENT = ProfilingExperiment.for_cases(
+    strategy_id="default-v1", case_ids=["case-1", "case-2"], created_at=NOW
+)
+ADMIN_STATUS = ExperimentStatus(
+    experiment=ADMIN_EXPERIMENT,
+    state=ExperimentState.PARTIALLY_COMPLETED,
+    cases=(
+        CaseStatus("case-1", WORKER_ID, CaseState.COMPLETED),
+        CaseStatus("case-2", WORKER_ID, CaseState.FAILED, failure=FAILURE),
+    ),
+)
+ADMIN_SNAPSHOT = ProfileSnapshot(
+    snapshot_id="snapshot-1",
+    created_at=NOW,
+    model_characterizations=(CHARACTERIZATION,),
+    measurements=(RECORD,),
+    network_measurements=(),
+)
+
+
+class RecordingAdminHandler:
+    """Fake MasterProfilingAdmin: records DTOs, returns canned responses."""
+
+    def __init__(self) -> None:
+        self.starts: list[StartExperimentRequest] = []
+        self.gets: list[GetExperimentRequest] = []
+        self.cancels: list[CancelExperimentRequest] = []
+        self.snapshots: list[BuildProfileSnapshotRequest] = []
+        self.start_response = StartExperimentResponse(
+            accepted=True, experiment_id=ADMIN_EXPERIMENT.experiment_id
+        )
+        self.get_response = GetExperimentResponse(found=True, status=ADMIN_STATUS)
+        self.cancel_response = CancelExperimentResponse(
+            accepted=True, detail="experiment cancelled"
+        )
+        self.snapshot_response = BuildProfileSnapshotResponse(
+            accepted=True, snapshot=ADMIN_SNAPSHOT
+        )
+        self.error: Exception | None = None
+
+    async def start_experiment(
+        self, request: StartExperimentRequest
+    ) -> StartExperimentResponse:
+        if self.error is not None:
+            raise self.error
+        self.starts.append(request)
+        return self.start_response
+
+    async def get_experiment(
+        self, request: GetExperimentRequest
+    ) -> GetExperimentResponse:
+        if self.error is not None:
+            raise self.error
+        self.gets.append(request)
+        return self.get_response
+
+    async def cancel_experiment(
+        self, request: CancelExperimentRequest
+    ) -> CancelExperimentResponse:
+        if self.error is not None:
+            raise self.error
+        self.cancels.append(request)
+        return self.cancel_response
+
+    async def build_profile_snapshot(
+        self, request: BuildProfileSnapshotRequest
+    ) -> BuildProfileSnapshotResponse:
+        if self.error is not None:
+            raise self.error
+        self.snapshots.append(request)
+        return self.snapshot_response
+
+
+@pytest.fixture
+async def admin_transport():
+    handler = RecordingAdminHandler()
+    server, port = await start_admin_server(handler, host=HOST, port=0)
+    client = ProfilingAdminClient(f"{HOST}:{port}")
+    try:
+        yield handler, client, port
+    finally:
+        await client.close()
+        await server.stop(grace=None)
+
+
+async def test_admin_start_roundtrip_over_grpc(admin_transport) -> None:
+    handler, client, _port = admin_transport
+    request = StartExperimentRequest(request=ADMIN_INTENT)
+
+    response = await client.start_experiment(request)
+
+    assert response.accepted is True
+    assert response.experiment_id == ADMIN_EXPERIMENT.experiment_id
+    (received,) = handler.starts
+    assert received == request  # the full intent tree survived the wire
+
+
+async def test_admin_start_rejection_over_grpc(admin_transport) -> None:
+    handler, client, _port = admin_transport
+    handler.start_response = StartExperimentResponse(
+        accepted=False, detail="no registered worker hosts the profiling service"
+    )
+
+    response = await client.start_experiment(StartExperimentRequest(request=ADMIN_INTENT))
+
+    assert response.accepted is False
+    assert "no registered worker" in response.detail
+    assert response.experiment_id == ""
+
+
+async def test_admin_get_roundtrip_over_grpc(admin_transport) -> None:
+    handler, client, _port = admin_transport
+
+    response = await client.get_experiment(
+        GetExperimentRequest(experiment_id=ADMIN_EXPERIMENT.experiment_id)
+    )
+
+    assert response.found is True
+    assert response.status == ADMIN_STATUS  # states AND typed failures survived
+    assert response.status is not None
+    failed = response.status.cases[1]
+    assert failed.failure is not None
+    assert failed.failure.category is ProfilingErrorCategory.DEVICE_BUSY
+    (received,) = handler.gets
+    assert received.experiment_id == ADMIN_EXPERIMENT.experiment_id
+
+
+async def test_admin_get_not_found_over_grpc(admin_transport) -> None:
+    handler, client, _port = admin_transport
+    handler.get_response = GetExperimentResponse(found=False)
+
+    response = await client.get_experiment(GetExperimentRequest(experiment_id="nope"))
+
+    assert response.found is False
+    assert response.status is None
+
+
+async def test_admin_cancel_roundtrip_over_grpc(admin_transport) -> None:
+    handler, client, _port = admin_transport
+
+    response = await client.cancel_experiment(
+        CancelExperimentRequest(experiment_id=ADMIN_EXPERIMENT.experiment_id)
+    )
+
+    assert response.accepted is True
+    assert response.detail == "experiment cancelled"
+    (received,) = handler.cancels
+    assert received.experiment_id == ADMIN_EXPERIMENT.experiment_id
+
+
+async def test_admin_snapshot_roundtrip_over_grpc(admin_transport) -> None:
+    handler, client, _port = admin_transport
+
+    response = await client.build_profile_snapshot(BuildProfileSnapshotRequest())
+
+    assert response.accepted is True
+    assert response.snapshot == ADMIN_SNAPSHOT  # the whole §46 view survived
+    assert len(handler.snapshots) == 1
+
+
+async def test_admin_handler_value_error_aborts_rpc(admin_transport) -> None:
+    handler, client, _port = admin_transport
+    handler.error = ValueError("domain says no")
+
+    with pytest.raises(grpc.aio.AioRpcError) as excinfo:
+        await client.start_experiment(StartExperimentRequest(request=ADMIN_INTENT))
+
+    assert excinfo.value.code() is grpc.StatusCode.INVALID_ARGUMENT
+    assert "domain says no" in excinfo.value.details()
+
+
+async def test_admin_invalid_wire_request_never_reaches_handler(
+    admin_transport,
+) -> None:
+    handler, _client, port = admin_transport
+    stub = pb_grpc.ProfilingAdminServiceStub(  # type: ignore[no-untyped-call]
+        grpc.aio.insecure_channel(
+            f"{HOST}:{port}", options=profiling_channel_options()
+        )
+    )
+
+    with pytest.raises(grpc.aio.AioRpcError) as excinfo:
+        await stub.StartExperiment(pb.StartExperimentRequest(request_payload=""))
+
+    assert excinfo.value.code() is grpc.StatusCode.INVALID_ARGUMENT
+    assert handler.starts == []
+
+
+def test_admin_client_rejects_empty_endpoint() -> None:
+    with pytest.raises(ValueError, match="endpoint"):
+        ProfilingAdminClient("")

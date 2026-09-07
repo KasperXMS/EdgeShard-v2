@@ -33,7 +33,8 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Protocol
@@ -44,7 +45,9 @@ from edgeshard.control.master.service import MasterService
 from edgeshard.profiling.domain.experiment import (
     CaseOutcome,
     CaseState,
+    CaseStatus,
     ExperimentState,
+    ExperimentStatus,
     ModelCaseSpec,
     NetworkCaseSpec,
     ProfilingCase,
@@ -53,7 +56,9 @@ from edgeshard.profiling.domain.experiment import (
     ProfilingFailure,
 )
 from edgeshard.profiling.domain.hashing import JsonScalar, canonical_sha256
+from edgeshard.profiling.domain.network import NetworkEndpointProfile
 from edgeshard.profiling.domain.session import (
+    ModelSessionFacts,
     ProfilingSessionKind,
     ProfilingSessionRequest,
     profiling_session_id,
@@ -61,6 +66,7 @@ from edgeshard.profiling.domain.session import (
 from edgeshard.profiling.domain.signature import ProfilingGranularity
 from edgeshard.profiling.domain.snapshot import ProfileSnapshot
 from edgeshard.profiling.network.classifier import (
+    ClassifiedPair,
     WorkerNetworkFacts,
     worker_network_facts,
 )
@@ -108,6 +114,14 @@ _REJECTION_CATEGORY: dict[ProfilingRejection, ProfilingErrorCategory] = {
     ProfilingRejection.SESSION_KIND_MISMATCH: ProfilingErrorCategory.INTERNAL_ERROR,
     ProfilingRejection.UNKNOWN_CASE: ProfilingErrorCategory.INTERNAL_ERROR,
 }
+
+MODEL_INSPECTION_SCOPE = "model-inspection"
+"""Scope prefix of §47-step-1 inspection sessions (not tied to an experiment).
+
+Experiment-dispatched sessions are scoped by their ``experiment_id``; an
+inspection happens *before* any experiment exists, so it gets its own scope
+namespace (uniqueness per call is added by :meth:`_inspection_session_id`).
+"""
 
 
 class ProfilingTransport(Protocol):
@@ -371,6 +385,7 @@ class ProfilingController:
         self._transport_factory = transport_factory
         self._clock = clock
         self._rpc_timeout = rpc_timeout
+        self._inspection_seq = 0
 
     # -- experiment definitions (§8.1, §44) ----------------------------------
 
@@ -422,6 +437,177 @@ class ProfilingController:
     def load_experiment(self, experiment_id: str) -> StoredExperiment | None:
         """The stored definition + lifecycle state of one experiment (§43)."""
         return self._store.get_experiment(experiment_id)
+
+    def experiment_status(self, experiment_id: str) -> ExperimentStatus | None:
+        """Read-back view of one experiment for the admin plane (§49).
+
+        ``None`` for an unknown id (never a guess, §52.2). Case failures are
+        *not* part of the store's ledger — it keeps states only (§43) — so
+        returned :class:`CaseStatus` entries carry their state and the admin
+        layer enriches them with the typed failures from its run reports.
+        """
+        stored = self._store.get_experiment(experiment_id)
+        if stored is None:
+            return None
+        cases: list[CaseStatus] = []
+        for case_id in stored.experiment.case_ids:
+            stored_case = self._store.get_case(case_id)
+            if stored_case is None:
+                raise ValueError(
+                    f"experiment {experiment_id!r} references case {case_id!r} "
+                    "which is not persisted (§8.3)"
+                )
+            cases.append(
+                CaseStatus(
+                    case_id=case_id,
+                    worker_id=stored_case.case.worker_id,
+                    state=stored_case.state,
+                )
+            )
+        return ExperimentStatus(
+            experiment=stored.experiment, state=stored.state, cases=tuple(cases)
+        )
+
+    # -- planning support for the admin layer (§46-§47) ------------------------
+
+    def profiling_worker_ids(self) -> tuple[str, ...]:
+        """Every registered Worker that hosts the profiling plane (§41).
+
+        Sorted and registration-order independent; Workers without a
+        profiling endpoint are invisible to profiling intents rather than
+        dispatched-to-fail.
+        """
+        return tuple(
+            sorted(
+                record.identity.worker_id
+                for record in self._service.registry.list_workers()
+                if record.profiling_endpoint is not None
+            )
+        )
+
+    def cluster_network_facts(self) -> dict[str, WorkerNetworkFacts]:
+        """Public view of the Master-resolved network facts (§30, §52.2)."""
+        return self._cluster_network_facts()
+
+    def measured_operator_signature_ids(
+        self,
+        *,
+        device_performance_class_id: str | None = None,
+        environment_fingerprint_id: str | None = None,
+    ) -> AbstractSet[str]:
+        """The §28 incremental-reuse answer straight from the store."""
+        return self._store.measured_operator_signature_ids(
+            device_performance_class_id=device_performance_class_id,
+            environment_fingerprint_id=environment_fingerprint_id,
+        )
+
+    def record_model_facts(self, facts: ModelSessionFacts) -> None:
+        """Persist one inspection's facts into the §43 registries.
+
+        The characterization and every layer/module/operator signature the
+        Worker reported become stored facts — so the ProfileSnapshot carries
+        the static model picture (§46) even before (or without) any
+        measurement, and reuse queries can see the signatures. Idempotent:
+        the registries are content-addressed (§9).
+        """
+        self._store.store_characterization(facts.characterization)
+        for layer_entry in facts.layer_entries:
+            self._store.store_layer_signature(layer_entry.signature)
+        for module_entry in facts.module_entries:
+            self._store.store_module_signature(module_entry.signature)
+        for signature in facts.operator_signatures:
+            self._store.store_operator_signature(signature)
+        logger.info(
+            "recorded model facts: %s (%d layer, %d module, %d operator "
+            "signature(s))",
+            facts.characterization.model.model_id,
+            len(facts.layer_entries),
+            len(facts.module_entries),
+            len(facts.operator_signatures),
+        )
+
+    def record_network_characterization(
+        self,
+        endpoint_profiles: Iterable[NetworkEndpointProfile],
+        classified_pairs: Iterable[ClassifiedPair],
+    ) -> None:
+        """Persist the §47 network steps 1-2 facts (endpoints + classes)."""
+        for profile in endpoint_profiles:
+            self._store.store_network_endpoint(profile)
+        for classified in classified_pairs:
+            self._store.store_path_classification(
+                classified.pair, classified.path_class
+            )
+
+    # -- model inspection (§47 step 1, over the §41 plane) ---------------------
+
+    async def inspect_model(
+        self, *, worker_id: str, request: ProfilingSessionRequest
+    ) -> ModelSessionFacts | ProfilingFailure:
+        """Prepare a MODEL session on one Worker purely to read its facts.
+
+        §46/§47: planning consumes facts, and the static characterization
+        happens Worker-side (§38) — the Master never loads a model. The
+        session is closed on every exit path: an inspection is a read, not a
+        lease the caller keeps. Every problem (unreachable Worker, refusal,
+        transport loss, facts missing from an accepted prepare) comes back as
+        a typed :class:`ProfilingFailure`, never an exception (§42, §52.2).
+        """
+        if request.kind is not ProfilingSessionKind.MODEL:
+            raise ValueError(
+                f"inspect_model requires a MODEL session request, got "
+                f"{request.kind.value!r}"
+            )
+        resolved = self._resolve_tokens(worker_id)
+        if isinstance(resolved, ProfilingFailure):
+            return resolved
+        session_id = self._inspection_session_id(resolved, request)
+        transport = self._transport_factory(resolved.endpoint)
+        try:
+            prepared = await self._prepare(
+                transport,
+                resolved,
+                _SessionPlan(
+                    session_id=session_id, session_request=request, cases=()
+                ),
+                (),
+            )
+            if isinstance(prepared, ProfilingFailure):
+                return prepared
+            if prepared.session_facts is None:
+                # The response DTO forbids this for accepted MODEL sessions;
+                # guard anyway (§47).
+                return ProfilingFailure(
+                    category=ProfilingErrorCategory.INTERNAL_ERROR,
+                    message=(
+                        f"accepted model inspection on worker {worker_id!r} "
+                        "carries no session facts (§47)"
+                    ),
+                )
+            return prepared.session_facts
+        finally:
+            await self._close_session(transport, resolved, session_id)
+            await transport.close()
+
+    def _inspection_session_id(
+        self, tokens: _DispatchTokens, request: ProfilingSessionRequest
+    ) -> str:
+        """A fresh canonical inspection session id (§7, §38).
+
+        Scoped to the Worker's current registration epoch plus a per-process
+        sequence, so repeated inspections of the same model never re-present
+        a *closed* session id — the Worker refuses those by design (§38:
+        closed ids never come back, prepare a new one). An inspection is a
+        live fact read, not an append-oriented ledger entry, so uniqueness
+        beats cross-restart replay here; experiment sessions keep their
+        deterministic experiment-scoped ids (§50).
+        """
+        self._inspection_seq += 1
+        scope = (
+            f"{MODEL_INSPECTION_SCOPE}:"
+            f"{tokens.registration_session_id}:{self._inspection_seq}"
+        )
+        return profiling_session_id(scope, tokens.worker_id, request)
 
     # -- execution (§40) ------------------------------------------------------
 

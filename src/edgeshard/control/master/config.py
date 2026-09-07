@@ -61,6 +61,12 @@ DEFAULT_MASTER_PORT = 51_000
 """Control-plane listen defaults; port 0 (OS-chosen) is allowed so tests and
 ``master serve`` on a busy host can report the bound port in their READY line."""
 
+DEFAULT_PROFILING_ADMIN_PORT = 51_001
+"""Profiling-admin listen default (Phase 2 spec §49); port 0 allowed as above."""
+
+DEFAULT_PROFILE_STORE_PATH = "edgeshard-profiles.sqlite3"
+"""Where ``master serve`` persists the profile store when profiling is on (§43)."""
+
 
 class MasterServeSection(BaseModel):
     """Listen address and timing knobs of ``edgeshard master serve`` (§45)."""
@@ -80,6 +86,33 @@ class MasterServeSection(BaseModel):
             raise ValueError("master host must be non-empty")
         if not 0 <= self.port <= 65_535:
             raise ValueError(f"master port out of range: {self.port}")
+        return self
+
+
+class MasterProfilingSection(BaseModel):
+    """Master-side profiling-admin hosting intent (Phase 2 spec §49).
+
+    Additive: ``enabled=false`` (the default) keeps exact Phase 1 behavior —
+    no admin server, no profile store, no extra files on disk. When enabled,
+    ``master serve`` opens the SQLite profile store (§43) and hosts
+    ``ProfilingAdminService`` for the CLI's ``profile`` commands.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    admin_host: str = DEFAULT_MASTER_HOST
+    admin_port: int = DEFAULT_PROFILING_ADMIN_PORT
+    store_path: str = DEFAULT_PROFILE_STORE_PATH
+
+    @model_validator(mode="after")
+    def _check_listen(self) -> MasterProfilingSection:
+        if not self.admin_host:
+            raise ValueError("profiling admin host must be non-empty")
+        if not 0 <= self.admin_port <= 65_535:
+            raise ValueError(f"profiling admin port out of range: {self.admin_port}")
+        if not self.store_path:
+            raise ValueError("profile store path must be non-empty")
         return self
 
 
@@ -116,6 +149,7 @@ class MasterServeConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     master: MasterServeSection = MasterServeSection()
+    profiling: MasterProfilingSection = MasterProfilingSection()
     tls: TlsSection = TlsSection()
 
     @classmethod

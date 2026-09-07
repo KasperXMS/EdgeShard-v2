@@ -32,10 +32,12 @@ from edgeshard.profiling.domain.model import ModelReference
 from edgeshard.profiling.domain.network import (
     NetworkDirection,
     NetworkMeasurementRegime,
+    NetworkPair,
     NetworkPathClass,
     NetworkTransport,
     ProbeKind,
 )
+from edgeshard.profiling.domain.session import ProfilingSessionKind
 from edgeshard.profiling.domain.signature import (
     InferencePhase,
     ModuleSignature,
@@ -433,3 +435,156 @@ class ProfilingExperiment:
             requested_by=requested_by,
             case_ids=ordered,
         )
+
+
+@dataclass(frozen=True)
+class ProfilingRequest:
+    """Operator intent for one profiling experiment (spec §49).
+
+    The admin wire contract (``StartExperiment``): the CLI submits *intent*,
+    never planned cases — planning is the Master's job through the strategy
+    layer (§46-§47), so a request is fully described before any Worker is
+    contacted. Empty ``worker_ids`` means "every registered Worker with a
+    profiling endpoint"; the Master resolves and refuses unknown ids rather
+    than guessing (§52.2).
+
+    Kind-specific shape mirrors :class:`ProfilingSessionRequest`:
+
+    * ``MODEL``/``OPERATOR`` benchmark through a characterized checkpoint and
+      therefore require ``model``, the declared ``dtype`` (§17), and
+      ``device_ids``; ``OPERATOR`` additionally honors ``missing_only`` (the
+      §28 incremental-reuse filter — ``False`` re-measures everything).
+    * ``NETWORK`` forbids all model/device knobs and accepts the probe
+      selection (``network_probe``: ``None`` = RTT + bandwidth, §47) plus the
+      bandwidth scoping knobs of §34 (path-class filter, explicit pairs).
+      Reuse does not apply — network facts are cheap and topology-bound, so
+      ``missing_only`` is forbidden rather than silently ignored.
+    """
+
+    kind: ProfilingSessionKind
+    model: ModelReference | None = None
+    dtype: str | None = None
+    worker_ids: tuple[str, ...] = ()
+    device_ids: tuple[str, ...] = ()
+    missing_only: bool = True
+    network_probe: ProbeKind | None = None
+    bandwidth_path_classes: tuple[NetworkPathClass, ...] = ()
+    extra_bandwidth_pairs: tuple[NetworkPair, ...] = ()
+    requested_by: str | None = None
+
+    def __post_init__(self) -> None:
+        seen_workers: set[str] = set()
+        for worker_id in self.worker_ids:
+            if not worker_id:
+                raise ValueError("worker_ids must not contain empty entries")
+            if worker_id in seen_workers:
+                raise ValueError(f"duplicate worker_id {worker_id!r}")
+            seen_workers.add(worker_id)
+        seen_devices: set[str] = set()
+        for device_id in self.device_ids:
+            if not device_id:
+                raise ValueError("device_ids must not contain empty entries")
+            if device_id in seen_devices:
+                raise ValueError(f"duplicate device_id {device_id!r}")
+            seen_devices.add(device_id)
+        if self.requested_by is not None and not self.requested_by:
+            raise ValueError("requested_by must not be empty when present")
+        if self.kind is ProfilingSessionKind.NETWORK:
+            self._check_network()
+        else:
+            self._check_model_family()
+
+    def _check_network(self) -> None:
+        if self.model is not None:
+            raise ValueError("network requests must not carry a model reference")
+        if self.dtype is not None:
+            raise ValueError("network requests must not carry a dtype")
+        if self.device_ids:
+            raise ValueError("network requests must not carry device_ids (§33-36)")
+        if not self.missing_only:
+            raise ValueError(
+                "missing_only=False is meaningless for network requests — "
+                "probes are never deduplicated against stored measurements"
+            )
+
+    def _check_model_family(self) -> None:
+        if self.model is None:
+            raise ValueError(
+                f"{self.kind.value} requests require a model reference (§38)"
+            )
+        if self.dtype is None:
+            raise ValueError(
+                f"{self.kind.value} requests require the declared measurement dtype"
+            )
+        if not self.device_ids:
+            raise ValueError(
+                f"{self.kind.value} requests require at least one device_id"
+            )
+        if self.network_probe is not None:
+            raise ValueError(
+                f"{self.kind.value} requests must not select a network probe"
+            )
+        if self.bandwidth_path_classes or self.extra_bandwidth_pairs:
+            raise ValueError(
+                f"{self.kind.value} requests must not carry bandwidth knobs (§34)"
+            )
+
+
+@dataclass(frozen=True)
+class CaseStatus:
+    """Master-side lifecycle status of one case within an experiment.
+
+    The read-back half of the admin contract (``GetExperiment``). ``failure``
+    is present only for terminal negative states (``FAILED``/``CANCELLED``)
+    and always typed (§42); running or succeeded cases carry ``None`` — the
+    measurement itself lives in the profile store, never in status.
+    """
+
+    case_id: str
+    worker_id: str
+    state: CaseState
+    failure: ProfilingFailure | None = None
+
+    def __post_init__(self) -> None:
+        if not self.case_id:
+            raise ValueError("case_id must not be empty")
+        if not self.worker_id:
+            raise ValueError("worker_id must not be empty")
+        negative = self.state in (CaseState.FAILED, CaseState.CANCELLED)
+        if self.failure is not None and not negative:
+            raise ValueError(
+                f"failure is only valid for failed/cancelled cases, got state "
+                f"{self.state.value!r}"
+            )
+
+
+@dataclass(frozen=True)
+class ExperimentStatus:
+    """Whole-experiment read-back: definition + state + per-case status.
+
+    ``cases`` must cover ``experiment.case_ids`` exactly — one status per
+    case, no extras, no gaps (§8.3: an experiment's case set is closed at
+    creation; status may never silently lose or invent cases).
+    """
+
+    experiment: ProfilingExperiment
+    state: ExperimentState
+    cases: tuple[CaseStatus, ...]
+
+    def __post_init__(self) -> None:
+        expected = set(self.experiment.case_ids)
+        seen: set[str] = set()
+        for case in self.cases:
+            if case.case_id not in expected:
+                raise ValueError(
+                    f"status for case {case.case_id!r} outside the experiment's "
+                    f"case set (§8.3)"
+                )
+            if case.case_id in seen:
+                raise ValueError(f"duplicate case status for {case.case_id!r}")
+            seen.add(case.case_id)
+        missing = expected - seen
+        if missing:
+            raise ValueError(
+                f"experiment cases lack status: {', '.join(sorted(missing))}"
+            )

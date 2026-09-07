@@ -14,17 +14,21 @@ import dataclasses
 
 import pytest
 from wire_fixtures import (
+    CHARACTERIZATION,
     FAILURE,
     FAILURE_OUTCOME,
     INSTANCE_ID,
+    MODEL,
     MODEL_CASE,
     MODEL_SESSION_REQUEST,
     NETWORK_CASE,
     NETWORK_FACTS,
     NETWORK_SESSION_REQUEST,
+    NOW,
     OPERATOR_SESSION_REQUEST,
     PEER_NETWORK_FACTS,
     PROFILING_SESSION_ID,
+    RECORD,
     REGISTRATION_SESSION_ID,
     SESSION_FACTS,
     SUCCESS_OUTCOME,
@@ -34,9 +38,15 @@ from wire_fixtures import (
 from edgeshard.profiling.domain.experiment import (
     CaseOutcome,
     CaseState,
+    CaseStatus,
+    ExperimentState,
+    ExperimentStatus,
     ProfilingErrorCategory,
+    ProfilingExperiment,
+    ProfilingRequest,
 )
-from edgeshard.profiling.domain.session import ModelSessionFacts
+from edgeshard.profiling.domain.session import ModelSessionFacts, ProfilingSessionKind
+from edgeshard.profiling.domain.snapshot import ProfileSnapshot
 from edgeshard.protocol.profiling import mapper
 from edgeshard.protocol.profiling.mapper import (
     CancelProfilingCaseRequest,
@@ -551,3 +561,176 @@ def test_session_kind_mismatch_reason_available() -> None:
         mapper.run_case_response_to_wire(response)
     )
     assert restored.reason is ProfilingRejection.SESSION_KIND_MISMATCH
+
+
+# ---------------------------------------------------------------------------
+# ProfilingAdminService DTOs (§49): intents in, status/snapshots out
+# ---------------------------------------------------------------------------
+
+ADMIN_INTENT = ProfilingRequest(
+    kind=ProfilingSessionKind.MODEL,
+    model=MODEL,
+    dtype="fp32",
+    worker_ids=(WORKER_ID,),
+    device_ids=("gpu-0",),
+    requested_by="operator",
+)
+ADMIN_EXPERIMENT = ProfilingExperiment.for_cases(
+    strategy_id="default-v1", case_ids=["case-1", "case-2"], created_at=NOW
+)
+ADMIN_STATUS = ExperimentStatus(
+    experiment=ADMIN_EXPERIMENT,
+    state=ExperimentState.PARTIALLY_COMPLETED,
+    cases=(
+        CaseStatus("case-1", WORKER_ID, CaseState.COMPLETED),
+        CaseStatus("case-2", WORKER_ID, CaseState.FAILED, failure=FAILURE),
+    ),
+)
+ADMIN_SNAPSHOT = ProfileSnapshot(
+    snapshot_id="snapshot-1",
+    created_at=NOW,
+    model_characterizations=(CHARACTERIZATION,),
+    measurements=(RECORD,),
+    network_measurements=(),
+)
+
+
+def test_start_request_roundtrip() -> None:
+    request = mapper.StartExperimentRequest(request=ADMIN_INTENT)
+    wire = mapper.start_experiment_request_to_wire(request)
+    assert wire.request_payload
+    assert mapper.start_experiment_request_from_wire(wire) == request
+
+
+def test_start_request_missing_payload_rejected() -> None:
+    with pytest.raises(ProfilingProtocolError, match="profiling request"):
+        mapper.start_experiment_request_from_wire(pb.StartExperimentRequest())
+
+
+def test_start_request_malformed_payload_rejected() -> None:
+    with pytest.raises(ProfilingProtocolError, match="malformed"):
+        mapper.start_experiment_request_from_wire(
+            pb.StartExperimentRequest(request_payload="{not json")
+        )
+
+
+def test_start_response_roundtrip() -> None:
+    accepted = mapper.StartExperimentResponse(
+        accepted=True, experiment_id=ADMIN_EXPERIMENT.experiment_id
+    )
+    wire = mapper.start_experiment_response_to_wire(accepted)
+    assert mapper.start_experiment_response_from_wire(wire) == accepted
+    rejected = mapper.StartExperimentResponse(accepted=False, detail="no workers")
+    assert (
+        mapper.start_experiment_response_from_wire(
+            mapper.start_experiment_response_to_wire(rejected)
+        )
+        == rejected
+    )
+
+
+def test_start_response_verdict_consistency() -> None:
+    with pytest.raises(ValueError, match="experiment_id"):
+        mapper.StartExperimentResponse(accepted=True)
+    with pytest.raises(ValueError, match="detail"):
+        mapper.StartExperimentResponse(accepted=False)
+    with pytest.raises(ValueError, match="experiment_id"):
+        mapper.StartExperimentResponse(
+            accepted=False, detail="no", experiment_id="e-1"
+        )
+
+
+def test_get_experiment_roundtrip() -> None:
+    request = mapper.GetExperimentRequest(experiment_id="e-1")
+    assert (
+        mapper.get_experiment_request_from_wire(
+            mapper.get_experiment_request_to_wire(request)
+        )
+        == request
+    )
+    with pytest.raises(ValueError, match="experiment_id"):
+        mapper.GetExperimentRequest(experiment_id="")
+
+    found = mapper.GetExperimentResponse(found=True, status=ADMIN_STATUS)
+    wire = mapper.get_experiment_response_to_wire(found)
+    assert wire.status_payload
+    assert mapper.get_experiment_response_from_wire(wire) == found
+
+    missing = mapper.GetExperimentResponse(found=False)
+    assert mapper.get_experiment_response_to_wire(missing).status_payload == ""
+    assert mapper.get_experiment_response_from_wire(
+        mapper.get_experiment_response_to_wire(missing)
+    ) == missing
+
+
+def test_get_experiment_response_found_requires_status() -> None:
+    with pytest.raises(ValueError, match="found"):
+        mapper.GetExperimentResponse(found=True)
+    with pytest.raises(ValueError, match="found"):
+        mapper.GetExperimentResponse(found=False, status=ADMIN_STATUS)
+
+
+def test_get_experiment_response_malformed_status_rejected() -> None:
+    with pytest.raises(ProfilingProtocolError, match="experiment status"):
+        mapper.get_experiment_response_from_wire(
+            pb.GetExperimentResponse(found=True, status_payload="{oops")
+        )
+
+
+def test_cancel_experiment_roundtrip() -> None:
+    request = mapper.CancelExperimentRequest(experiment_id="e-1")
+    assert (
+        mapper.cancel_experiment_request_from_wire(
+            mapper.cancel_experiment_request_to_wire(request)
+        )
+        == request
+    )
+    for response in (
+        mapper.CancelExperimentResponse(accepted=True, detail="cancelled"),
+        mapper.CancelExperimentResponse(accepted=True),
+        mapper.CancelExperimentResponse(accepted=False, detail="unknown experiment"),
+    ):
+        assert (
+            mapper.cancel_experiment_response_from_wire(
+                mapper.cancel_experiment_response_to_wire(response)
+            )
+            == response
+        )
+    with pytest.raises(ValueError, match="detail"):
+        mapper.CancelExperimentResponse(accepted=False)
+
+
+def test_build_snapshot_roundtrip() -> None:
+    request = mapper.BuildProfileSnapshotRequest()
+    assert (
+        mapper.build_snapshot_request_from_wire(
+            mapper.build_snapshot_request_to_wire(request)
+        )
+        == request
+    )
+
+    accepted = mapper.BuildProfileSnapshotResponse(
+        accepted=True, snapshot=ADMIN_SNAPSHOT
+    )
+    wire = mapper.build_snapshot_response_to_wire(accepted)
+    assert wire.snapshot_payload
+    assert mapper.build_snapshot_response_from_wire(wire) == accepted
+
+    rejected = mapper.BuildProfileSnapshotResponse(
+        accepted=False, detail="store failed"
+    )
+    assert mapper.build_snapshot_response_to_wire(rejected).snapshot_payload == ""
+    assert mapper.build_snapshot_response_from_wire(
+        mapper.build_snapshot_response_to_wire(rejected)
+    ) == rejected
+
+
+def test_build_snapshot_response_verdict_consistency() -> None:
+    with pytest.raises(ValueError, match="snapshot"):
+        mapper.BuildProfileSnapshotResponse(accepted=True)
+    with pytest.raises(ValueError, match="snapshot"):
+        mapper.BuildProfileSnapshotResponse(
+            accepted=False, detail="x", snapshot=ADMIN_SNAPSHOT
+        )
+    with pytest.raises(ValueError, match="detail"):
+        mapper.BuildProfileSnapshotResponse(accepted=False)

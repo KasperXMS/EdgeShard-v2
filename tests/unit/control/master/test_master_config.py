@@ -6,7 +6,11 @@ from pathlib import Path
 
 import pytest
 
-from edgeshard.control.master.config import MasterConfig, MasterServeConfig
+from edgeshard.control.master.config import (
+    MasterConfig,
+    MasterProfilingSection,
+    MasterServeConfig,
+)
 
 
 def test_defaults_match_spec_32() -> None:
@@ -117,3 +121,51 @@ def test_serve_config_invalid_rejected(tmp_path: Path, payload: str) -> None:
     with pytest.raises(ValueError):
         config = MasterServeConfig.from_yaml(path)
         config.to_master_config()
+
+
+# ---------------------------------------------------------------------------
+# MasterProfilingSection: the additive profiling-admin layer (Phase 2 §49)
+# ---------------------------------------------------------------------------
+
+
+def test_profiling_defaults_are_disabled_and_frozen_shape() -> None:
+    config = MasterServeConfig()
+    assert config.profiling.enabled is False
+    assert config.profiling.admin_host == "0.0.0.0"
+    assert config.profiling.admin_port == 51_001
+    assert config.profiling.store_path == "edgeshard-profiles.sqlite3"
+
+
+def test_profiling_section_from_yaml(tmp_path: Path) -> None:
+    path = write_master_config(
+        tmp_path,
+        """
+profiling:
+  enabled: true
+  admin_host: 127.0.0.1
+  admin_port: 0
+  store_path: /tmp/profiles.sqlite3
+""",
+    )
+    config = MasterServeConfig.from_yaml(path)
+    assert config.profiling.enabled is True
+    assert config.profiling.admin_host == "127.0.0.1"
+    assert config.profiling.admin_port == 0  # OS-chosen; READY reports it
+    assert config.profiling.store_path == "/tmp/profiles.sqlite3"
+
+
+@pytest.mark.parametrize(
+    "section",
+    [
+        {"admin_host": ""},
+        {"admin_port": -1},
+        {"admin_port": 65_536},
+        {"store_path": ""},
+        {"bogus": 1},  # extra keys are forbidden (Phase 0 config discipline)
+    ],
+)
+def test_profiling_section_rejects_invalid_values(
+    section: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError):
+        MasterProfilingSection(**section)

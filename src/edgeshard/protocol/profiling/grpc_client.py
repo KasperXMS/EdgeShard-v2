@@ -111,3 +111,78 @@ class WorkerProfilingClient:
 
     async def __aexit__(self, *exc_info: object) -> None:
         await self.close()
+
+
+class ProfilingAdminClient:
+    """Client for the Master's ``ProfilingAdminService`` endpoint (spec §49).
+
+    Spoken by the CLI only: it submits intents and reads back status and
+    snapshots, never generated protobuf objects.
+    """
+
+    def __init__(self, endpoint: str) -> None:
+        if not endpoint:
+            raise ValueError("admin endpoint must not be empty")
+        self._endpoint = endpoint
+        self._channel = grpc.aio.insecure_channel(
+            endpoint, options=profiling_channel_options()
+        )
+        # Generated grpc stub code is untyped (only pb2 ships .pyi stubs).
+        self._stub = pb_grpc.ProfilingAdminServiceStub(self._channel)  # type: ignore[no-untyped-call]
+
+    @property
+    def endpoint(self) -> str:
+        return self._endpoint
+
+    async def start_experiment(
+        self,
+        request: mapper.StartExperimentRequest,
+        *,
+        timeout: float | None = None,
+    ) -> mapper.StartExperimentResponse:
+        wire = await self._stub.StartExperiment(
+            mapper.start_experiment_request_to_wire(request), timeout=timeout
+        )
+        return mapper.start_experiment_response_from_wire(wire)
+
+    async def get_experiment(
+        self,
+        request: mapper.GetExperimentRequest,
+        *,
+        timeout: float | None = None,
+    ) -> mapper.GetExperimentResponse:
+        wire = await self._stub.GetExperiment(
+            mapper.get_experiment_request_to_wire(request), timeout=timeout
+        )
+        return mapper.get_experiment_response_from_wire(wire)
+
+    async def cancel_experiment(
+        self,
+        request: mapper.CancelExperimentRequest,
+        *,
+        timeout: float | None = None,
+    ) -> mapper.CancelExperimentResponse:
+        wire = await self._stub.CancelExperiment(
+            mapper.cancel_experiment_request_to_wire(request), timeout=timeout
+        )
+        return mapper.cancel_experiment_response_from_wire(wire)
+
+    async def build_profile_snapshot(
+        self,
+        request: mapper.BuildProfileSnapshotRequest,
+        *,
+        timeout: float | None = None,
+    ) -> mapper.BuildProfileSnapshotResponse:
+        wire = await self._stub.BuildProfileSnapshot(
+            mapper.build_snapshot_request_to_wire(request), timeout=timeout
+        )
+        return mapper.build_snapshot_response_from_wire(wire)
+
+    async def close(self) -> None:
+        await self._channel.close()
+
+    async def __aenter__(self) -> ProfilingAdminClient:
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        await self.close()

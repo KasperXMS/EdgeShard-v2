@@ -37,14 +37,17 @@ from edgeshard.profiling.codec import PayloadCodecError, decode_json, encode_jso
 from edgeshard.profiling.domain.experiment import (
     CaseOutcome,
     CaseState,
+    ExperimentStatus,
     ProfilingCase,
     ProfilingFailure,
+    ProfilingRequest,
 )
 from edgeshard.profiling.domain.session import (
     ModelSessionFacts,
     ProfilingSessionKind,
     ProfilingSessionRequest,
 )
+from edgeshard.profiling.domain.snapshot import ProfileSnapshot
 from edgeshard.profiling.network.classifier import WorkerNetworkFacts
 from edgeshard.protocol.profiling.pb import profiling_pb2 as pb
 
@@ -751,4 +754,235 @@ def close_session_response_from_wire(
         accepted=accepted,
         detail=wire.detail,
         reason=_rejection_from_wire(wire.reason, accepted=accepted, label="close"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# ProfilingAdminService (§49): the CLI submits intents, reads back status.
+# No session tokens here — the admin plane terminates at the Master, which
+# owns registration state; refusals are plain accepted=False + detail.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class StartExperimentRequest:
+    """One profiling intent submitted by an operator (spec §49)."""
+
+    request: ProfilingRequest
+
+
+@dataclass(frozen=True)
+class StartExperimentResponse:
+    """Acceptance verdict; ``experiment_id`` only when accepted."""
+
+    accepted: bool
+    detail: str = ""
+    experiment_id: str = ""
+
+    def __post_init__(self) -> None:
+        if self.accepted:
+            if not self.experiment_id:
+                raise ValueError("an accepted start must carry an experiment_id")
+        else:
+            if not self.detail:
+                raise ValueError("a rejected start must carry a detail")
+            if self.experiment_id:
+                raise ValueError("a rejected start must not carry an experiment_id")
+
+
+@dataclass(frozen=True)
+class GetExperimentRequest:
+    """Status read-back for one experiment id."""
+
+    experiment_id: str
+
+    def __post_init__(self) -> None:
+        if not self.experiment_id:
+            raise ValueError("experiment_id must not be empty")
+
+
+@dataclass(frozen=True)
+class GetExperimentResponse:
+    """Lookup verdict; ``status`` only when the experiment is known (§52.2)."""
+
+    found: bool
+    status: ExperimentStatus | None = None
+
+    def __post_init__(self) -> None:
+        if self.found != (self.status is not None):
+            raise ValueError("found must be true exactly when status is present")
+
+
+@dataclass(frozen=True)
+class CancelExperimentRequest:
+    """Cancellation intent for one experiment id."""
+
+    experiment_id: str
+
+    def __post_init__(self) -> None:
+        if not self.experiment_id:
+            raise ValueError("experiment_id must not be empty")
+
+
+@dataclass(frozen=True)
+class CancelExperimentResponse:
+    """Cancellation verdict; a rejected cancel always explains itself."""
+
+    accepted: bool
+    detail: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.accepted and not self.detail:
+            raise ValueError("a rejected cancel must carry a detail")
+
+
+@dataclass(frozen=True)
+class BuildProfileSnapshotRequest:
+    """Snapshot intent; v1 snapshots the whole store (§46), no scoping."""
+
+
+@dataclass(frozen=True)
+class BuildProfileSnapshotResponse:
+    """Snapshot verdict; ``snapshot`` only when accepted."""
+
+    accepted: bool
+    detail: str = ""
+    snapshot: ProfileSnapshot | None = None
+
+    def __post_init__(self) -> None:
+        if self.accepted != (self.snapshot is not None):
+            raise ValueError("accepted must be true exactly when snapshot is present")
+        if not self.accepted and not self.detail:
+            raise ValueError("a rejected snapshot build must carry a detail")
+
+
+def start_experiment_request_to_wire(
+    request: StartExperimentRequest,
+) -> pb.StartExperimentRequest:
+    return pb.StartExperimentRequest(request_payload=encode_json(request.request))
+
+
+def start_experiment_request_from_wire(
+    wire: pb.StartExperimentRequest,
+) -> StartExperimentRequest:
+    return StartExperimentRequest(
+        request=_decode_payload(
+            ProfilingRequest, wire.request_payload, "profiling request"
+        )
+    )
+
+
+def start_experiment_response_to_wire(
+    response: StartExperimentResponse,
+) -> pb.StartExperimentResponse:
+    return pb.StartExperimentResponse(
+        accepted=response.accepted,
+        detail=response.detail,
+        experiment_id=response.experiment_id,
+    )
+
+
+def start_experiment_response_from_wire(
+    wire: pb.StartExperimentResponse,
+) -> StartExperimentResponse:
+    return StartExperimentResponse(
+        accepted=bool(wire.accepted),
+        detail=wire.detail,
+        experiment_id=wire.experiment_id,
+    )
+
+
+def get_experiment_request_to_wire(
+    request: GetExperimentRequest,
+) -> pb.GetExperimentRequest:
+    return pb.GetExperimentRequest(experiment_id=request.experiment_id)
+
+
+def get_experiment_request_from_wire(
+    wire: pb.GetExperimentRequest,
+) -> GetExperimentRequest:
+    return GetExperimentRequest(experiment_id=wire.experiment_id)
+
+
+def get_experiment_response_to_wire(
+    response: GetExperimentResponse,
+) -> pb.GetExperimentResponse:
+    return pb.GetExperimentResponse(
+        found=response.found,
+        status_payload=(
+            encode_json(response.status) if response.status is not None else ""
+        ),
+    )
+
+
+def get_experiment_response_from_wire(
+    wire: pb.GetExperimentResponse,
+) -> GetExperimentResponse:
+    return GetExperimentResponse(
+        found=bool(wire.found),
+        status=_decode_optional_payload(
+            ExperimentStatus, wire.status_payload, "experiment status"
+        ),
+    )
+
+
+def cancel_experiment_request_to_wire(
+    request: CancelExperimentRequest,
+) -> pb.CancelExperimentRequest:
+    return pb.CancelExperimentRequest(experiment_id=request.experiment_id)
+
+
+def cancel_experiment_request_from_wire(
+    wire: pb.CancelExperimentRequest,
+) -> CancelExperimentRequest:
+    return CancelExperimentRequest(experiment_id=wire.experiment_id)
+
+
+def cancel_experiment_response_to_wire(
+    response: CancelExperimentResponse,
+) -> pb.CancelExperimentResponse:
+    return pb.CancelExperimentResponse(
+        accepted=response.accepted, detail=response.detail
+    )
+
+
+def cancel_experiment_response_from_wire(
+    wire: pb.CancelExperimentResponse,
+) -> CancelExperimentResponse:
+    return CancelExperimentResponse(accepted=bool(wire.accepted), detail=wire.detail)
+
+
+def build_snapshot_request_to_wire(
+    request: BuildProfileSnapshotRequest,
+) -> pb.BuildProfileSnapshotRequest:
+    return pb.BuildProfileSnapshotRequest()
+
+
+def build_snapshot_request_from_wire(
+    wire: pb.BuildProfileSnapshotRequest,
+) -> BuildProfileSnapshotRequest:
+    return BuildProfileSnapshotRequest()
+
+
+def build_snapshot_response_to_wire(
+    response: BuildProfileSnapshotResponse,
+) -> pb.BuildProfileSnapshotResponse:
+    return pb.BuildProfileSnapshotResponse(
+        accepted=response.accepted,
+        detail=response.detail,
+        snapshot_payload=(
+            encode_json(response.snapshot) if response.snapshot is not None else ""
+        ),
+    )
+
+
+def build_snapshot_response_from_wire(
+    wire: pb.BuildProfileSnapshotResponse,
+) -> BuildProfileSnapshotResponse:
+    return BuildProfileSnapshotResponse(
+        accepted=bool(wire.accepted),
+        detail=wire.detail,
+        snapshot=_decode_optional_payload(
+            ProfileSnapshot, wire.snapshot_payload, "profile snapshot"
+        ),
     )

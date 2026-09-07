@@ -25,8 +25,17 @@ MASTER_SIDE_MODULES = (
     "edgeshard.profiling.strategy.base",
     "edgeshard.profiling.strategy.default",
     "edgeshard.control.master.profiling_controller",
+    "edgeshard.control.master.profiling_admin",
+    "edgeshard.protocol.profiling.grpc_server",
+    "edgeshard.protocol.profiling.grpc_client",
+    "edgeshard.cli",
 )
-"""Every module the Master loads to plan and orchestrate profiling (§40)."""
+"""Every module the Master side (and the operator CLI) loads for profiling.
+
+The CLI is in the list because ``profile model inspect`` is the *only*
+command allowed to touch torch — lazily, inside the command, behind the
+inference extra (§49); importing the CLI itself must work without it.
+"""
 
 _SCRIPT_HEADER = """\
 import sys

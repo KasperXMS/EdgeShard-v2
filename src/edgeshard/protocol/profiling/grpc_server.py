@@ -141,3 +141,110 @@ async def start_profiling_server(
         raise RuntimeError(f"could not bind {host}:{port}")
     await server.start()
     return server, bound_port
+
+
+class ProfilingAdminHandler(Protocol):
+    """Master-side behavior the admin servicer delegates to (spec §49).
+
+    The handler expands operator *intent* into experiments through the
+    strategy layer and reads back lifecycle/snapshots; the CLI never drives
+    domain logic itself.
+    """
+
+    async def start_experiment(
+        self, request: mapper.StartExperimentRequest
+    ) -> mapper.StartExperimentResponse: ...
+
+    async def get_experiment(
+        self, request: mapper.GetExperimentRequest
+    ) -> mapper.GetExperimentResponse: ...
+
+    async def cancel_experiment(
+        self, request: mapper.CancelExperimentRequest
+    ) -> mapper.CancelExperimentResponse: ...
+
+    async def build_profile_snapshot(
+        self, request: mapper.BuildProfileSnapshotRequest
+    ) -> mapper.BuildProfileSnapshotResponse: ...
+
+
+class ProfilingAdminServicer(pb_grpc.ProfilingAdminServiceServicer):
+    """ProfilingAdminService implementation over a ProfilingAdminHandler."""
+
+    def __init__(self, handler: ProfilingAdminHandler) -> None:
+        self._handler = handler
+
+    async def StartExperiment(
+        self,
+        request: pb.StartExperimentRequest,
+        context: grpc.aio.ServicerContext,
+    ) -> pb.StartExperimentResponse:
+        try:
+            domain_request = mapper.start_experiment_request_from_wire(request)
+            response = await self._handler.start_experiment(domain_request)
+            return mapper.start_experiment_response_to_wire(response)
+        except (mapper.ProfilingProtocolError, ValueError) as exc:
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(exc))
+            raise  # unreachable: grpc.aio abort raises AbortError
+
+    async def GetExperiment(
+        self,
+        request: pb.GetExperimentRequest,
+        context: grpc.aio.ServicerContext,
+    ) -> pb.GetExperimentResponse:
+        try:
+            domain_request = mapper.get_experiment_request_from_wire(request)
+            response = await self._handler.get_experiment(domain_request)
+            return mapper.get_experiment_response_to_wire(response)
+        except (mapper.ProfilingProtocolError, ValueError) as exc:
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(exc))
+            raise  # unreachable: grpc.aio abort raises AbortError
+
+    async def CancelExperiment(
+        self,
+        request: pb.CancelExperimentRequest,
+        context: grpc.aio.ServicerContext,
+    ) -> pb.CancelExperimentResponse:
+        try:
+            domain_request = mapper.cancel_experiment_request_from_wire(request)
+            response = await self._handler.cancel_experiment(domain_request)
+            return mapper.cancel_experiment_response_to_wire(response)
+        except (mapper.ProfilingProtocolError, ValueError) as exc:
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(exc))
+            raise  # unreachable: grpc.aio abort raises AbortError
+
+    async def BuildProfileSnapshot(
+        self,
+        request: pb.BuildProfileSnapshotRequest,
+        context: grpc.aio.ServicerContext,
+    ) -> pb.BuildProfileSnapshotResponse:
+        try:
+            domain_request = mapper.build_snapshot_request_from_wire(request)
+            response = await self._handler.build_profile_snapshot(domain_request)
+            return mapper.build_snapshot_response_to_wire(response)
+        except (mapper.ProfilingProtocolError, ValueError) as exc:
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(exc))
+            raise  # unreachable: grpc.aio abort raises AbortError
+
+
+async def start_admin_server(
+    handler: ProfilingAdminHandler,
+    *,
+    host: str,
+    port: int,
+) -> tuple[grpc.aio.Server, int]:
+    """Start the Master's profiling-admin gRPC server (spec §49).
+
+    Same shape as :func:`start_profiling_server`: ``port=0`` binds an
+    OS-chosen port and reports it back so ``master serve`` can print the
+    endpoint and tests can co-locate Master, Workers, and CLI on one host.
+    """
+    server = grpc.aio.server(options=profiling_channel_options())
+    pb_grpc.add_ProfilingAdminServiceServicer_to_server(  # type: ignore[no-untyped-call]
+        ProfilingAdminServicer(handler), server
+    )
+    bound_port: int = server.add_insecure_port(f"{host}:{port}")
+    if bound_port == 0:
+        raise RuntimeError(f"could not bind {host}:{port}")
+    await server.start()
+    return server, bound_port

@@ -50,12 +50,14 @@ class PayloadCodecError(ValueError):
 
 def encode_payload(value: object) -> Any:
     """Domain value as JSON-compatible data (tagged objects, ISO datetimes)."""
+    if isinstance(value, StrEnum):
+        # Before the str check: members ARE strings, and consumers of the
+        # payload (json, yaml) must see plain values, never enum subclasses.
+        return value.value
     if value is None or isinstance(value, (bool, int, str)):
         return value
     if isinstance(value, float):
         return value  # NaN/inf are rejected by encode_json's allow_nan=False
-    if isinstance(value, StrEnum):
-        return value.value
     if isinstance(value, datetime):
         return value.isoformat()
     if dataclasses.is_dataclass(value) and not isinstance(value, type):

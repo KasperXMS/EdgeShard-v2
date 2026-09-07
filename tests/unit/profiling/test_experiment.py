@@ -6,16 +6,20 @@ from datetime import UTC, datetime
 
 import pytest
 
+from edgeshard.profiling.codec import decode_json, encode_json
 from edgeshard.profiling.domain.experiment import (
     CaseOutcome,
     CaseState,
+    CaseStatus,
     ExperimentState,
+    ExperimentStatus,
     ModelCaseSpec,
     NetworkCaseSpec,
     ProfilingCase,
     ProfilingErrorCategory,
     ProfilingExperiment,
     ProfilingFailure,
+    ProfilingRequest,
     profiling_case_id,
     profiling_experiment_id,
 )
@@ -31,10 +35,12 @@ from edgeshard.profiling.domain.model import ModelReference
 from edgeshard.profiling.domain.network import (
     NetworkDirection,
     NetworkMeasurementRegime,
+    NetworkPair,
     NetworkPathClass,
     NetworkTransport,
     ProbeKind,
 )
+from edgeshard.profiling.domain.session import ProfilingSessionKind
 from edgeshard.profiling.domain.signature import (
     GemmSignature,
     InferencePhase,
@@ -406,3 +412,210 @@ def test_experiment_for_cases_dedupes_and_precomputes_id() -> None:
     )
     assert experiment.requested_by == "operator"
     assert experiment.created_at == created
+
+
+# ---------------------------------------------------------------------------
+# ProfilingRequest (§49): operator intent, validated per kind
+# ---------------------------------------------------------------------------
+
+MODEL_REF = ModelReference("tiny/llama", "local")
+FAILURE = ProfilingFailure(
+    category=ProfilingErrorCategory.DEVICE_BUSY,
+    message="device busy",
+    details=(("device_id", "gpu-0"),),
+)
+
+
+def _model_request(**overrides: object) -> ProfilingRequest:
+    kwargs: dict = {
+        "kind": ProfilingSessionKind.MODEL,
+        "model": MODEL_REF,
+        "dtype": "fp32",
+        "device_ids": ("gpu-0",),
+    }
+    kwargs.update(overrides)
+    return ProfilingRequest(**kwargs)
+
+
+def test_model_request_defaults() -> None:
+    request = _model_request()
+    assert request.worker_ids == ()
+    assert request.missing_only is True
+    assert request.network_probe is None
+    assert request.bandwidth_path_classes == ()
+    assert request.extra_bandwidth_pairs == ()
+    assert request.requested_by is None
+
+
+def test_operator_request_needs_the_same_model_context() -> None:
+    request = _model_request(kind=ProfilingSessionKind.OPERATOR)
+    assert request.kind is ProfilingSessionKind.OPERATOR
+    with pytest.raises(ValueError, match="model reference"):
+        _model_request(kind=ProfilingSessionKind.OPERATOR, model=None)
+    with pytest.raises(ValueError, match="dtype"):
+        _model_request(kind=ProfilingSessionKind.OPERATOR, dtype=None)
+    with pytest.raises(ValueError, match="device_id"):
+        _model_request(kind=ProfilingSessionKind.OPERATOR, device_ids=())
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"model": None},
+        {"dtype": None},
+        {"device_ids": ()},
+    ],
+)
+def test_model_request_requires_its_context(overrides: dict) -> None:
+    with pytest.raises(ValueError):
+        _model_request(**overrides)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    [
+        ({"network_probe": ProbeKind.RTT}, "network probe"),
+        (
+            {"bandwidth_path_classes": (NetworkPathClass.WIRED_LAN,)},
+            "bandwidth knobs",
+        ),
+        (
+            {"extra_bandwidth_pairs": (NetworkPair("w-a", "w-b"),)},
+            "bandwidth knobs",
+        ),
+    ],
+)
+def test_model_request_forbids_network_knobs(
+    overrides: dict, match: str
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        _model_request(**overrides)
+
+
+def test_network_request_shape() -> None:
+    request = ProfilingRequest(
+        kind=ProfilingSessionKind.NETWORK,
+        worker_ids=("w-a", "w-b"),
+        network_probe=ProbeKind.BANDWIDTH,
+        bandwidth_path_classes=(NetworkPathClass.WIRED_LAN,),
+        extra_bandwidth_pairs=(NetworkPair("w-a", "w-b"),),
+        requested_by="operator",
+    )
+    assert request.network_probe is ProbeKind.BANDWIDTH
+    assert request.requested_by == "operator"
+
+
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    [
+        ({"model": MODEL_REF}, "model reference"),
+        ({"dtype": "fp32"}, "dtype"),
+        ({"device_ids": ("gpu-0",)}, "device_ids"),
+        ({"missing_only": False}, "missing_only"),
+    ],
+)
+def test_network_request_forbids_model_knobs(
+    overrides: dict, match: str
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        ProfilingRequest(kind=ProfilingSessionKind.NETWORK, **overrides)
+
+
+def test_request_rejects_empty_and_duplicate_ids() -> None:
+    with pytest.raises(ValueError, match="empty"):
+        _model_request(worker_ids=("w-a", ""))
+    with pytest.raises(ValueError, match="duplicate worker_id"):
+        _model_request(worker_ids=("w-a", "w-a"))
+    with pytest.raises(ValueError, match="empty"):
+        _model_request(device_ids=("gpu-0", ""))
+    with pytest.raises(ValueError, match="duplicate device_id"):
+        _model_request(device_ids=("gpu-0", "gpu-0"))
+    with pytest.raises(ValueError, match="requested_by"):
+        _model_request(requested_by="")
+
+
+def test_profiling_request_codec_round_trip() -> None:
+    request = ProfilingRequest(
+        kind=ProfilingSessionKind.NETWORK,
+        worker_ids=("w-a", "w-b"),
+        network_probe=ProbeKind.RTT,
+        bandwidth_path_classes=(NetworkPathClass.WIFI_LAN,),
+        extra_bandwidth_pairs=(NetworkPair("w-a", "w-b", "nic-a", "nic-b"),),
+        requested_by="operator",
+    )
+    assert decode_json(ProfilingRequest, encode_json(request)) == request
+    model = _model_request(worker_ids=("w-1",), requested_by="ops")
+    assert decode_json(ProfilingRequest, encode_json(model)) == model
+
+
+# ---------------------------------------------------------------------------
+# CaseStatus / ExperimentStatus (§49 read-back)
+# ---------------------------------------------------------------------------
+
+
+def _experiment(case_ids: tuple[str, ...] = ("c-1", "c-2")) -> ProfilingExperiment:
+    return ProfilingExperiment.for_cases(
+        strategy_id="default", case_ids=case_ids, created_at=NOW
+    )
+
+
+def test_case_status_states() -> None:
+    assert CaseStatus("c-1", "w-1", CaseState.PENDING).failure is None
+    failed = CaseStatus("c-1", "w-1", CaseState.FAILED, failure=FAILURE)
+    assert failed.failure is FAILURE
+    assert CaseStatus("c-1", "w-1", CaseState.CANCELLED, failure=FAILURE)
+    with pytest.raises(ValueError, match="only valid for failed/cancelled"):
+        CaseStatus("c-1", "w-1", CaseState.COMPLETED, failure=FAILURE)
+    with pytest.raises(ValueError, match="case_id"):
+        CaseStatus("", "w-1", CaseState.PENDING)
+    with pytest.raises(ValueError, match="worker_id"):
+        CaseStatus("c-1", "", CaseState.PENDING)
+
+
+def test_experiment_status_requires_exact_case_coverage() -> None:
+    experiment = _experiment()
+    status = ExperimentStatus(
+        experiment=experiment,
+        state=ExperimentState.RUNNING,
+        cases=(
+            CaseStatus("c-1", "w-1", CaseState.RUNNING),
+            CaseStatus("c-2", "w-2", CaseState.PENDING),
+        ),
+    )
+    assert len(status.cases) == 2
+    with pytest.raises(ValueError, match="lack status"):
+        ExperimentStatus(
+            experiment=experiment,
+            state=ExperimentState.RUNNING,
+            cases=(CaseStatus("c-1", "w-1", CaseState.RUNNING),),
+        )
+    with pytest.raises(ValueError, match="outside the experiment"):
+        ExperimentStatus(
+            experiment=experiment,
+            state=ExperimentState.RUNNING,
+            cases=(
+                CaseStatus("c-1", "w-1", CaseState.RUNNING),
+                CaseStatus("c-3", "w-1", CaseState.PENDING),
+            ),
+        )
+    with pytest.raises(ValueError, match="duplicate case status"):
+        ExperimentStatus(
+            experiment=experiment,
+            state=ExperimentState.RUNNING,
+            cases=(
+                CaseStatus("c-1", "w-1", CaseState.RUNNING),
+                CaseStatus("c-1", "w-1", CaseState.PENDING),
+            ),
+        )
+
+
+def test_experiment_status_codec_round_trip() -> None:
+    status = ExperimentStatus(
+        experiment=_experiment(),
+        state=ExperimentState.PARTIALLY_COMPLETED,
+        cases=(
+            CaseStatus("c-1", "w-1", CaseState.COMPLETED),
+            CaseStatus("c-2", "w-2", CaseState.FAILED, failure=FAILURE),
+        ),
+    )
+    assert decode_json(ExperimentStatus, encode_json(status)) == status

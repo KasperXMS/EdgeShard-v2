@@ -44,19 +44,32 @@ from edgeshard.profiling.domain.measurement import (
     TimeUnit,
     summarize_samples,
 )
-from edgeshard.profiling.domain.model import ModelReference
+from edgeshard.profiling.domain.model import (
+    ModelCharacterization,
+    ModelReference,
+    ModelStage,
+    StageKind,
+)
 from edgeshard.profiling.domain.network import ProbeKind
 from edgeshard.profiling.domain.session import (
+    LayerEntry,
+    ModelSessionFacts,
+    ModuleEntry,
     ProfilingSessionKind,
+    ProfilingSessionRequest,
     profiling_session_id,
 )
 from edgeshard.profiling.domain.signature import (
     GemmSignature,
+    ModuleKind,
+    ModuleSignature,
     OperatorKind,
     OperatorSignature,
     ProfilingGranularity,
     TransformerLayerSignature,
+    operator_signature_id,
 )
+from edgeshard.profiling.network.classifier import classify_pairs, endpoint_profiles
 from edgeshard.profiling.store.sqlite import SqliteProfileStore
 from edgeshard.protocol.control.mapper import (
     CONTROL_PROTOCOL_VERSION,
@@ -1156,3 +1169,365 @@ def test_session_request_rejects_model_group_without_model(tmp_path: Path) -> No
     case = ProfilingCase(case_id="c-1", worker_id=W1, spec=broken)
     with pytest.raises(ValueError, match="model reference and dtype"):
         _session_request([case])
+
+
+# ---------------------------------------------------------------------------
+# P2G.8: admin-plane support API (§46-§49)
+# ---------------------------------------------------------------------------
+
+MODULE_SIG_MLP = ModuleSignature(
+    kind=ModuleKind.MLP,
+    architecture_family="llama",
+    structural_parameters=(("hidden_size", 32), ("intermediate_size", 64)),
+    dtype="fp32",
+    quantization=None,
+)
+CHARACTERIZATION = ModelCharacterization(
+    model=MODEL,
+    architecture_family="llama",
+    num_layers=2,
+    hidden_size=32,
+    intermediate_size=64,
+    vocab_size=64,
+    num_attention_heads=4,
+    num_kv_heads=2,
+    head_dim=8,
+    dtype="fp32",
+    quantization=None,
+    tied_word_embeddings=False,
+    stages=(
+        ModelStage(kind=StageKind.EMBEDDING),
+        ModelStage(kind=StageKind.TRANSFORMER_LAYER_GROUP, layer_count=2),
+        ModelStage(kind=StageKind.LM_HEAD),
+    ),
+)
+SESSION_FACTS = ModelSessionFacts(
+    characterization=CHARACTERIZATION,
+    layer_entries=(
+        LayerEntry(0, "model.layers.0", LAYER_SIG),
+        LayerEntry(1, "model.layers.1", LAYER_SIG),
+    ),
+    module_entries=(
+        ModuleEntry("mlp", "model.layers.0.mlp", ModuleKind.MLP, 0, MODULE_SIG_MLP),
+    ),
+    operator_signatures=(OPERATOR_SIG,),
+)
+INSPECTION_REQUEST = ProfilingSessionRequest(
+    kind=ProfilingSessionKind.MODEL,
+    device_ids=("gpu-0",),
+    model=MODEL,
+    dtype="fp32",
+)
+
+
+def transport_for(rig: Rig, endpoint: str = ENDPOINT_1) -> FakeTransport:
+    """The endpoint's fake transport, pre-created so it can be scripted.
+
+    The rig's factory ``setdefault``s by endpoint, so scripting before the
+    first dispatch hands the controller this exact instance.
+    """
+    return rig.transports.setdefault(endpoint, FakeTransport(endpoint))
+
+
+class TestProfilingWorkerIds:
+    async def test_empty_registry(self, tmp_path: Path) -> None:
+        rig = make_rig(tmp_path)
+        assert rig.controller.profiling_worker_ids() == ()
+
+    async def test_only_workers_with_profiling_endpoints(self, tmp_path: Path) -> None:
+        rig = make_rig(tmp_path)
+        await register_worker(rig, W2, profiling_endpoint=ENDPOINT_2)
+        await register_worker(rig, W1, profiling_endpoint=ENDPOINT_1)
+        await register_worker(rig, "w-plain", profiling_endpoint=None)
+        assert rig.controller.profiling_worker_ids() == (W1, W2)
+
+
+class TestClusterNetworkFactsAndReuse:
+    async def test_cluster_network_facts_cover_registered_workers(
+        self, tmp_path: Path
+    ) -> None:
+        rig = make_rig(tmp_path)
+        await register_worker(rig, W1)
+        await register_worker(rig, W2, profiling_endpoint=ENDPOINT_2)
+        facts = rig.controller.cluster_network_facts()
+        assert set(facts) == {W1, W2}
+        assert facts[W1].worker_id == W1
+
+    async def test_measured_ids_empty_then_growing(self, tmp_path: Path) -> None:
+        rig = make_rig(tmp_path)
+        await register_worker(rig, W1)
+        assert rig.controller.measured_operator_signature_ids() == set()
+
+        case = operator_case()
+        experiment = rig.controller.create_experiment(
+            strategy_id="default-v1", cases=[case]
+        )
+        await rig.controller.run_experiment(experiment.experiment_id)
+
+        assert rig.controller.measured_operator_signature_ids() == {
+            operator_signature_id(OPERATOR_SIG)
+        }
+
+    async def test_record_model_facts_lands_in_the_snapshot(
+        self, tmp_path: Path
+    ) -> None:
+        rig = make_rig(tmp_path)
+        rig.controller.record_model_facts(SESSION_FACTS)
+        # Registries are content-addressed: recording twice is a replay (§9).
+        rig.controller.record_model_facts(SESSION_FACTS)
+        snapshot = rig.store.build_snapshot("s-1")
+        assert snapshot.model_characterizations == (CHARACTERIZATION,)
+
+    async def test_record_network_characterization_is_idempotent(
+        self, tmp_path: Path
+    ) -> None:
+        rig = make_rig(tmp_path)
+        await register_worker(rig, W1)
+        await register_worker(rig, W2, profiling_endpoint=ENDPOINT_2)
+        facts = list(rig.controller.cluster_network_facts().values())
+        profiles = endpoint_profiles(facts)
+        classified = classify_pairs(facts)
+        assert profiles and classified
+        rig.controller.record_network_characterization(profiles, classified)
+        rig.controller.record_network_characterization(profiles, classified)
+
+
+class TestExperimentStatus:
+    async def test_unknown_experiment_is_none(self, tmp_path: Path) -> None:
+        rig = make_rig(tmp_path)
+        assert rig.controller.experiment_status("nope") is None
+
+    async def test_pending_status_covers_every_case(self, tmp_path: Path) -> None:
+        rig = make_rig(tmp_path)
+        await register_worker(rig, W1)
+        cases = [operator_case(), layer_case(layer_index=0)]
+        experiment = rig.controller.create_experiment(
+            strategy_id="default-v1", cases=cases
+        )
+
+        status = rig.controller.experiment_status(experiment.experiment_id)
+
+        assert status is not None
+        assert status.experiment == experiment
+        assert status.state is ExperimentState.PENDING
+        assert {case.case_id for case in status.cases} == set(experiment.case_ids)
+        assert all(case.state is CaseState.PENDING for case in status.cases)
+        assert all(case.worker_id == W1 for case in status.cases)
+        # The store keeps states, not failures (§43): no failure objects here.
+        assert all(case.failure is None for case in status.cases)
+
+    async def test_status_tracks_run_states(self, tmp_path: Path) -> None:
+        rig = make_rig(tmp_path)
+        await register_worker(rig, W1)
+        ok = operator_case()
+        bad = operator_case(signature=OPERATOR_SIG_B)
+        transport_for(rig).script_run(
+            bad.case_id,
+            RunProfilingCaseResponse(
+                accepted=True,
+                outcome=CaseOutcome.from_failure(
+                    ProfilingFailure(
+                        category=ProfilingErrorCategory.BENCHMARK_FAILED,
+                        message="boom",
+                    )
+                ),
+            ),
+        )
+        experiment = rig.controller.create_experiment(
+            strategy_id="default-v1", cases=[ok, bad]
+        )
+        await rig.controller.run_experiment(experiment.experiment_id)
+
+        status = rig.controller.experiment_status(experiment.experiment_id)
+
+        assert status is not None
+        assert status.state is ExperimentState.PARTIALLY_COMPLETED
+        by_id = {case.case_id: case for case in status.cases}
+        assert by_id[ok.case_id].state is CaseState.COMPLETED
+        assert by_id[bad.case_id].state is CaseState.FAILED
+
+
+class TestInspectModel:
+    async def test_happy_path_returns_facts_and_closes(
+        self, tmp_path: Path
+    ) -> None:
+        rig = make_rig(tmp_path)
+        worker_id, instance_id, session_id = await register_worker(rig, W1)
+        transport = transport_for(rig)
+        transport.prepare_response = PrepareProfilingSessionResponse(
+            accepted=True, session_facts=SESSION_FACTS
+        )
+
+        facts = await rig.controller.inspect_model(
+            worker_id=worker_id, request=INSPECTION_REQUEST
+        )
+
+        assert facts is SESSION_FACTS
+        (prepare,) = transport.prepare_requests
+        assert prepare.worker_id == worker_id
+        assert prepare.instance_id == instance_id
+        assert prepare.registration_session_id == session_id
+        assert prepare.session_request == INSPECTION_REQUEST
+        assert prepare.network_facts == ()
+        # A read, not a lease: the session is closed and the channel shut.
+        assert [
+            close.profiling_session_id for close in transport.close_requests
+        ] == [prepare.profiling_session_id]
+        assert transport.closed
+
+    async def test_repeated_inspections_never_reuse_a_closed_session_id(
+        self, tmp_path: Path
+    ) -> None:
+        # §38: closed ids never come back — each inspection gets a fresh one.
+        rig = make_rig(tmp_path)
+        await register_worker(rig, W1)
+        transport = transport_for(rig)
+        transport.prepare_response = PrepareProfilingSessionResponse(
+            accepted=True, session_facts=SESSION_FACTS
+        )
+
+        first = await rig.controller.inspect_model(
+            worker_id=W1, request=INSPECTION_REQUEST
+        )
+        second = await rig.controller.inspect_model(
+            worker_id=W1, request=INSPECTION_REQUEST
+        )
+
+        assert first is SESSION_FACTS and second is SESSION_FACTS
+        ids = [
+            request.profiling_session_id for request in transport.prepare_requests
+        ]
+        assert len(ids) == 2
+        assert ids[0] != ids[1]
+
+    async def test_reregistration_starts_a_new_session_epoch(
+        self, tmp_path: Path
+    ) -> None:
+        rig = make_rig(tmp_path)
+        await register_worker(rig, W1)
+        transport = transport_for(rig)
+        transport.prepare_response = PrepareProfilingSessionResponse(
+            accepted=True, session_facts=SESSION_FACTS
+        )
+        await rig.controller.inspect_model(
+            worker_id=W1, request=INSPECTION_REQUEST
+        )
+
+        # A restarted Master (fresh controller) after a fresh registration
+        # must not re-present the old epoch's session id.
+        fresh = ProfilingController(
+            service=rig.service,
+            store=rig.store,
+            transport_factory=lambda endpoint: rig.transports.setdefault(
+                endpoint, FakeTransport(endpoint)
+            ),
+            clock=rig.clock.wall,
+        )
+        await register_worker(rig, W1)
+        await fresh.inspect_model(worker_id=W1, request=INSPECTION_REQUEST)
+
+        ids = [
+            request.profiling_session_id for request in transport.prepare_requests
+        ]
+        assert ids[0] != ids[1]
+
+    async def test_unregistered_worker_is_typed_unreachable(
+        self, tmp_path: Path
+    ) -> None:
+        rig = make_rig(tmp_path)
+        failure = await rig.controller.inspect_model(
+            worker_id="ghost", request=INSPECTION_REQUEST
+        )
+        assert isinstance(failure, ProfilingFailure)
+        assert failure.category is ProfilingErrorCategory.NETWORK_UNREACHABLE
+        assert "not registered" in failure.message
+
+    async def test_worker_without_profiling_plane_is_typed_unreachable(
+        self, tmp_path: Path
+    ) -> None:
+        rig = make_rig(tmp_path)
+        await register_worker(rig, W1, profiling_endpoint=None)
+        failure = await rig.controller.inspect_model(
+            worker_id=W1, request=INSPECTION_REQUEST
+        )
+        assert isinstance(failure, ProfilingFailure)
+        assert failure.category is ProfilingErrorCategory.NETWORK_UNREACHABLE
+        assert "profiling" in failure.message
+
+    async def test_domain_preparation_failure_survives(self, tmp_path: Path) -> None:
+        rig = make_rig(tmp_path)
+        await register_worker(rig, W1)
+        typed = ProfilingFailure(
+            category=ProfilingErrorCategory.UNSUPPORTED_MODEL,
+            message="no READY snapshot",
+        )
+        transport_for(rig).prepare_response = PrepareProfilingSessionResponse(
+            accepted=False, detail="model unavailable", failure=typed
+        )
+
+        failure = await rig.controller.inspect_model(
+            worker_id=W1, request=INSPECTION_REQUEST
+        )
+
+        assert failure is typed
+        assert transport_for(rig).closed
+
+    async def test_lease_refusal_maps_to_typed_failure(self, tmp_path: Path) -> None:
+        rig = make_rig(tmp_path)
+        await register_worker(rig, W1)
+        transport_for(rig).prepare_response = PrepareProfilingSessionResponse(
+            accepted=False,
+            detail="device gpu-0 is leased",
+            reason=ProfilingRejection.DEVICE_BUSY,
+        )
+
+        failure = await rig.controller.inspect_model(
+            worker_id=W1, request=INSPECTION_REQUEST
+        )
+
+        assert isinstance(failure, ProfilingFailure)
+        assert failure.category is ProfilingErrorCategory.DEVICE_BUSY
+
+    async def test_transport_timeout_is_typed_timeout(self, tmp_path: Path) -> None:
+        rig = make_rig(tmp_path)
+        await register_worker(rig, W1)
+        transport_for(rig).prepare_error = FakeAioRpcError(
+            grpc.StatusCode.DEADLINE_EXCEEDED
+        )
+
+        failure = await rig.controller.inspect_model(
+            worker_id=W1, request=INSPECTION_REQUEST
+        )
+
+        assert isinstance(failure, ProfilingFailure)
+        assert failure.category is ProfilingErrorCategory.TIMEOUT
+        # Cleanup still ran on the failure path.
+        assert transport_for(rig).close_requests
+        assert transport_for(rig).closed
+
+    async def test_accepted_prepare_without_facts_is_internal_error(
+        self, tmp_path: Path
+    ) -> None:
+        rig = make_rig(tmp_path)
+        await register_worker(rig, W1)
+        transport_for(rig).prepare_response = PrepareProfilingSessionResponse(
+            accepted=True
+        )
+
+        failure = await rig.controller.inspect_model(
+            worker_id=W1, request=INSPECTION_REQUEST
+        )
+
+        assert isinstance(failure, ProfilingFailure)
+        assert failure.category is ProfilingErrorCategory.INTERNAL_ERROR
+        assert "no session facts" in failure.message
+
+    async def test_non_model_request_fails_loudly(self, tmp_path: Path) -> None:
+        rig = make_rig(tmp_path)
+        with pytest.raises(ValueError, match="MODEL session request"):
+            await rig.controller.inspect_model(
+                worker_id=W1,
+                request=ProfilingSessionRequest(
+                    kind=ProfilingSessionKind.NETWORK
+                ),
+            )
