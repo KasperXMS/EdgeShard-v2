@@ -372,6 +372,34 @@ class TestCaseBuilders:
         }
         assert explicit in pairs
 
+    def test_bandwidth_path_class_filter(self) -> None:
+        """§49 ``--path-class`` knob: restricts the class-driven selection."""
+        workers = [
+            _worker("w1", "192.168.1.10"),
+            _worker("w2", "192.168.1.20"),
+            _worker("w3", "192.168.1.30", name="wlan0"),
+        ]
+        cases = bandwidth_cases(workers, path_classes=[NetworkPathClass.WIFI_LAN])
+        assert cases
+        assert {case.spec.path_class for case in cases} == {NetworkPathClass.WIFI_LAN}
+
+    def test_bandwidth_path_class_filter_keeps_explicit_pairs(self) -> None:
+        """The explicit-pair knob wins over the class filter (§34)."""
+        workers = [
+            _worker("w1", "192.168.1.10"),
+            _worker("w2", "192.168.1.20"),
+        ]
+        explicit = NetworkPair(source_worker_id="w2", destination_worker_id="w1")
+        cases = bandwidth_cases(
+            workers,
+            extra_pairs=(explicit,),
+            path_classes=[NetworkPathClass.OVERLAY],
+            include_reverse=False,
+        )
+        assert len(cases) == 1
+        directed = (cases[0].spec.source_worker_id, cases[0].spec.destination_worker_id)
+        assert directed == ("w2", "w1")
+
     def test_bandwidth_unknown_worker_in_extra_pairs_rejected(self) -> None:
         workers = [_worker("w1", "10.0.0.1"), _worker("w2", "10.0.0.2")]
         with pytest.raises(ValueError, match="unknown worker"):

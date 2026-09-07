@@ -13,24 +13,41 @@ inventions:
   arguments) becomes the explicit ``unknown`` — never a guessed dtype
   (§52.2). The profiler fallback is structural discovery (§18.2), so an
   ``unknown`` label honestly marks reduced fidelity.
+
+The torch import is *deferred* into the two translation functions that
+need real ``torch.dtype`` objects: the label vocabulary itself is pure
+data, so torch-free consumers (the §36 payload formula, the Master-side
+strategy) can import this module in a control-plane-only deployment
+where the ``inference`` extra is not installed.
 """
 
 from __future__ import annotations
 
-import torch
+from functools import cache
+from typing import TYPE_CHECKING
 
-_TORCH_LABELS: dict[torch.dtype, str] = {
-    torch.bfloat16: "bf16",
-    torch.float16: "fp16",
-    torch.float32: "fp32",
-    torch.float64: "fp64",
-    torch.int8: "int8",
-    torch.int16: "int16",
-    torch.int32: "int32",
-    torch.int64: "int64",
-    torch.uint8: "uint8",
-    torch.bool: "bool",
-}
+if TYPE_CHECKING:
+    import torch
+
+
+@cache
+def _torch_labels() -> dict[torch.dtype, str]:
+    """Torch dtype ↔ label table, built on first torch-facing use."""
+    import torch
+
+    return {
+        torch.bfloat16: "bf16",
+        torch.float16: "fp16",
+        torch.float32: "fp32",
+        torch.float64: "fp64",
+        torch.int8: "int8",
+        torch.int16: "int16",
+        torch.int32: "int32",
+        torch.int64: "int64",
+        torch.uint8: "uint8",
+        torch.bool: "bool",
+    }
+
 
 _KINETO_LABELS: dict[str, str] = {
     "float": "fp32",
@@ -52,7 +69,7 @@ UNKNOWN_DTYPE = "unknown"
 
 def dtype_label(dtype: torch.dtype) -> str:
     """Project label for a torch dtype; unlisted dtypes keep their name."""
-    label = _TORCH_LABELS.get(dtype)
+    label = _torch_labels().get(dtype)
     if label is not None:
         return label
     return str(dtype).removeprefix("torch.")
@@ -73,7 +90,7 @@ def torch_dtype(label: str) -> torch.dtype:
     (P2D). Unknown labels raise ``ValueError`` — an input dtype is never
     guessed (§52.2).
     """
-    for dtype, known in _TORCH_LABELS.items():
+    for dtype, known in _torch_labels().items():
         if known == label:
             return dtype
     raise ValueError(f"unknown dtype label {label!r}")

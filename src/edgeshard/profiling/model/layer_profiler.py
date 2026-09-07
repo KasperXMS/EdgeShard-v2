@@ -41,6 +41,12 @@ from edgeshard.profiling.model.execution import (
     measurement_record_from_result,
     require_model_spec,
 )
+from edgeshard.profiling.model.planning import (
+    DEFAULT_PREFILL_SEQUENCE_LENGTHS as DEFAULT_PREFILL_SEQUENCE_LENGTHS,
+)
+from edgeshard.profiling.model.planning import (
+    representative_layer_positions as representative_layer_positions,
+)
 
 logger = logging.getLogger("profiling.model.layer_profiler")
 
@@ -49,9 +55,6 @@ STANDARD_DECODER_LAYER_TYPE = "decoder"
 
 DEFAULT_VARIATION_THRESHOLD = 0.05
 """Default coefficient-of-variation threshold of the §22 sanity check."""
-
-DEFAULT_PREFILL_SEQUENCE_LENGTHS = (128, 512, 2048)
-"""Default v1 prefill workload dimensions (§21); batch_size = 1."""
 
 
 def transformer_layer_signature(
@@ -193,32 +196,6 @@ class LayerPositionCheck:
     max_relative_deviation: float
     variation_threshold: float
     homogeneous: bool
-
-
-def representative_layer_positions(
-    num_layers: int,
-) -> tuple[tuple[LayerPosition, int], ...]:
-    """Positions to sample for the §22 check: first, middle, last.
-
-    For a 32-layer stack this yields indices 0/16/31 (the spec example
-    counts 1-based). Stacks smaller than three layers collapse onto the
-    positions that exist; duplicates are removed, order preserved.
-    """
-    if num_layers <= 0:
-        raise ValueError(f"num_layers must be positive, got {num_layers}")
-    candidates = [(LayerPosition.EARLY, 0)]
-    if num_layers >= 3:
-        candidates.append((LayerPosition.MIDDLE, num_layers // 2))
-    if num_layers >= 2:
-        candidates.append((LayerPosition.LATE, num_layers - 1))
-    seen: set[int] = set()
-    positions: list[tuple[LayerPosition, int]] = []
-    for position, index in candidates:
-        if index in seen:
-            continue
-        seen.add(index)
-        positions.append((position, index))
-    return tuple(positions)
 
 
 def layer_position_check(

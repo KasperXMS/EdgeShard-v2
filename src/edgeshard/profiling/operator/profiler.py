@@ -13,7 +13,11 @@ the §28 algorithm: deduplicated signatures are split against the ids that
 already have compatible measurements (the reuse query side is a protocol
 — the P2G ``ProfileStore`` answers it after filtering by performance
 class/environment), and only the missing signatures are benchmarked.
-Adding a new model therefore adds only its new shapes.
+Adding a new model therefore adds only its new shapes. The pure planning
+helpers (``operator_case_spec``, ``plan_incremental_profiling``,
+``parameters_dtype``) live in the torch-free
+:mod:`edgeshard.profiling.operator.planning` module — shared with the
+Master-side strategy (§47) — and are re-exported here for the Worker API.
 
 ``verification_suite`` + ``verify_performance_class`` implement §29: a
 very small suite (one representative GEMM, one attention case, one
@@ -38,21 +42,17 @@ import torch
 from edgeshard.profiling.benchmark.harness import BenchmarkHarness, InstrumentationBundle
 from edgeshard.profiling.benchmark.sampling import DurationSamplingPolicy, SamplingPolicy
 from edgeshard.profiling.domain.experiment import (
-    ModelCaseSpec,
     ProfilingCase,
     ProfilingErrorCategory,
 )
 from edgeshard.profiling.domain.measurement import MeasurementRecord, TimeUnit
 from edgeshard.profiling.domain.signature import (
     AttentionSignature,
-    CustomOperatorParameters,
     GemmSignature,
     InferencePhase,
-    KvCopySignature,
     NormSignature,
     NormVariant,
     OperatorKind,
-    OperatorParameters,
     OperatorSignature,
     ProfilingGranularity,
     operator_signature_id,
@@ -62,11 +62,17 @@ from edgeshard.profiling.model.execution import (
     measurement_record_from_result,
     require_model_spec,
 )
+from edgeshard.profiling.operator.planning import (
+    IncrementalPlan,
+    operator_case_spec,
+    parameters_dtype,
+    plan_incremental_profiling,
+)
 from edgeshard.profiling.operator.registry import (
     OperatorWorkloadRegistry,
     default_operator_workload_registry,
 )
-from edgeshard.profiling.operator.workloads import OperatorWorkload, parameters_dtype
+from edgeshard.profiling.operator.workloads import OperatorWorkload
 
 logger = logging.getLogger("profiling.operator.profiler")
 
@@ -99,60 +105,6 @@ class _BoundOperatorWorkload:
 
     def cleanup(self) -> None:
         self._workload.cleanup()
-
-
-def operator_case_spec(signature: OperatorSignature, *, device_id: str) -> ModelCaseSpec:
-    """Case-spec request that benchmarks exactly this signature (§8.2).
-
-    Operator cases are model-free: the signature *is* the workload
-    identity, so ``model`` stays ``None``. Phase and context come from the
-    signature's own facts (decode attention knows its ``kv_len``);
-    batch/sequence fields mirror the signature dimensions where they are
-    defined. Custom operators are preserved for coverage (§19), never
-    benchmarked — requesting one fails typed.
-    """
-    parameters = signature.parameters
-    if isinstance(parameters, CustomOperatorParameters):
-        raise ProfilingError(
-            ProfilingErrorCategory.UNSUPPORTED_OPERATOR,
-            f"custom operator {parameters.raw_name!r} has no synthetic workload; "
-            "unknown operations are preserved for coverage, not benchmarked (§19)",
-            {"kind": signature.kind.value},
-        )
-    dtype = parameters_dtype(parameters)
-    phase = InferencePhase.PREFILL
-    context_length: int | None = None
-    if isinstance(parameters, AttentionSignature):
-        phase = parameters.phase
-        if phase is InferencePhase.DECODE:
-            context_length = parameters.kv_len - parameters.q_len
-    return ModelCaseSpec(
-        granularity=ProfilingGranularity.OPERATOR,
-        device_ids=(device_id,),
-        dtype=dtype,
-        backend=signature.backend_family,
-        operator_signature=signature,
-        phase=phase,
-        batch_size=_case_batch_size(parameters),
-        sequence_length=_case_sequence_length(parameters),
-        context_length=context_length,
-    )
-
-
-def _case_batch_size(parameters: OperatorParameters) -> int:
-    batch_size = getattr(parameters, "batch_size", None)
-    return batch_size if isinstance(batch_size, int) else 1
-
-
-def _case_sequence_length(parameters: OperatorParameters) -> int:
-    if isinstance(parameters, AttentionSignature):
-        return parameters.q_len
-    if isinstance(parameters, GemmSignature):
-        return parameters.m  # flattened token count of the production call
-    if isinstance(parameters, KvCopySignature):
-        return parameters.context_length
-    sequence_length = getattr(parameters, "sequence_length", None)
-    return sequence_length if isinstance(sequence_length, int) else 512
 
 
 class OperatorProfiler:
@@ -255,47 +207,6 @@ class MeasuredSignatureIndex(Protocol):
     """
 
     def measured_signature_ids(self) -> AbstractSet[str]: ...
-
-
-@dataclass(frozen=True)
-class IncrementalPlan:
-    """Split of requested signatures into reused vs missing (§28).
-
-    ``reused`` signatures already have compatible measurements and MUST
-    NOT be re-benchmarked; ``missing`` signatures are the only ones a new
-    model contributes to the workload list.
-    """
-
-    reused: tuple[OperatorSignature, ...]
-    missing: tuple[OperatorSignature, ...]
-
-
-def plan_incremental_profiling(
-    signatures: Iterable[OperatorSignature],
-    *,
-    measured_ids: AbstractSet[str],
-) -> IncrementalPlan:
-    """Compute the missing-signature plan (§28).
-
-    Signatures are deduplicated by canonical id preserving first-appearance
-    order (the input may already be deduped by §20; dedup here keeps the
-    plan correct for any caller). No signature is dropped: every input
-    lands in exactly one of ``reused``/``missing``.
-    """
-    unique: dict[str, OperatorSignature] = {}
-    for signature in signatures:
-        unique.setdefault(operator_signature_id(signature), signature)
-    reused = tuple(
-        signature
-        for signature_id, signature in unique.items()
-        if signature_id in measured_ids
-    )
-    missing = tuple(
-        signature
-        for signature_id, signature in unique.items()
-        if signature_id not in measured_ids
-    )
-    return IncrementalPlan(reused=reused, missing=missing)
 
 
 @dataclass(frozen=True)

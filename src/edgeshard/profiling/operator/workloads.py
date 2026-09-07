@@ -36,11 +36,11 @@ from edgeshard.profiling.domain.signature import (
     InferencePhase,
     NormSignature,
     NormVariant,
-    OperatorParameters,
     OperatorSignature,
 )
 from edgeshard.profiling.dtypes import UNKNOWN_DTYPE, torch_dtype
 from edgeshard.profiling.errors import ProfilingError
+from edgeshard.profiling.operator.planning import parameters_dtype
 
 RMS_NORM_EPS = 1e-6
 """Epsilon of the eager RMSNorm sequence (the common production default)."""
@@ -77,21 +77,6 @@ def workload_dtype(label: str) -> torch.dtype:
             {"dtype": label},
         )
     return torch_dtype(label)
-
-
-def parameters_dtype(parameters: OperatorParameters) -> str:
-    """Declared dtype label of typed operator parameters.
-
-    ``CUSTOM`` parameters carry raw per-input dtypes instead: custom
-    operators are preserved for coverage (§19), not benchmarked in v1.
-    """
-    dtype = getattr(parameters, "dtype", None)
-    if not isinstance(dtype, str):
-        raise ProfilingError(
-            ProfilingErrorCategory.UNSUPPORTED_OPERATOR,
-            f"{type(parameters).__name__} carries no single workload dtype",
-        )
-    return dtype
 
 
 @runtime_checkable

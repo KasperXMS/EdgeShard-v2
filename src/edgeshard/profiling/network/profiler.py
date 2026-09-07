@@ -45,6 +45,7 @@ from edgeshard.profiling.domain.measurement import (
 from edgeshard.profiling.domain.network import (
     NetworkDirection,
     NetworkPair,
+    NetworkPathClass,
     NetworkTransport,
     ProbeKind,
 )
@@ -166,6 +167,7 @@ def bandwidth_cases(
     payload_bytes: int | None = None,
     include_reverse: bool = True,
     same_subnet_prefix_length: int = DEFAULT_SAME_SUBNET_PREFIX_LENGTH,
+    path_classes: Iterable[NetworkPathClass] | None = None,
 ) -> tuple[ProfilingCase, ...]:
     """Sparse bandwidth cases: representatives per class, both directions (§34).
 
@@ -174,11 +176,24 @@ def bandwidth_cases(
     optional explicit-pair knob. Forward and reverse flows are distinct
     directed cases (§32); v1 runs them sequentially (see
     :meth:`NetworkProfiler.probe_bandwidth`).
+
+    ``path_classes`` restricts the class-driven selection (e.g. the §49
+    ``network bandwidth --path-class`` knob); explicitly requested
+    ``extra_pairs`` are appended regardless — the explicit knob wins over
+    the class filter.
     """
     workers = tuple(facts)
     by_id = {worker.worker_id: worker for worker in workers}
+    classified = classify_pairs(
+        workers, same_subnet_prefix_length=same_subnet_prefix_length
+    )
+    if path_classes is not None:
+        allowed = frozenset(path_classes)
+        classified = tuple(
+            entry for entry in classified if entry.path_class in allowed
+        )
     selected = select_bandwidth_pairs(
-        classify_pairs(workers, same_subnet_prefix_length=same_subnet_prefix_length),
+        classified,
         representatives_per_class=representatives_per_class,
         extra_pairs=extra_pairs,
     )
