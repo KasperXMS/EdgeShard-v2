@@ -12,9 +12,12 @@ contaminate each other), and turns every failure into a typed
 Per-reply RTT samples are parsed from the ``time=Y ms`` reply lines. A
 Windows sub-millisecond reply prints ``time<Yms``; the runner records the
 documented resolution bound ``Y`` — an upper bound the tool itself
-reported, never a fabricated zero (§42, §52.1). Summary statistics
-(median/p95-if-enough/jitter-as-stddev/loss) come from the shared
-:func:`summarize_samples` and :class:`RttMetrics` conventions.
+reported, never a fabricated zero (§42, §52.1). Localized Windows builds
+translate the ``time`` token (zh-CN prints ``时间<1ms``), so a line that
+misses the English pattern but carries the locale-independent ``TTL=``
+reply marker falls back to its single millisecond value. Summary
+statistics (median/p95-if-enough/jitter-as-stddev/loss) come from the
+shared :func:`summarize_samples` and :class:`RttMetrics` conventions.
 """
 
 from __future__ import annotations
@@ -49,6 +52,15 @@ DEFAULT_PING_CONCURRENCY = 4
 
 _TIME_PATTERN = re.compile(r"time[=<](\d+(?:\.\d+)?)\s*ms")
 """One reply RTT: ``time=0.045 ms`` (Unix) or ``time<1ms`` (Windows)."""
+
+_REPLY_MARKER = re.compile(r"ttl=", re.IGNORECASE)
+"""Locale-independent reply anchor: every Windows/Unix reply line carries
+``TTL=``/``ttl=``, while localized Windows builds translate the ``time``
+token itself (e.g. zh-CN prints ``时间<1ms``) and timeout/statistics lines
+carry no TTL. Used only as the fallback gate for :data:`_ANY_MS_VALUE`."""
+
+_ANY_MS_VALUE = re.compile(r"(\d+(?:\.\d+)?)\s*ms")
+"""The RTT on a localized reply line: its only millisecond field."""
 
 
 def ping_command(
@@ -95,11 +107,16 @@ def parse_ping_output(stdout: str) -> tuple[float, ...]:
 
     Only reply lines carrying a ``time`` field count as received; loss
     lines, headers, and the trailing statistics block contribute nothing.
-    ``time<Yms`` is recorded as the reported resolution bound ``Y``.
+    ``time<Yms`` is recorded as the reported resolution bound ``Y``. A
+    localized reply line (``TTL=`` present, English ``time`` token
+    translated away) falls back to its single millisecond value; timeout
+    and statistics lines carry no ``TTL=``, so they still count as nothing.
     """
     samples: list[float] = []
     for line in stdout.splitlines():
         match = _TIME_PATTERN.search(line)
+        if match is None and _REPLY_MARKER.search(line):
+            match = _ANY_MS_VALUE.search(line)
         if match:
             samples.append(float(match.group(1)))
     return tuple(samples)

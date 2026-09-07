@@ -2,9 +2,10 @@
 
 Everything runs against fake async subprocess factories — no host network
 access. Pinned: platform-aware command construction, RTT line parsing
-(including the Windows ``time<1ms`` resolution bound, never zero), typed
-failures for total loss / missing binary / timeout, and the mandatory
-concurrency bound across a fan-out.
+(including the Windows ``time<1ms`` resolution bound, never zero, and
+localized zh-CN Windows replies via the ``TTL=`` fallback), typed failures
+for total loss / missing binary / timeout, and the mandatory concurrency
+bound across a fan-out.
 """
 
 from __future__ import annotations
@@ -48,6 +49,23 @@ Ping statistics for 192.168.1.20:
 Approximate round trip times in milli-seconds:
     Minimum = 0ms, Maximum = 3ms, Average = 1ms
 """
+
+# Real zh-CN Windows output. The fullwidth commas in the statistics block
+# are spelled <FW> and substituted with chr(0xFF0C) solely to keep ruff
+# RUF001 quiet; the parsed string is byte-identical to the console output
+# observed on the localized host. The reply lines — the ones that matter
+# for the TTL fallback — need no substitution.
+LOCALIZED_WINDOWS_PING_OUTPUT = """\
+正在 Ping 127.0.0.1 具有 32 字节的数据:
+来自 127.0.0.1 的回复: 字节=32 时间<1ms TTL=128
+请求超时。
+来自 127.0.0.1 的回复: 字节=32 时间=3ms TTL=128
+
+127.0.0.1 的 Ping 统计信息:
+    数据包: 已发送 = 3<FW>已接收 = 2<FW>丢失 = 1 (33% 丢失)<FW>
+往返行程的估计时间(以毫秒为单位):
+    最短 = 0ms<FW>最长 = 3ms<FW>平均 = 1ms
+""".replace("<FW>", chr(0xFF0C))
 
 TOTAL_LOSS_OUTPUT = """\
 PING 10.9.9.9 (10.9.9.9) 56(84) bytes of data.
@@ -161,6 +179,15 @@ class TestParsePingOutput:
     def test_windows_sub_millisecond_bound_is_never_zero(self) -> None:
         """``time<1ms`` records the resolution bound 1.0 — not a fabricated 0 (§42)."""
         assert parse_ping_output(WINDOWS_PING_OUTPUT) == (1.0, 3.0, 2.0)
+
+    def test_localized_windows_replies_use_ttl_fallback(self) -> None:
+        """zh-CN Windows translates the ``time`` token (``时间<1ms``).
+
+        Real output observed on a zh-CN Windows host; the locale-independent
+        ``TTL=`` anchor must keep replies from reading as total loss, and the
+        localized statistics block (``最短 = 0ms``, no TTL) must stay ignored.
+        """
+        assert parse_ping_output(LOCALIZED_WINDOWS_PING_OUTPUT) == (1.0, 3.0)
 
     def test_total_loss_yields_no_samples(self) -> None:
         assert parse_ping_output(TOTAL_LOSS_OUTPUT) == ()
