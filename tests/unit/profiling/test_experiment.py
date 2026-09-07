@@ -17,6 +17,7 @@ from edgeshard.profiling.domain.experiment import (
     ProfilingExperiment,
     ProfilingFailure,
     profiling_case_id,
+    profiling_experiment_id,
 )
 from edgeshard.profiling.domain.hashing import normalized_items
 from edgeshard.profiling.domain.measurement import (
@@ -375,3 +376,33 @@ def test_case_outcome_carries_exactly_one_member() -> None:
         CaseOutcome()
     with pytest.raises(ValueError, match="exactly one"):
         CaseOutcome(record=record, failure=failure)
+
+
+def test_experiment_id_is_canonical_and_order_insensitive() -> None:
+    """§7: the id hashes the strategy plus the *set* of cases."""
+    first = profiling_experiment_id("default", ["c-1", "c-2"])
+    assert len(first) == 64
+    assert first == profiling_experiment_id("default", ["c-2", "c-1"])
+    assert first != profiling_experiment_id("other-strategy", ["c-1", "c-2"])
+    assert first != profiling_experiment_id("default", ["c-1", "c-3"])
+
+
+def test_experiment_id_requires_strategy_id() -> None:
+    with pytest.raises(ValueError, match="strategy_id"):
+        profiling_experiment_id("", ["c-1"])
+
+
+def test_experiment_for_cases_dedupes_and_precomputes_id() -> None:
+    created = datetime(2026, 9, 7, 12, 0, tzinfo=UTC)
+    experiment = ProfilingExperiment.for_cases(
+        strategy_id="default",
+        case_ids=["c-2", "c-1", "c-2"],
+        created_at=created,
+        requested_by="operator",
+    )
+    assert experiment.case_ids == ("c-2", "c-1")
+    assert experiment.experiment_id == profiling_experiment_id(
+        "default", ["c-1", "c-2"]
+    )
+    assert experiment.requested_by == "operator"
+    assert experiment.created_at == created

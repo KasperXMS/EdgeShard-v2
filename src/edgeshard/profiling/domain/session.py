@@ -21,6 +21,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 
+from edgeshard.profiling.domain.hashing import canonical_sha256
 from edgeshard.profiling.domain.model import ModelCharacterization, ModelReference
 from edgeshard.profiling.domain.signature import (
     ModuleKind,
@@ -81,6 +82,28 @@ class ProfilingSessionRequest:
             raise ValueError("dtype must not be empty when present")
         if self.quantization is not None and not self.quantization:
             raise ValueError("quantization must not be empty when present")
+
+
+def profiling_session_id(
+    experiment_id: str, worker_id: str, session_request: ProfilingSessionRequest
+) -> str:
+    """Canonical SHA-256 identity of one dispatched profiling session (§7).
+
+    Scoped to the experiment so a session id is never reused across jobs (a
+    closed id must never come back — the Worker refuses re-preparing it,
+    §38), and derived from the *full* request so two sessions with different
+    content (kind, devices, model, dtype) can never collide onto one id. A
+    Master restart re-derives the identical id from the same experiment and
+    request, and the Worker replays the prepare idempotently (§50) instead of
+    loading the model a second time.
+    """
+    if not experiment_id:
+        raise ValueError("experiment_id must not be empty")
+    if not worker_id:
+        raise ValueError("worker_id must not be empty")
+    return canonical_sha256(
+        ("profiling_session", experiment_id, worker_id, session_request)
+    )
 
 
 @dataclass(frozen=True)

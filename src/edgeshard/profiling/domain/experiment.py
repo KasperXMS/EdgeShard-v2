@@ -17,6 +17,7 @@ or ``None`` measurement.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
@@ -327,6 +328,22 @@ def profiling_case_id(worker_id: str, spec: CaseSpec) -> str:
     return canonical_sha256(("profiling_case", worker_id, spec))
 
 
+def profiling_experiment_id(strategy_id: str, case_ids: Iterable[str]) -> str:
+    """Canonical SHA-256 identity of an experiment definition (spec §7).
+
+    Hashes the strategy plus the *set* of dispatched case ids (sorted, so the
+    ordering in which a strategy emits cases never leaks into the digest).
+    ``created_at`` and ``requested_by`` are deliberately excluded: they are
+    volatile/contextual, and re-planning the same strategy over the same cases
+    is the same logical experiment — which is what makes experiment creation
+    idempotent across a Master restart (§7.4: a hashed identity must not embed
+    volatile fields).
+    """
+    if not strategy_id:
+        raise ValueError("strategy_id must not be empty")
+    return canonical_sha256(("profiling_experiment", strategy_id, tuple(sorted(case_ids))))
+
+
 @dataclass(frozen=True)
 class ProfilingCase:
     """One dispatched benchmark request (spec §8.2).
@@ -392,3 +409,27 @@ class ProfilingExperiment:
             if case_id in seen:
                 raise ValueError(f"duplicate case_id {case_id!r}")
             seen.add(case_id)
+
+    @classmethod
+    def for_cases(
+        cls,
+        *,
+        strategy_id: str,
+        case_ids: Iterable[str],
+        created_at: datetime,
+        requested_by: str | None = None,
+    ) -> ProfilingExperiment:
+        """Build an experiment with its canonical id precomputed (§7).
+
+        Duplicate case ids collapse (the same canonical case dispatched twice
+        is one case); emission order is preserved for the stored ``case_ids``
+        but never affects the id.
+        """
+        ordered = tuple(dict.fromkeys(case_ids))
+        return cls(
+            experiment_id=profiling_experiment_id(strategy_id, ordered),
+            strategy_id=strategy_id,
+            created_at=created_at,
+            requested_by=requested_by,
+            case_ids=ordered,
+        )

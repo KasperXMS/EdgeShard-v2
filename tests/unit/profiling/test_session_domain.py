@@ -25,6 +25,7 @@ from edgeshard.profiling.domain.session import (
     ModuleEntry,
     ProfilingSessionKind,
     ProfilingSessionRequest,
+    profiling_session_id,
 )
 from edgeshard.profiling.domain.signature import (
     GemmSignature,
@@ -204,3 +205,27 @@ class TestModelSessionFacts:
                     LayerEntry(0, "model.layers.1", LAYER_SIG),
                 ),
             )
+
+
+def test_session_id_is_canonical_and_scope_sensitive() -> None:
+    """§7: deterministic, and scoped to experiment, worker, and content."""
+    request = ProfilingSessionRequest(
+        kind=ProfilingSessionKind.OPERATOR, device_ids=("gpu-0",)
+    )
+    base = profiling_session_id("exp-1", "w-1", request)
+    assert len(base) == 64
+    assert base == profiling_session_id("exp-1", "w-1", request)
+    assert base != profiling_session_id("exp-2", "w-1", request)
+    assert base != profiling_session_id("exp-1", "w-2", request)
+    other = ProfilingSessionRequest(
+        kind=ProfilingSessionKind.OPERATOR, device_ids=("gpu-1",)
+    )
+    assert base != profiling_session_id("exp-1", "w-1", other)
+
+
+def test_session_id_requires_non_empty_scope() -> None:
+    request = ProfilingSessionRequest(kind=ProfilingSessionKind.NETWORK)
+    with pytest.raises(ValueError, match="experiment_id"):
+        profiling_session_id("", "w-1", request)
+    with pytest.raises(ValueError, match="worker_id"):
+        profiling_session_id("exp-1", "", request)
