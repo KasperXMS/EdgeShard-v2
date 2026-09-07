@@ -13,13 +13,16 @@ mapping; production code never sees SQL (§43).
 from __future__ import annotations
 
 import sqlite3
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
+from edgeshard.profiling.codec import decode_json, encode_json
 from edgeshard.profiling.domain.environment import (
     DevicePerformanceClass,
+    DevicePerformanceClassMembership,
     EnvironmentFingerprint,
     MemoryModel,
     device_performance_class_id,
@@ -31,7 +34,9 @@ from edgeshard.profiling.domain.experiment import (
     ModelCaseSpec,
     NetworkCaseSpec,
     ProfilingCase,
+    ProfilingErrorCategory,
     ProfilingExperiment,
+    ProfilingFailure,
 )
 from edgeshard.profiling.domain.measurement import (
     BandwidthMetrics,
@@ -218,11 +223,13 @@ def _latency_record(
     measurement_id: str,
     fingerprint: str = "fp-1",
     started_at: datetime = NOW,
+    environment: EnvironmentFingerprint | None = None,
 ) -> MeasurementRecord:
     return MeasurementRecord(
         measurement_id=measurement_id,
         case_id=case.case_id,
         environment_fingerprint=fingerprint,
+        environment=environment,
         started_at=started_at,
         finished_at=started_at,
         sample_count=2,
@@ -517,49 +524,108 @@ class TestRegistries:
 
 
 class TestReuseIndex:
-    def test_measured_operator_signature_ids(self, store: SqliteProfileStore) -> None:
-        assert store.measured_operator_signature_ids() == frozenset()
-        dpc_id = store.store_performance_class(PERFORMANCE_CLASS)
-        fp = _fingerprint(device_performance_class_id=dpc_id)
-        fp_id = store.store_environment_fingerprint(fp)
-        other_fp_id = store.store_environment_fingerprint(_fingerprint(device_id="gpu-1"))
-
+    def test_same_physical_environment_reuses_measurement(
+        self, store: SqliteProfileStore
+    ) -> None:
+        environment = _fingerprint(dtype="fp32")
         op_case = _operator_case(OP_SIG)
-        other_case = _operator_case(OTHER_OP_SIG)
         store.append_case(op_case)
-        store.append_case(other_case)
-        store.append_measurement(_latency_record(op_case, "m-1", fp_id))
-        store.append_measurement(_latency_record(other_case, "m-2", other_fp_id))
+        store.append_measurement(
+            _latency_record(
+                op_case,
+                "m-1",
+                environment_fingerprint_id(environment),
+                environment=environment,
+            )
+        )
 
         op_id = operator_signature_id(OP_SIG)
-        other_id = operator_signature_id(OTHER_OP_SIG)
-        assert store.measured_operator_signature_ids() == frozenset({op_id, other_id})
-        assert store.measured_operator_signature_ids(
-            environment_fingerprint_id=fp_id
+        assert store.measured_operator_signature_ids_for_environment(
+            environment
         ) == frozenset({op_id})
-        assert store.measured_operator_signature_ids(
-            device_performance_class_id=dpc_id
-        ) == frozenset({op_id})
-        assert store.measured_operator_signature_ids(
-            device_performance_class_id="dpc-never-seen"
-        ) == frozenset()
 
     def test_index_adapter_feeds_incremental_planning(
         self, store: SqliteProfileStore
     ) -> None:
         """P2E seam: the scoped index drives missing-only planning (§28)."""
-        fp_id = store.store_environment_fingerprint(_fingerprint())
+        environment = _fingerprint(dtype="fp32")
         op_case = _operator_case(OP_SIG)
         store.append_case(op_case)
-        store.append_measurement(_latency_record(op_case, "m-1", fp_id))
-        index = OperatorSignatureIndex(
-            store, environment_fingerprint_id=fp_id
+        store.append_measurement(
+            _latency_record(
+                op_case,
+                "m-1",
+                environment_fingerprint_id(environment),
+                environment=environment,
+            )
         )
+        index = OperatorSignatureIndex(store, environment)
         plan = plan_incremental_profiling(
             [OP_SIG, OTHER_OP_SIG], measured_ids=index.measured_signature_ids()
         )
         assert plan.reused == (OP_SIG,)
         assert plan.missing == (OTHER_OP_SIG,)
+
+    def test_cross_device_reuse_requires_verified_same_performance_class(
+        self, store: SqliteProfileStore
+    ) -> None:
+        class_id = device_performance_class_id(PERFORMANCE_CLASS)
+        reference = _fingerprint(
+            "rtx-a",
+            worker_id="worker-a",
+            device_performance_class_id=class_id,
+            device_performance_class=PERFORMANCE_CLASS,
+            dtype="fp32",
+        )
+        candidate = _fingerprint(
+            "rtx-b",
+            worker_id="worker-b",
+            device_performance_class_id=class_id,
+            device_performance_class=PERFORMANCE_CLASS,
+            dtype="fp32",
+        )
+        orin_class = DevicePerformanceClass(
+            vendor="nvidia",
+            accelerator_model="agx-orin",
+            memory_model=MemoryModel.SHARED,
+            backend_family="torch",
+        )
+        orin = _fingerprint(
+            "orin-gpu",
+            worker_id="worker-orin",
+            device_performance_class_id=device_performance_class_id(orin_class),
+            device_performance_class=orin_class,
+            dtype="fp32",
+        )
+        case = _operator_case()
+        store.append_case(case)
+        store.append_measurement(
+            _latency_record(
+                case,
+                "m-reference",
+                environment_fingerprint_id(reference),
+                environment=reference,
+            )
+        )
+        store.store_environment_fingerprint(candidate)
+        store.store_environment_fingerprint(orin)
+
+        assert store.measured_operator_signature_ids_for_environment(candidate) == frozenset()
+        assert store.measured_operator_signature_ids_for_environment(orin) == frozenset()
+
+        store.store_performance_class_membership(
+            DevicePerformanceClassMembership(
+                device_performance_class_id=class_id,
+                worker_id="worker-b",
+                device_id="rtx-b",
+                verified=True,
+                verified_at=NOW,
+                evidence_measurement_ids=("verify-gemm",),
+            )
+        )
+        assert store.measured_operator_signature_ids_for_environment(candidate) == {
+            operator_signature_id(OP_SIG)
+        }
 
 
 class TestSnapshot:
@@ -572,9 +638,28 @@ class TestSnapshot:
         bandwidth_case = _bandwidth_case()
         for case in (op_case, rtt_case, bandwidth_case):
             store.append_case(case)
-        op_record = _latency_record(op_case, "m-op")
-        rtt_record = _rtt_record(rtt_case, "m-rtt")
-        bandwidth_record = _bandwidth_record(bandwidth_case, "m-bw")
+        model_environment = _fingerprint(dtype="fp32")
+        network_environment = EnvironmentFingerprint(
+            backend="network-tools",
+            profiling_implementation_revision="r1",
+            worker_id="w-1",
+        )
+        op_record = _latency_record(
+            op_case,
+            "m-op",
+            environment_fingerprint_id(model_environment),
+            environment=model_environment,
+        )
+        rtt_record = replace(
+            _rtt_record(rtt_case, "m-rtt"),
+            environment_fingerprint=environment_fingerprint_id(network_environment),
+            environment=network_environment,
+        )
+        bandwidth_record = replace(
+            _bandwidth_record(bandwidth_case, "m-bw"),
+            environment_fingerprint=environment_fingerprint_id(network_environment),
+            environment=network_environment,
+        )
         for record in (op_record, rtt_record, bandwidth_record):
             store.append_measurement(record)
 
@@ -598,16 +683,71 @@ class TestSnapshot:
         assert snapshot.measurements == ()
         assert snapshot.network_measurements == ()
 
+    def test_snapshot_is_self_contained_after_store_is_closed(
+        self, tmp_path: Path
+    ) -> None:
+        path = tmp_path / "self-contained.db"
+        class_id = device_performance_class_id(PERFORMANCE_CLASS)
+        environment = _fingerprint(
+            device_performance_class_id=class_id,
+            device_performance_class=PERFORMANCE_CLASS,
+            dtype="fp32",
+        )
+        case = _operator_case()
+        endpoint = NetworkEndpointProfile(
+            worker_id="w-1", interface_id="eth", addresses=("10.0.0.1",)
+        )
+        pair = NetworkPair(
+            source_worker_id="w-1",
+            destination_worker_id="w-2",
+            source_interface_id="eth",
+            destination_interface_id="eth",
+        )
+        with SqliteProfileStore(path) as open_store:
+            open_store.store_characterization(CHARACTERIZATION)
+            open_store.store_layer_signature(LAYER_SIG)
+            open_store.store_module_signature(MODULE_SIG)
+            open_store.store_operator_signature(OP_SIG)
+            open_store.store_network_endpoint(endpoint)
+            open_store.store_path_classification(pair, NetworkPathClass.WIRED_LAN)
+            open_store.append_case(case)
+            record = _latency_record(
+                case,
+                "m-contained",
+                environment_fingerprint_id(environment),
+                environment=environment,
+            )
+            open_store.append_measurement(record)
+            snapshot = open_store.build_snapshot("snap-contained", created_at=NOW)
+
+        restored = decode_json(type(snapshot), encode_json(snapshot))
+        assert restored == snapshot
+        assert snapshot.profiling_cases == (case,)
+        assert snapshot.operator_signatures == (OP_SIG,)
+        assert snapshot.environment_fingerprints == (environment,)
+        assert snapshot.device_performance_classes == (PERFORMANCE_CLASS,)
+        assert snapshot.network_endpoints == (endpoint,)
+        assert snapshot.network_paths[0].pair == pair
+        assert snapshot.measurements == (record,)
+
 
 class TestDurability:
     def test_data_survives_reopen(self, tmp_path: Path) -> None:
         """Master-restart resume (§40 DoD) reads experiments/cases from disk."""
         path = tmp_path / "profile.db"
         case = _operator_case()
+        environment = _fingerprint(dtype="fp32")
         with SqliteProfileStore(path) as first:
             first.append_experiment(_experiment("exp-1", case.case_id))
             first.append_case(case)
-            first.append_measurement(_latency_record(case, "m-1"))
+            first.append_measurement(
+                _latency_record(
+                    case,
+                    "m-1",
+                    environment_fingerprint_id(environment),
+                    environment=environment,
+                )
+            )
             first.update_case_state(case.case_id, CaseState.COMPLETED)
             first.update_experiment_state("exp-1", ExperimentState.RUNNING)
         with SqliteProfileStore(path) as second:
@@ -618,9 +758,26 @@ class TestDurability:
             assert stored_experiment is not None
             assert stored_experiment.state is ExperimentState.RUNNING
             assert second.get_measurement("m-1") is not None
-            assert second.measured_operator_signature_ids() == frozenset(
-                {operator_signature_id(OP_SIG)}
-            )
+            assert second.measured_operator_signature_ids_for_environment(
+                environment
+            ) == frozenset({operator_signature_id(OP_SIG)})
+
+    def test_typed_case_failure_survives_master_restart(self, tmp_path: Path) -> None:
+        path = tmp_path / "failure.db"
+        case = _operator_case()
+        failure = ProfilingFailure(
+            category=ProfilingErrorCategory.BENCHMARK_FAILED,
+            message="kernel launch failed",
+            details=(("device_id", "gpu-0"),),
+        )
+        with SqliteProfileStore(path) as first:
+            first.append_case(case)
+            first.update_case_state(case.case_id, CaseState.FAILED, failure)
+        with SqliteProfileStore(path) as restarted:
+            stored = restarted.get_case(case.case_id)
+            assert stored is not None
+            assert stored.state is CaseState.FAILED
+            assert stored.failure == failure
 
     def test_empty_path_rejected(self) -> None:
         with pytest.raises(ValueError, match="path"):

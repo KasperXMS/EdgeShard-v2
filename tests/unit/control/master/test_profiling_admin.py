@@ -36,7 +36,7 @@ from edgeshard.profiling.domain.experiment import (
     ProfilingFailure,
     ProfilingRequest,
 )
-from edgeshard.profiling.domain.network import ProbeKind
+from edgeshard.profiling.domain.network import NetworkPair, ProbeKind
 from edgeshard.profiling.domain.session import ProfilingSessionKind
 from edgeshard.profiling.domain.signature import ProfilingGranularity
 from edgeshard.protocol.profiling.mapper import (
@@ -143,6 +143,40 @@ class TestStartExperimentNetwork:
         for case in cases:
             assert isinstance(case.spec, NetworkCaseSpec)
             assert case.spec.probe_kind is ProbeKind.RTT
+        await drain(admin, response.experiment_id)
+
+    async def test_explicit_interface_pair_excludes_default_bandwidth_paths(
+        self, tmp_path: Path
+    ) -> None:
+        rig = make_rig(tmp_path)
+        await register_worker(rig, W1)
+        await register_worker(rig, W2, profiling_endpoint=ENDPOINT_2)
+        admin = make_admin(rig)
+        pair = NetworkPair(
+            source_worker_id=W1,
+            destination_worker_id=W2,
+            source_interface_id="nic-0",
+            destination_interface_id="nic-0",
+        )
+
+        response = await admin.start_experiment(
+            StartExperimentRequest(
+                request=network_intent(
+                    network_probe=ProbeKind.BANDWIDTH,
+                    extra_bandwidth_pairs=(pair,),
+                )
+            )
+        )
+
+        assert response.accepted
+        cases = stored_cases(rig, response.experiment_id)
+        assert cases
+        assert all(
+            isinstance(case.spec, NetworkCaseSpec)
+            and case.spec.source_interface_id == "nic-0"
+            and case.spec.destination_interface_id == "nic-0"
+            for case in cases
+        )
         await drain(admin, response.experiment_id)
 
     async def test_single_worker_without_peer_is_zero_case_rejection(
@@ -301,10 +335,19 @@ class TestStartExperimentModelFamily:
             )
         )
         assert second.accepted is True
-        # Canonical ids (§7): the re-planned experiment is the same one.
-        assert second.experiment_id == first.experiment_id
+        # Explicit reruns retain configuration identity but get a fresh run id.
+        assert second.experiment_id != first.experiment_id
         report = await drain(admin, second.experiment_id)
         assert report.state is ExperimentState.COMPLETED
+        first_stored = rig.store.get_experiment(first.experiment_id)
+        second_stored = rig.store.get_experiment(second.experiment_id)
+        assert first_stored is not None and second_stored is not None
+        assert (
+            first_stored.experiment.configuration_id
+            == second_stored.experiment.configuration_id
+        )
+        assert first_stored.experiment.case_ids != second_stored.experiment.case_ids
+        assert len(rig.store.build_snapshot("rerun").measurements) == 2
 
 
 class TestGetExperiment:
@@ -353,10 +396,10 @@ class TestGetExperiment:
         assert status_response.status is not None
         (case_status,) = status_response.status.cases
         assert case_status.state is CaseState.FAILED
-        # The store keeps states only (§43); the report cache supplies this.
+        # The typed failure remains available without the report cache.
         assert case_status.failure == failure
 
-    async def test_without_cached_report_failure_is_honest_absence(
+    async def test_without_cached_report_reads_durable_failure(
         self, tmp_path: Path
     ) -> None:
         rig = make_rig(tmp_path)
@@ -381,8 +424,8 @@ class TestGetExperiment:
                 ),
             ),
         )
-        # Run through the controller directly: the admin has no cached report
-        # (a Master restart looks exactly like this, §52.2).
+        # Run through the controller directly: the admin has no cached report,
+        # as after a Master restart.
         await rig.controller.run_experiment(response.experiment_id)
 
         status_response = await admin.get_experiment(
@@ -393,7 +436,8 @@ class TestGetExperiment:
         assert status_response.status is not None
         (case_status,) = status_response.status.cases
         assert case_status.state is CaseState.FAILED
-        assert case_status.failure is None
+        assert case_status.failure is not None
+        assert case_status.failure.category is ProfilingErrorCategory.BENCHMARK_FAILED
 
 
 class TestCancelExperiment:

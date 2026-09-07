@@ -12,6 +12,7 @@ gRPC wire is covered by the P2G integration tests.
 
 from __future__ import annotations
 
+import dataclasses
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -27,6 +28,13 @@ from edgeshard.control.master.profiling_controller import (
     _session_request,
 )
 from edgeshard.control.master.service import MasterService
+from edgeshard.profiling.domain.environment import (
+    DevicePerformanceClass,
+    EnvironmentFingerprint,
+    MemoryModel,
+    device_performance_class_id,
+    environment_fingerprint_id,
+)
 from edgeshard.profiling.domain.experiment import (
     CaseOutcome,
     CaseState,
@@ -50,7 +58,11 @@ from edgeshard.profiling.domain.model import (
     ModelStage,
     StageKind,
 )
-from edgeshard.profiling.domain.network import ProbeKind
+from edgeshard.profiling.domain.network import (
+    NetworkDirection,
+    NetworkTransport,
+    ProbeKind,
+)
 from edgeshard.profiling.domain.session import (
     LayerEntry,
     ModelSessionFacts,
@@ -70,6 +82,7 @@ from edgeshard.profiling.domain.signature import (
     operator_signature_id,
 )
 from edgeshard.profiling.network.classifier import classify_pairs, endpoint_profiles
+from edgeshard.profiling.operator.profiler import PerformanceClassVerification
 from edgeshard.profiling.store.sqlite import SqliteProfileStore
 from edgeshard.protocol.control.mapper import (
     CONTROL_PROTOCOL_VERSION,
@@ -82,11 +95,15 @@ from edgeshard.protocol.profiling.mapper import (
     CloseProfilingSessionResponse,
     GetProfilingCaseRequest,
     GetProfilingCaseResponse,
+    PrepareIperfServerRequest,
+    PrepareIperfServerResponse,
     PrepareProfilingSessionRequest,
     PrepareProfilingSessionResponse,
     ProfilingRejection,
     RunProfilingCaseRequest,
     RunProfilingCaseResponse,
+    StopIperfServerRequest,
+    StopIperfServerResponse,
 )
 from factories import make_rtx_capability, make_worker_identity, make_worker_state
 
@@ -96,6 +113,27 @@ W1 = "w-1"
 W2 = "w-2"
 ENDPOINT_1 = "127.0.0.1:9101"
 ENDPOINT_2 = "127.0.0.1:9102"
+
+PERFORMANCE_CLASS = DevicePerformanceClass(
+    vendor="NVIDIA",
+    accelerator_model="NVIDIA GeForce RTX 4090",
+    memory_model=MemoryModel.DISCRETE,
+    backend_family="torch",
+    architecture="8.9",
+    dtype="fp32",
+)
+ENVIRONMENT = EnvironmentFingerprint(
+    backend="torch",
+    profiling_implementation_revision="test",
+    device_performance_class_id=device_performance_class_id(PERFORMANCE_CLASS),
+    device_performance_class=PERFORMANCE_CLASS,
+    torch_version="test",
+    model_revision="local",
+    dtype="fp32",
+    worker_id=W1,
+    device_id="gpu-0",
+)
+OPERATOR_ENVIRONMENT = dataclasses.replace(ENVIRONMENT, model_revision=None)
 
 MODEL = ModelReference(model_id="tiny/llama", revision="local")
 OPERATOR_SIG = OperatorSignature(
@@ -155,12 +193,17 @@ class FakeAioRpcError(grpc.aio.AioRpcError):
         super().__init__(code=code, details=details, debug_error_string="fake")
 
 
-def make_record(case_id: str, measurement_id: str | None = None) -> MeasurementRecord:
+def make_record(
+    case_id: str,
+    measurement_id: str | None = None,
+    environment: EnvironmentFingerprint = OPERATOR_ENVIRONMENT,
+) -> MeasurementRecord:
     samples = (1.0, 2.0, 3.0)
     return MeasurementRecord(
         measurement_id=measurement_id or f"m-{uuid.uuid4().hex[:12]}",
         case_id=case_id,
-        environment_fingerprint="fp-1",
+        environment_fingerprint=environment_fingerprint_id(environment),
+        environment=environment,
         started_at=NOW,
         finished_at=NOW + timedelta(seconds=1),
         sample_count=len(samples),
@@ -188,6 +231,8 @@ class FakeTransport:
         self.get_requests: list[GetProfilingCaseRequest] = []
         self.cancel_requests: list[CancelProfilingCaseRequest] = []
         self.close_requests: list[CloseProfilingSessionRequest] = []
+        self.prepare_iperf_requests: list[PrepareIperfServerRequest] = []
+        self.stop_iperf_requests: list[StopIperfServerRequest] = []
         self.timeouts: list[float | None] = []
         self.closed = False
         self.prepare_response: PrepareProfilingSessionResponse = (
@@ -237,7 +282,20 @@ class FakeTransport:
             return scripted
         return RunProfilingCaseResponse(
             accepted=True,
-            outcome=CaseOutcome.from_record(make_record(request.case.case_id)),
+            outcome=CaseOutcome.from_record(
+                make_record(
+                    request.case.case_id,
+                    environment=dataclasses.replace(
+                        OPERATOR_ENVIRONMENT,
+                        worker_id=request.case.worker_id,
+                        device_id=(
+                            request.case.spec.device_ids[0]
+                            if isinstance(request.case.spec, ModelCaseSpec)
+                            else None
+                        ),
+                    ),
+                )
+            ),
         )
 
     async def get_profiling_case(
@@ -276,6 +334,20 @@ class FakeTransport:
         self.close_requests.append(request)
         self.timeouts.append(timeout)
         return CloseProfilingSessionResponse(accepted=True)
+
+    async def prepare_iperf_server(
+        self, request: PrepareIperfServerRequest, *, timeout: float | None = None
+    ) -> PrepareIperfServerResponse:
+        self.prepare_iperf_requests.append(request)
+        self.timeouts.append(timeout)
+        return PrepareIperfServerResponse(accepted=True, port=request.port or 45123)
+
+    async def stop_iperf_server(
+        self, request: StopIperfServerRequest, *, timeout: float | None = None
+    ) -> StopIperfServerResponse:
+        self.stop_iperf_requests.append(request)
+        self.timeouts.append(timeout)
+        return StopIperfServerResponse(accepted=True)
 
     async def close(self) -> None:
         self.closed = True
@@ -516,16 +588,25 @@ async def test_model_cases_share_one_session_and_split_on_dtype(
 
     assert report.state is ExperimentState.COMPLETED
     prepares = rig.transport().prepare_requests
-    assert len(prepares) == 2
-    by_dtype = {prepare.session_request.dtype: prepare for prepare in prepares}
-    assert by_dtype["fp32"].session_request.device_ids == ("gpu-0", "gpu-1")
-    assert by_dtype["fp32"].session_request.model == MODEL
-    assert by_dtype["bf16"].session_request.device_ids == ("gpu-0",)
+    assert len(prepares) == 3
+    assert {
+        (
+            prepare.session_request.dtype,
+            prepare.session_request.device_ids,
+            prepare.session_request.target_layer_index,
+        )
+        for prepare in prepares
+    } == {
+        ("fp32", ("gpu-0",), 0),
+        ("fp32", ("gpu-1",), 1),
+        ("bf16", ("gpu-0",), 2),
+    }
+    assert all(prepare.session_request.model == MODEL for prepare in prepares)
     runs = rig.transport().run_requests
     session_of = {run.case.case_id: run.profiling_session_id for run in runs}
-    assert session_of[fp32_a.case_id] == session_of[fp32_b.case_id]
+    assert session_of[fp32_a.case_id] != session_of[fp32_b.case_id]
     assert session_of[bf16.case_id] != session_of[fp32_a.case_id]
-    assert len(rig.transport().close_requests) == 2
+    assert len(rig.transport().close_requests) == 3
 
 
 async def test_operator_and_model_cases_use_separate_sessions(tmp_path: Path) -> None:
@@ -651,7 +732,7 @@ async def test_prepare_device_busy_refusal_keeps_category(tmp_path: Path) -> Non
     assert failure.category is ProfilingErrorCategory.DEVICE_BUSY
     assert "device_busy" in failure.message
     assert transport.run_requests == []  # never benchmarked
-    assert transport.close_requests == []  # nothing to clean up
+    assert len(transport.close_requests) == 1
     assert rig.store.query_measurements(case_id=case.case_id) == ()
 
 
@@ -691,7 +772,7 @@ async def test_prepare_timeout_maps_to_timeout_failure(tmp_path: Path) -> None:
 
     failure = failure_of(report_for(report, case.case_id))
     assert failure.category is ProfilingErrorCategory.TIMEOUT
-    assert dict(failure.details)["grpc_code"] == grpc.StatusCode.DEADLINE_EXCEEDED.value
+    assert dict(failure.details)["grpc_code"] == "DEADLINE_EXCEEDED"
 
 
 # ---------------------------------------------------------------------------
@@ -794,6 +875,30 @@ async def test_record_case_mismatch_is_protocol_violation(tmp_path: Path) -> Non
     assert failure.category is ProfilingErrorCategory.INTERNAL_ERROR
     assert rig.store.query_measurements(case_id=case.case_id) == ()
     assert rig.store.get_measurement(foreign.measurement_id) is None
+
+
+async def test_opaque_environment_result_is_protocol_violation(tmp_path: Path) -> None:
+    """A Worker result must carry the full fingerprint, not only its hash."""
+    rig = make_rig(tmp_path)
+    await register_worker(rig, W1)
+    case = operator_case()
+    experiment = rig.controller.create_experiment(strategy_id="default", cases=[case])
+    transport = rig.transports.setdefault(ENDPOINT_1, FakeTransport(ENDPOINT_1))
+    opaque = dataclasses.replace(make_record(case.case_id), environment=None)
+    transport.script_run(
+        case.case_id,
+        RunProfilingCaseResponse(
+            accepted=True,
+            outcome=CaseOutcome.from_record(opaque),
+        ),
+    )
+
+    report = await rig.controller.run_experiment(experiment.experiment_id)
+
+    failure = failure_of(report_for(report, case.case_id))
+    assert failure.category is ProfilingErrorCategory.INTERNAL_ERROR
+    assert "complete, correctly attributed" in failure.message
+    assert rig.store.get_measurement(opaque.measurement_id) is None
 
 
 # ---------------------------------------------------------------------------
@@ -978,6 +1083,44 @@ async def test_network_case_unknown_peer_fails_without_dispatch(
     assert failure.category is ProfilingErrorCategory.NETWORK_UNREACHABLE
     assert "w-ghost" in failure.message
     assert rig.transport().prepare_requests == []
+
+
+async def test_cross_worker_iperf_server_lifecycle_is_bounded_to_case(
+    tmp_path: Path,
+) -> None:
+    rig = make_rig(tmp_path)
+    await register_worker(rig, W1, profiling_endpoint=ENDPOINT_1)
+    await register_worker(rig, W2, profiling_endpoint=ENDPOINT_2)
+    case = ProfilingCase.for_spec(
+        W1,
+        NetworkCaseSpec(
+            probe_kind=ProbeKind.BANDWIDTH,
+            source_worker_id=W1,
+            destination_worker_id=W2,
+            source_interface_id="nic-0",
+            destination_interface_id="nic-0",
+            transport=NetworkTransport.TCP,
+            direction=NetworkDirection.FORWARD,
+            duration_s=1.0,
+        ),
+    )
+    experiment = rig.controller.create_experiment(
+        strategy_id="default", cases=[case]
+    )
+
+    report = await rig.controller.run_experiment(experiment.experiment_id)
+
+    assert report.state is ExperimentState.COMPLETED
+    source = rig.transport(ENDPOINT_1)
+    destination = rig.transport(ENDPOINT_2)
+    assert len(destination.prepare_iperf_requests) == 1
+    assert len(destination.stop_iperf_requests) == 1
+    prepared = destination.prepare_iperf_requests[0]
+    stopped = destination.stop_iperf_requests[0]
+    assert prepared.server_id == stopped.server_id
+    assert prepared.bind_address == "192.168.1.100"
+    assert prepared.timeout_s > 1.0
+    assert source.run_requests[0].iperf_server_port == 45123
 
 
 # ---------------------------------------------------------------------------
@@ -1211,6 +1354,7 @@ SESSION_FACTS = ModelSessionFacts(
         ModuleEntry("mlp", "model.layers.0.mlp", ModuleKind.MLP, 0, MODULE_SIG_MLP),
     ),
     operator_signatures=(OPERATOR_SIG,),
+    environment=ENVIRONMENT,
 )
 INSPECTION_REQUEST = ProfilingSessionRequest(
     kind=ProfilingSessionKind.MODEL,
@@ -1256,7 +1400,9 @@ class TestClusterNetworkFactsAndReuse:
     async def test_measured_ids_empty_then_growing(self, tmp_path: Path) -> None:
         rig = make_rig(tmp_path)
         await register_worker(rig, W1)
-        assert rig.controller.measured_operator_signature_ids() == set()
+        assert rig.controller.measured_operator_signature_ids_for_environment(
+            OPERATOR_ENVIRONMENT
+        ) == set()
 
         case = operator_case()
         experiment = rig.controller.create_experiment(
@@ -1264,7 +1410,9 @@ class TestClusterNetworkFactsAndReuse:
         )
         await rig.controller.run_experiment(experiment.experiment_id)
 
-        assert rig.controller.measured_operator_signature_ids() == {
+        assert rig.controller.measured_operator_signature_ids_for_environment(
+            OPERATOR_ENVIRONMENT
+        ) == {
             operator_signature_id(OPERATOR_SIG)
         }
 
@@ -1277,6 +1425,34 @@ class TestClusterNetworkFactsAndReuse:
         rig.controller.record_model_facts(SESSION_FACTS)
         snapshot = rig.store.build_snapshot("s-1")
         assert snapshot.model_characterizations == (CHARACTERIZATION,)
+
+    def test_performance_class_verification_verdict_is_persisted_and_used(
+        self, tmp_path: Path
+    ) -> None:
+        rig = make_rig(tmp_path)
+        rig.controller.record_model_facts(SESSION_FACTS)
+        candidate = dataclasses.replace(
+            OPERATOR_ENVIRONMENT, worker_id="w-2", device_id="gpu-1"
+        )
+        rig.controller.record_performance_class_verification(
+            candidate,
+            PerformanceClassVerification(
+                tolerance=0.15,
+                comparisons=(),
+                max_relative_deviation=0.0,
+                compatible=True,
+            ),
+            evidence_measurement_ids=("verify-1",),
+        )
+
+        snapshot = rig.controller.build_profile_snapshot()
+        membership = next(
+            item
+            for item in snapshot.device_performance_class_memberships
+            if item.worker_id == "w-2"
+        )
+        assert membership.verified
+        assert membership.evidence_measurement_ids == ("verify-1",)
 
     async def test_record_network_characterization_is_idempotent(
         self, tmp_path: Path

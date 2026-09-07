@@ -134,12 +134,20 @@ class FakePingRunner:
     def __init__(self, samples: tuple[float, ...] = (0.4, 0.5, 0.6, 0.7, 0.8)) -> None:
         self.samples = samples
         self.calls: list[tuple[str, int | None]] = []
+        self.bind_addresses: list[str | None] = []
         self.active = 0
         self.max_active = 0
         self.delay = 0.01
 
-    async def probe(self, target: str, *, packet_count: int | None = None) -> PingObservation:
+    async def probe(
+        self,
+        target: str,
+        *,
+        packet_count: int | None = None,
+        bind_address: str | None = None,
+    ) -> PingObservation:
         self.calls.append((target, packet_count))
+        self.bind_addresses.append(bind_address)
         self.active += 1
         self.max_active = max(self.max_active, self.active)
         try:
@@ -541,6 +549,55 @@ class TestNetworkProfilerBandwidth:
         assert bandwidth.retransmits is None  # UDP-style absence stays None
         assert "payload_bytes" not in record.metadata_mapping
 
+    async def test_multi_nic_explicit_path_selects_both_endpoints(self) -> None:
+        def multi(worker_id: str, lan: str, overlay: str) -> WorkerNetworkFacts:
+            lan_kind, _ = classify_interface("eth0")
+            overlay_kind, overlay_type = classify_interface("zt0")
+            return WorkerNetworkFacts(
+                worker_id=worker_id,
+                hostname=f"host-{worker_id}",
+                interfaces=(
+                    InterfaceFacts("lan", "eth0", lan_kind, None, (lan,), 1500),
+                    InterfaceFacts(
+                        "overlay", "zt0", overlay_kind, overlay_type, (overlay,), 2800
+                    ),
+                ),
+            )
+
+        source = multi("w1", "192.168.1.10", "100.64.0.10")
+        destination = multi("w2", "192.168.1.20", "100.64.0.20")
+        case = ProfilingCase.for_spec(
+            "w1",
+            NetworkCaseSpec(
+                probe_kind=ProbeKind.BANDWIDTH,
+                source_worker_id="w1",
+                destination_worker_id="w2",
+                source_interface_id="overlay",
+                destination_interface_id="overlay",
+                path_class=NetworkPathClass.OVERLAY,
+                transport=NetworkTransport.TCP,
+                direction=NetworkDirection.FORWARD,
+                duration_s=2.0,
+            ),
+        )
+        iperf = FakeIperfRunner()
+
+        await NetworkProfiler(iperf_runner=iperf).profile(
+            case,
+            network_facts=_facts_map(source, destination),
+            environment_fingerprint="env",
+            iperf_server_port=45678,
+        )
+
+        assert iperf.probes == [
+            Iperf3Probe(
+                target="100.64.0.20",
+                bind_address="100.64.0.10",
+                port=45678,
+                duration_s=2.0,
+            )
+        ]
+
 
 class TestNetworkProfilerFactResolution:
     async def test_model_case_rejected(self) -> None:
@@ -567,7 +624,36 @@ class TestNetworkProfilerFactResolution:
                 _rtt_case(), network_facts=facts, environment_fingerprint="e"
             )
         assert excinfo.value.category is ProfilingErrorCategory.NETWORK_UNREACHABLE
-        assert "no IPv4 address" in str(excinfo.value)
+        assert "no unambiguous IPv4 probe path" in str(excinfo.value)
+
+    async def test_multi_nic_without_explicit_destination_is_rejected(self) -> None:
+        destination = WorkerNetworkFacts(
+            worker_id="w2",
+            hostname="host-w2",
+            interfaces=(
+                InterfaceFacts(
+                    "lan",
+                    "eth0",
+                    classify_interface("eth0")[0],
+                    None,
+                    ("192.168.1.20",),
+                    1500,
+                ),
+                InterfaceFacts(
+                    "overlay",
+                    "zt0",
+                    classify_interface("zt0")[0],
+                    "zerotier",
+                    ("100.64.0.20",),
+                    2800,
+                ),
+            ),
+        )
+        facts = _facts_map(_worker("w1", "192.168.1.10"), destination)
+        with pytest.raises(ProfilingError, match="destination_interface_id"):
+            await NetworkProfiler(ping_runner=FakePingRunner()).profile(
+                _rtt_case(), network_facts=facts, environment_fingerprint="e"
+            )
 
     async def test_typed_probe_failure_propagates(self) -> None:
         class FailingPing(FakePingRunner):

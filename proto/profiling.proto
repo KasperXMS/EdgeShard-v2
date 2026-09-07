@@ -114,6 +114,9 @@ message RunProfilingCaseRequest {
 
   // codec JSON: ProfilingCase.
   string case_payload = 6;
+  // Runtime-only destination server port selected by the Master. It is not
+  // part of canonical case identity.
+  uint32 iperf_server_port = 7;
 }
 
 message RunProfilingCaseResponse {
@@ -181,6 +184,36 @@ message CloseProfilingSessionResponse {
   // Closing an unknown or already-closed session is accepted (idempotent):
   // cleanup must have released the session's leases and model state either
   // way (§38-§39).
+  bool accepted = 1;
+  string detail = 2;
+  ProfilingRejectionReason reason = 3;
+}
+
+message PrepareIperfServerRequest {
+  string worker_id = 1;
+  string instance_id = 2;
+  string registration_session_id = 3;
+  string server_id = 4;
+  uint32 port = 5;
+  double timeout_s = 6;
+  string bind_address = 7;
+}
+
+message PrepareIperfServerResponse {
+  bool accepted = 1;
+  string detail = 2;
+  ProfilingRejectionReason reason = 3;
+  uint32 port = 4;
+}
+
+message StopIperfServerRequest {
+  string worker_id = 1;
+  string instance_id = 2;
+  string registration_session_id = 3;
+  string server_id = 4;
+}
+
+message StopIperfServerResponse {
   bool accepted = 1;
   string detail = 2;
   ProfilingRejectionReason reason = 3;
@@ -255,6 +288,12 @@ service WorkerProfilingService {
 
   rpc CloseProfilingSession(CloseProfilingSessionRequest)
       returns (CloseProfilingSessionResponse);
+
+  rpc PrepareIperfServer(PrepareIperfServerRequest)
+      returns (PrepareIperfServerResponse);
+
+  rpc StopIperfServer(StopIperfServerRequest)
+      returns (StopIperfServerResponse);
 }
 
 service ProfilingAdminService {

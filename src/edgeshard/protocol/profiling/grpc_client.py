@@ -103,6 +103,28 @@ class WorkerProfilingClient:
         )
         return mapper.close_session_response_from_wire(wire)
 
+    async def prepare_iperf_server(
+        self,
+        request: mapper.PrepareIperfServerRequest,
+        *,
+        timeout: float | None = None,
+    ) -> mapper.PrepareIperfServerResponse:
+        wire = await self._stub.PrepareIperfServer(
+            mapper.prepare_iperf_server_request_to_wire(request), timeout=timeout
+        )
+        return mapper.prepare_iperf_server_response_from_wire(wire)
+
+    async def stop_iperf_server(
+        self,
+        request: mapper.StopIperfServerRequest,
+        *,
+        timeout: float | None = None,
+    ) -> mapper.StopIperfServerResponse:
+        wire = await self._stub.StopIperfServer(
+            mapper.stop_iperf_server_request_to_wire(request), timeout=timeout
+        )
+        return mapper.stop_iperf_server_response_from_wire(wire)
+
     async def close(self) -> None:
         await self._channel.close()
 

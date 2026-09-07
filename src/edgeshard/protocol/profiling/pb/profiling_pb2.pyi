@@ -53,20 +53,22 @@ class PrepareProfilingSessionResponse(_message.Message):
     def __init__(self, accepted: _Optional[bool] = ..., detail: _Optional[str] = ..., reason: _Optional[_Union[ProfilingRejectionReason, str]] = ..., session_facts_payload: _Optional[str] = ..., failure_payload: _Optional[str] = ...) -> None: ...
 
 class RunProfilingCaseRequest(_message.Message):
-    __slots__ = ("worker_id", "instance_id", "registration_session_id", "profiling_session_id", "case_id", "case_payload")
+    __slots__ = ("worker_id", "instance_id", "registration_session_id", "profiling_session_id", "case_id", "case_payload", "iperf_server_port")
     WORKER_ID_FIELD_NUMBER: _ClassVar[int]
     INSTANCE_ID_FIELD_NUMBER: _ClassVar[int]
     REGISTRATION_SESSION_ID_FIELD_NUMBER: _ClassVar[int]
     PROFILING_SESSION_ID_FIELD_NUMBER: _ClassVar[int]
     CASE_ID_FIELD_NUMBER: _ClassVar[int]
     CASE_PAYLOAD_FIELD_NUMBER: _ClassVar[int]
+    IPERF_SERVER_PORT_FIELD_NUMBER: _ClassVar[int]
     worker_id: str
     instance_id: str
     registration_session_id: str
     profiling_session_id: str
     case_id: str
     case_payload: str
-    def __init__(self, worker_id: _Optional[str] = ..., instance_id: _Optional[str] = ..., registration_session_id: _Optional[str] = ..., profiling_session_id: _Optional[str] = ..., case_id: _Optional[str] = ..., case_payload: _Optional[str] = ...) -> None: ...
+    iperf_server_port: int
+    def __init__(self, worker_id: _Optional[str] = ..., instance_id: _Optional[str] = ..., registration_session_id: _Optional[str] = ..., profiling_session_id: _Optional[str] = ..., case_id: _Optional[str] = ..., case_payload: _Optional[str] = ..., iperf_server_port: _Optional[int] = ...) -> None: ...
 
 class RunProfilingCaseResponse(_message.Message):
     __slots__ = ("accepted", "detail", "reason", "outcome_payload")
@@ -147,6 +149,58 @@ class CloseProfilingSessionRequest(_message.Message):
     def __init__(self, worker_id: _Optional[str] = ..., instance_id: _Optional[str] = ..., registration_session_id: _Optional[str] = ..., profiling_session_id: _Optional[str] = ...) -> None: ...
 
 class CloseProfilingSessionResponse(_message.Message):
+    __slots__ = ("accepted", "detail", "reason")
+    ACCEPTED_FIELD_NUMBER: _ClassVar[int]
+    DETAIL_FIELD_NUMBER: _ClassVar[int]
+    REASON_FIELD_NUMBER: _ClassVar[int]
+    accepted: bool
+    detail: str
+    reason: ProfilingRejectionReason
+    def __init__(self, accepted: _Optional[bool] = ..., detail: _Optional[str] = ..., reason: _Optional[_Union[ProfilingRejectionReason, str]] = ...) -> None: ...
+
+class PrepareIperfServerRequest(_message.Message):
+    __slots__ = ("worker_id", "instance_id", "registration_session_id", "server_id", "port", "timeout_s", "bind_address")
+    WORKER_ID_FIELD_NUMBER: _ClassVar[int]
+    INSTANCE_ID_FIELD_NUMBER: _ClassVar[int]
+    REGISTRATION_SESSION_ID_FIELD_NUMBER: _ClassVar[int]
+    SERVER_ID_FIELD_NUMBER: _ClassVar[int]
+    PORT_FIELD_NUMBER: _ClassVar[int]
+    TIMEOUT_S_FIELD_NUMBER: _ClassVar[int]
+    BIND_ADDRESS_FIELD_NUMBER: _ClassVar[int]
+    worker_id: str
+    instance_id: str
+    registration_session_id: str
+    server_id: str
+    port: int
+    timeout_s: float
+    bind_address: str
+    def __init__(self, worker_id: _Optional[str] = ..., instance_id: _Optional[str] = ..., registration_session_id: _Optional[str] = ..., server_id: _Optional[str] = ..., port: _Optional[int] = ..., timeout_s: _Optional[float] = ..., bind_address: _Optional[str] = ...) -> None: ...
+
+class PrepareIperfServerResponse(_message.Message):
+    __slots__ = ("accepted", "detail", "reason", "port")
+    ACCEPTED_FIELD_NUMBER: _ClassVar[int]
+    DETAIL_FIELD_NUMBER: _ClassVar[int]
+    REASON_FIELD_NUMBER: _ClassVar[int]
+    PORT_FIELD_NUMBER: _ClassVar[int]
+    accepted: bool
+    detail: str
+    reason: ProfilingRejectionReason
+    port: int
+    def __init__(self, accepted: _Optional[bool] = ..., detail: _Optional[str] = ..., reason: _Optional[_Union[ProfilingRejectionReason, str]] = ..., port: _Optional[int] = ...) -> None: ...
+
+class StopIperfServerRequest(_message.Message):
+    __slots__ = ("worker_id", "instance_id", "registration_session_id", "server_id")
+    WORKER_ID_FIELD_NUMBER: _ClassVar[int]
+    INSTANCE_ID_FIELD_NUMBER: _ClassVar[int]
+    REGISTRATION_SESSION_ID_FIELD_NUMBER: _ClassVar[int]
+    SERVER_ID_FIELD_NUMBER: _ClassVar[int]
+    worker_id: str
+    instance_id: str
+    registration_session_id: str
+    server_id: str
+    def __init__(self, worker_id: _Optional[str] = ..., instance_id: _Optional[str] = ..., registration_session_id: _Optional[str] = ..., server_id: _Optional[str] = ...) -> None: ...
+
+class StopIperfServerResponse(_message.Message):
     __slots__ = ("accepted", "detail", "reason")
     ACCEPTED_FIELD_NUMBER: _ClassVar[int]
     DETAIL_FIELD_NUMBER: _ClassVar[int]

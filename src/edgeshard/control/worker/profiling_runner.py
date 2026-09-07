@@ -34,7 +34,9 @@ refusals. Unexpected exceptions are logged and converted to
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
+import socket
 from collections.abc import Callable, Mapping
 from datetime import datetime
 from pathlib import Path
@@ -66,7 +68,10 @@ from edgeshard.control.worker.profiling_sessions import (
 )
 from edgeshard.profiling.benchmark.harness import InstrumentationBundle
 from edgeshard.profiling.domain.environment import (
+    DevicePerformanceClass,
     EnvironmentFingerprint,
+    MemoryModel,
+    device_performance_class_id,
     environment_fingerprint_id,
 )
 from edgeshard.profiling.domain.experiment import (
@@ -83,7 +88,14 @@ from edgeshard.profiling.domain.network import ProbeKind
 from edgeshard.profiling.domain.session import ProfilingSessionKind
 from edgeshard.profiling.domain.signature import ProfilingGranularity
 from edgeshard.profiling.errors import ProfilingError
-from edgeshard.profiling.instrumentation.memory import CudaAllocatorMemoryProbe
+from edgeshard.profiling.instrumentation.memory import (
+    CudaAllocatorMemoryProbe,
+    PhysicalMemoryProbe,
+)
+from edgeshard.profiling.instrumentation.telemetry import (
+    DeviceObservation,
+    TelemetryContextCollector,
+)
 from edgeshard.profiling.instrumentation.timing import CudaEventTimer, WallClockTimer
 from edgeshard.profiling.model.adapters.base import module_device
 from edgeshard.profiling.model.layer_profiler import TransformerLayerProfiler
@@ -98,11 +110,15 @@ from edgeshard.protocol.profiling.mapper import (
     CloseProfilingSessionResponse,
     GetProfilingCaseRequest,
     GetProfilingCaseResponse,
+    PrepareIperfServerRequest,
+    PrepareIperfServerResponse,
     PrepareProfilingSessionRequest,
     PrepareProfilingSessionResponse,
     ProfilingRejection,
     RunProfilingCaseRequest,
     RunProfilingCaseResponse,
+    StopIperfServerRequest,
+    StopIperfServerResponse,
 )
 from edgeshard.runtime.model_store import ModelStore
 
@@ -177,19 +193,158 @@ def _cuda_index_for_uuid(device_id: str) -> int:
         ) from exc
 
 
-def default_instrumentation(device: torch.device) -> InstrumentationBundle:
+def _available_tcp_port(bind_address: str | None) -> int:
+    """Choose a destination-local ephemeral port for a temporary server."""
+    family = socket.AF_INET6 if bind_address and ":" in bind_address else socket.AF_INET
+    host = bind_address or ("::" if family == socket.AF_INET6 else "0.0.0.0")
+    with socket.socket(family, socket.SOCK_STREAM) as candidate:
+        candidate.bind((host, 0))
+        return int(candidate.getsockname()[1])
+
+
+class _StateTelemetryInstrumentation:
+    """Adapter from the Phase 1 device state to profiling context metrics."""
+
+    def __init__(
+        self, device_id: str, record: ProfilingSessionRecord
+    ) -> None:
+        self._device_id = device_id
+        self._record = record
+
+    def capture(self) -> DeviceObservation | None:
+        state = (
+            self._record.worker_state_source()
+            if self._record.worker_state_source is not None
+            else self._record.worker_state
+        )
+        if state is None:
+            return None
+        device_state = next(
+            (item for item in state.device_states if item.device_id == self._device_id),
+            None,
+        )
+        if device_state is None:
+            return None
+        memory_used: int | None = None
+        capability = self._record.capability
+        if capability is not None:
+            device = next(
+                (
+                    item
+                    for item in capability.devices
+                    if item.identity.device_id == self._device_id
+                ),
+                None,
+            )
+            pool = next(
+                (
+                    item
+                    for item in capability.memory_pools
+                    if device is not None
+                    and item.memory_pool_id == device.memory_pool_id
+                ),
+                None,
+            )
+            pool_state = next(
+                (
+                    item
+                    for item in state.memory_states
+                    if pool is not None
+                    and item.memory_pool_id == pool.memory_pool_id
+                ),
+                None,
+            )
+            if (
+                pool is not None
+                and pool_state is not None
+                and pool_state.available_bytes is not None
+            ):
+                memory_used = pool.total_bytes - pool_state.available_bytes
+        return DeviceObservation(
+            device_id=self._device_id,
+            utilization=device_state.utilization,
+            temperature_c=device_state.temperature_c,
+            power_w=device_state.power_w,
+            memory_used_bytes=memory_used,
+        )
+
+
+def default_instrumentation(
+    device: torch.device,
+    *,
+    device_id: str | None = None,
+    record: ProfilingSessionRecord | None = None,
+) -> InstrumentationBundle:
     """The v1 bundle: device-correct timing, allocator memory on CUDA (§11-14).
 
     Physical-memory and telemetry instruments need pool/platform wiring the
     serve path does not provide yet; their metrics stay ``None`` (§52.2)
     rather than approximated.
     """
-    if device.type == "cuda":
-        return InstrumentationBundle(
-            timer=CudaEventTimer(device.index),
-            memory=CudaAllocatorMemoryProbe(device.index),
+    timer = CudaEventTimer(device.index) if device.type == "cuda" else WallClockTimer()
+    allocator = CudaAllocatorMemoryProbe(device.index) if device.type == "cuda" else None
+    physical: PhysicalMemoryProbe | None = None
+    telemetry: TelemetryContextCollector | None = None
+    if record is not None and device_id is not None:
+        capability = record.capability
+        state = record.worker_state
+        device_capability = (
+            next(
+                (
+                    item
+                    for item in capability.devices
+                    if item.identity.device_id == device_id
+                ),
+                None,
+            )
+            if capability is not None
+            else None
         )
-    return InstrumentationBundle(timer=WallClockTimer())
+        pool = (
+            next(
+                (
+                    item
+                    for item in capability.memory_pools
+                    if item.memory_pool_id == device_capability.memory_pool_id
+                ),
+                None,
+            )
+            if capability is not None and device_capability is not None
+            else None
+        )
+        if pool is not None:
+            def read_available() -> int | None:
+                current_state = (
+                    record.worker_state_source()
+                    if record.worker_state_source is not None
+                    else state
+                )
+                if current_state is None:
+                    return None
+                current = next(
+                    (
+                        item
+                        for item in current_state.memory_states
+                        if item.memory_pool_id == pool.memory_pool_id
+                    ),
+                    None,
+                )
+                return current.available_bytes if current is not None else None
+
+            physical = PhysicalMemoryProbe(
+                pool.memory_pool_id,
+                total_bytes=pool.total_bytes,
+                read_available_bytes=read_available,
+            )
+        telemetry = TelemetryContextCollector(
+            _StateTelemetryInstrumentation(device_id, record)
+        )
+    return InstrumentationBundle(
+        timer=timer,
+        memory=allocator,
+        physical_memory=physical,
+        telemetry=telemetry,
+    )
 
 
 def default_model_loader(device: torch.device) -> ModelSessionLoader:
@@ -244,13 +399,12 @@ class WorkerProfilingRunner:
         self._device_resolver = (
             device_resolver if device_resolver is not None else resolve_torch_device
         )
-        self._instrumentation_factory = (
-            instrumentation_factory
-            if instrumentation_factory is not None
-            else default_instrumentation
-        )
+        self._instrumentation_factory = instrumentation_factory
         self._clock = clock
         self._seed = seed
+        self._iperf_servers: dict[
+            str, tuple[asyncio.subprocess.Process, asyncio.Task[None], int]
+        ] = {}
 
     @property
     def leases(self) -> DeviceLeaseManager:
@@ -345,11 +499,28 @@ class WorkerProfilingRunner:
             session_request,
             now=self._clock(),
             capability_revision=inspection.capability.capability_revision or None,
+            capability=inspection.capability,
+            worker_state=inspection.state,
+            worker_state_source=getattr(self._inspector, "current_state", None),
             session_facts=model_handle.facts if model_handle is not None else None,
             network_facts=network_facts,
             model_handle=model_handle,
             model_cleanup=model_handle.close if model_handle is not None else None,
         )
+        if model_handle is not None:
+            characterization = model_handle.facts.characterization
+            record.session_facts = dataclasses.replace(
+                model_handle.facts,
+                environment=self._fingerprint(
+                    record,
+                    tokens,
+                    backend=session_request.backend,
+                    device_id=session_request.device_ids[0],
+                    dtype=session_request.dtype,
+                    quantization=characterization.quantization,
+                    model_revision=characterization.model.revision,
+                ),
+            )
         return PrepareProfilingSessionResponse(
             accepted=True, session_facts=record.session_facts
         )
@@ -447,7 +618,12 @@ class WorkerProfilingRunner:
 
         self._sessions.mark_running(record.session_id, case.case_id)
         try:
-            outcome = await self._execute(record, case, tokens)
+            outcome = await self._execute(
+                record,
+                case,
+                tokens,
+                iperf_server_port=request.iperf_server_port,
+            )
         except ProfilingError as exc:
             outcome = CaseOutcome.from_failure(exc.to_failure())
         except Exception as exc:
@@ -482,10 +658,18 @@ class WorkerProfilingRunner:
         record: ProfilingSessionRecord,
         case: ProfilingCase,
         tokens: RegistrationTokens,
+        *,
+        iperf_server_port: int | None = None,
     ) -> CaseOutcome:
         spec = case.spec
         if isinstance(spec, NetworkCaseSpec):
-            return await self._execute_network(record, case, spec, tokens)
+            return await self._execute_network(
+                record,
+                case,
+                spec,
+                tokens,
+                iperf_server_port=iperf_server_port,
+            )
         assert isinstance(spec, ModelCaseSpec)  # _kind_mismatch guarantees
         if spec.granularity is ProfilingGranularity.OPERATOR:
             return await self._execute_operator(record, case, spec, tokens)
@@ -497,6 +681,8 @@ class WorkerProfilingRunner:
         case: ProfilingCase,
         spec: NetworkCaseSpec,
         tokens: RegistrationTokens,
+        *,
+        iperf_server_port: int | None,
     ) -> CaseOutcome:
         if spec.destination_worker_id not in record.network_facts:
             raise ProfilingError(
@@ -506,13 +692,20 @@ class WorkerProfilingRunner:
                 {"destination_worker_id": spec.destination_worker_id},
             )
         backend = "iperf3" if spec.probe_kind is ProbeKind.BANDWIDTH else "ping"
-        fingerprint = self._fingerprint_id(record, tokens, backend=backend)
+        fingerprint = self._fingerprint(record, tokens, backend=backend)
         result = await self._network_profiler.profile(
             case,
             network_facts=record.network_facts,
-            environment_fingerprint=fingerprint,
+            environment_fingerprint=environment_fingerprint_id(fingerprint),
+            iperf_server_port=iperf_server_port,
         )
-        return CaseOutcome.from_record(result)
+        return CaseOutcome.from_record(
+            dataclasses.replace(
+                result,
+                environment=fingerprint,
+                environment_fingerprint=environment_fingerprint_id(fingerprint),
+            )
+        )
 
     async def _execute_operator(
         self,
@@ -523,18 +716,24 @@ class WorkerProfilingRunner:
     ) -> CaseOutcome:
         device_id = spec.device_ids[0]  # v1 operator benchmarks are single-device
         device = self._device_resolver(device_id, tokens.worker_id)
-        instrumentation = self._instrumentation_factory(device)
-        fingerprint = self._fingerprint_id(
+        instrumentation = self._instrumentation(record, device_id, device)
+        fingerprint = self._fingerprint(
             record, tokens, backend=spec.backend, device_id=device_id, dtype=spec.dtype
         )
         result = await asyncio.to_thread(
             self._operator_profiler.profile,
             case,
             instrumentation=instrumentation,
-            environment_fingerprint=fingerprint,
+            environment_fingerprint=environment_fingerprint_id(fingerprint),
             device=device,
         )
-        return CaseOutcome.from_record(result)
+        return CaseOutcome.from_record(
+            dataclasses.replace(
+                result,
+                environment=fingerprint,
+                environment_fingerprint=environment_fingerprint_id(fingerprint),
+            )
+        )
 
     async def _execute_model(
         self,
@@ -579,7 +778,12 @@ class WorkerProfilingRunner:
                         f"layer_index {layer.index}"
                     )
             device = module_device(layer.layer)
-            instrumentation = self._instrumentation_factory(device)
+            self._require_case_device(
+                device, spec.device_ids[0], tokens.worker_id, case.case_id
+            )
+            instrumentation = self._instrumentation(
+                record, spec.device_ids[0], device
+            )
             fingerprint = self._model_fingerprint(record, tokens, spec, characterization)
             result = await asyncio.to_thread(
                 self._layer_profiler.profile,
@@ -589,15 +793,24 @@ class WorkerProfilingRunner:
                 handle.layout,
                 handle.adapter,
                 instrumentation=instrumentation,
-                environment_fingerprint=fingerprint,
+                environment_fingerprint=environment_fingerprint_id(fingerprint),
                 seed=self._seed,
             )
-            return CaseOutcome.from_record(result)
+            return CaseOutcome.from_record(
+                dataclasses.replace(
+                    result,
+                    environment=fingerprint,
+                    environment_fingerprint=environment_fingerprint_id(fingerprint),
+                )
+            )
 
         assert spec.module_signature is not None  # domain guarantees for MODULE
         module = handle.module_for(spec.module_signature)
         device = module_device(module.module)
-        instrumentation = self._instrumentation_factory(device)
+        self._require_case_device(
+            device, spec.device_ids[0], tokens.worker_id, case.case_id
+        )
+        instrumentation = self._instrumentation(record, spec.device_ids[0], device)
         fingerprint = self._model_fingerprint(record, tokens, spec, characterization)
         result = await asyncio.to_thread(
             self._module_profiler.profile,
@@ -607,10 +820,47 @@ class WorkerProfilingRunner:
             handle.layout,
             handle.adapter,
             instrumentation=instrumentation,
-            environment_fingerprint=fingerprint,
+            environment_fingerprint=environment_fingerprint_id(fingerprint),
             seed=self._seed,
         )
-        return CaseOutcome.from_record(result)
+        return CaseOutcome.from_record(
+            dataclasses.replace(
+                result,
+                environment=fingerprint,
+                environment_fingerprint=environment_fingerprint_id(fingerprint),
+            )
+        )
+
+    def _require_case_device(
+        self,
+        actual: torch.device,
+        device_id: str,
+        worker_id: str,
+        case_id: str,
+    ) -> None:
+        expected = self._device_resolver(device_id, worker_id)
+        if actual != expected:
+            raise ProfilingError(
+                ProfilingErrorCategory.INTERNAL_ERROR,
+                f"case {case_id!r} targets {device_id!r} ({expected}) but "
+                f"the loaded module is on {actual}",
+                {
+                    "case_id": case_id,
+                    "device_id": device_id,
+                    "expected_torch_device": str(expected),
+                    "actual_torch_device": str(actual),
+                },
+            )
+
+    def _instrumentation(
+        self,
+        record: ProfilingSessionRecord,
+        device_id: str,
+        device: torch.device,
+    ) -> InstrumentationBundle:
+        if self._instrumentation_factory is not None:
+            return self._instrumentation_factory(device)
+        return default_instrumentation(device, device_id=device_id, record=record)
 
     # ------------------------------------------------------------------
     # Get / Cancel / Close (§41, §44)
@@ -655,6 +905,66 @@ class WorkerProfilingRunner:
         )
         return CancelProfilingCaseResponse(accepted=True, case_state=entry.state)
 
+    async def prepare_iperf_server(
+        self, request: PrepareIperfServerRequest
+    ) -> PrepareIperfServerResponse:
+        try:
+            self._validate(request)
+        except SessionRefused as exc:
+            return PrepareIperfServerResponse(
+                accepted=False, detail=exc.detail, reason=exc.reason
+            )
+        existing = self._iperf_servers.get(request.server_id)
+        if existing is not None:
+            return PrepareIperfServerResponse(accepted=True, port=existing[2])
+        port = request.port or _available_tcp_port(request.bind_address)
+        try:
+            process = await self._network_profiler.start_iperf_server(
+                port=port, bind_address=request.bind_address
+            )
+        except Exception as exc:
+            return PrepareIperfServerResponse(
+                accepted=False,
+                detail=f"could not start temporary iperf3 server: {exc}",
+                reason=ProfilingRejection.DEVICE_BUSY,
+            )
+        timeout_task = asyncio.create_task(
+            self._expire_iperf_server(request.server_id, request.timeout_s),
+            name=f"iperf-server-timeout-{request.server_id[:12]}",
+        )
+        self._iperf_servers[request.server_id] = (process, timeout_task, port)
+        return PrepareIperfServerResponse(accepted=True, port=port)
+
+    async def stop_iperf_server(
+        self, request: StopIperfServerRequest
+    ) -> StopIperfServerResponse:
+        try:
+            self._validate(request)
+        except SessionRefused as exc:
+            return StopIperfServerResponse(
+                accepted=False, detail=exc.detail, reason=exc.reason
+            )
+        await self._stop_iperf_server(request.server_id)
+        return StopIperfServerResponse(accepted=True)
+
+    async def _expire_iperf_server(self, server_id: str, timeout_s: float) -> None:
+        try:
+            await asyncio.sleep(timeout_s)
+            await self._stop_iperf_server(server_id, cancel_timeout=False)
+        except asyncio.CancelledError:
+            pass
+
+    async def _stop_iperf_server(
+        self, server_id: str, *, cancel_timeout: bool = True
+    ) -> None:
+        handle = self._iperf_servers.pop(server_id, None)
+        if handle is None:
+            return
+        process, timeout_task, _port = handle
+        if cancel_timeout:
+            timeout_task.cancel()
+        await self._network_profiler.stop_iperf_server(process)
+
     async def close_profiling_session(
         self, request: CloseProfilingSessionRequest
     ) -> CloseProfilingSessionResponse:
@@ -679,6 +989,8 @@ class WorkerProfilingRunner:
         """
         for session_id in self._sessions.close_all():
             self._leases.release_session(session_id)
+        for server_id in tuple(self._iperf_servers):
+            await self._stop_iperf_server(server_id)
         self._leases.release_all()
         logger.info("profiling runner shut down")
 
@@ -694,6 +1006,8 @@ class WorkerProfilingRunner:
             | GetProfilingCaseRequest
             | CancelProfilingCaseRequest
             | CloseProfilingSessionRequest
+            | PrepareIperfServerRequest
+            | StopIperfServerRequest
         ),
     ) -> RegistrationTokens:
         """§41: every RPC rides the *current* registration or is refused."""
@@ -709,8 +1023,8 @@ class WorkerProfilingRunner:
         tokens: RegistrationTokens,
         spec: ModelCaseSpec,
         characterization: ModelCharacterization,
-    ) -> str:
-        return self._fingerprint_id(
+    ) -> EnvironmentFingerprint:
+        return self._fingerprint(
             record,
             tokens,
             backend=spec.backend,
@@ -720,7 +1034,7 @@ class WorkerProfilingRunner:
             model_revision=characterization.model.revision,
         )
 
-    def _fingerprint_id(
+    def _fingerprint(
         self,
         record: ProfilingSessionRecord,
         tokens: RegistrationTokens,
@@ -730,26 +1044,104 @@ class WorkerProfilingRunner:
         dtype: str | None = None,
         quantization: str | None = None,
         model_revision: str | None = None,
-    ) -> str:
+    ) -> EnvironmentFingerprint:
         """The §9 compatibility identity every record of this session carries.
 
         Volatile telemetry is not part of it (§9); facts this Worker cannot
         observe (driver version, a verified performance class) stay absent
         rather than approximated (§52.2).
         """
+        performance_class = self._device_performance_class(
+            record, device_id=device_id, backend=backend, dtype=dtype
+        )
         fingerprint = EnvironmentFingerprint(
             backend=backend,
             profiling_implementation_revision=PROFILING_IMPLEMENTATION_REVISION,
+            device_performance_class_id=(
+                device_performance_class_id(performance_class)
+                if performance_class is not None
+                else None
+            ),
+            device_performance_class=performance_class,
             capability_revision=record.capability_revision,
             torch_version=torch.__version__,
             cuda_version=torch.version.cuda,
+            driver_version=self._driver_version(record, device_id),
             model_revision=model_revision,
             dtype=dtype,
             quantization=quantization,
             worker_id=tokens.worker_id,
             device_id=device_id,
         )
-        return environment_fingerprint_id(fingerprint)
+        return fingerprint
+
+    @staticmethod
+    def _driver_version(
+        record: ProfilingSessionRecord, device_id: str | None
+    ) -> str | None:
+        if record.capability is None or device_id is None:
+            return None
+        device = next(
+            (
+                candidate
+                for candidate in record.capability.devices
+                if candidate.identity.device_id == device_id
+            ),
+            None,
+        )
+        return device.driver_version if device is not None else None
+
+    @staticmethod
+    def _device_performance_class(
+        record: ProfilingSessionRecord,
+        *,
+        device_id: str | None,
+        backend: str,
+        dtype: str | None,
+    ) -> DevicePerformanceClass | None:
+        """Build the candidate reuse class from device-relevant facts only.
+
+        Membership in this structural class is not itself permission for
+        cross-device reuse; the store's verified-membership gate owns that
+        decision. Host-wide capability revisions and NIC/container changes
+        deliberately do not participate.
+        """
+        capability = record.capability
+        if capability is None or device_id is None:
+            return None
+        device = next(
+            (
+                candidate
+                for candidate in capability.devices
+                if candidate.identity.device_id == device_id
+            ),
+            None,
+        )
+        if device is None:
+            return None
+        pool = next(
+            (
+                candidate
+                for candidate in capability.memory_pools
+                if candidate.memory_pool_id == device.memory_pool_id
+            ),
+            None,
+        )
+        memory_model = (
+            MemoryModel(pool.model.value) if pool is not None else MemoryModel.DISCRETE
+        )
+        versions = {"torch": torch.__version__.split("+")[0]}
+        if torch.version.cuda is not None:
+            versions["cuda"] = torch.version.cuda
+        return DevicePerformanceClass(
+            vendor=device.vendor,
+            accelerator_model=device.model,
+            memory_model=memory_model,
+            backend_family=backend,
+            architecture=device.compute_capability,
+            dtype=dtype,
+            software_versions=tuple(sorted(versions.items())),
+        )
 
 
 def _kind_mismatch(record: ProfilingSessionRecord, case: ProfilingCase) -> str | None:

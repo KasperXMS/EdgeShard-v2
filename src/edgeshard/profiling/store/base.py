@@ -29,6 +29,7 @@ from typing import Protocol
 from edgeshard.model.errors import EdgeShardError
 from edgeshard.profiling.domain.environment import (
     DevicePerformanceClass,
+    DevicePerformanceClassMembership,
     EnvironmentFingerprint,
 )
 from edgeshard.profiling.domain.experiment import (
@@ -36,6 +37,7 @@ from edgeshard.profiling.domain.experiment import (
     ExperimentState,
     ProfilingCase,
     ProfilingExperiment,
+    ProfilingFailure,
 )
 from edgeshard.profiling.domain.measurement import MeasurementRecord
 from edgeshard.profiling.domain.model import ModelCharacterization
@@ -63,6 +65,7 @@ class StoredCase:
 
     case: ProfilingCase
     state: CaseState
+    failure: ProfilingFailure | None = None
 
 
 @dataclass(frozen=True)
@@ -81,8 +84,13 @@ class ProfileStore(Protocol):
     def append_case(self, case: ProfilingCase) -> bool:
         """Persist a case definition; ``False`` when the id already exists."""
 
-    def update_case_state(self, case_id: str, state: CaseState) -> None:
-        """Set the lifecycle state of a persisted case."""
+    def update_case_state(
+        self,
+        case_id: str,
+        state: CaseState,
+        failure: ProfilingFailure | None = None,
+    ) -> None:
+        """Set lifecycle state and preserve any typed terminal failure."""
 
     def get_case(self, case_id: str) -> StoredCase | None:
         """One persisted case with its state, or ``None`` when unknown."""
@@ -155,18 +163,15 @@ class ProfileStore(Protocol):
 
     # -- reuse queries (§28) and snapshot (§46) -------------------------------
 
-    def measured_operator_signature_ids(
-        self,
-        *,
-        device_performance_class_id: str | None = None,
-        environment_fingerprint_id: str | None = None,
-    ) -> AbstractSet[str]:
-        """Operator signature ids that already have measurements (§28).
+    def store_performance_class_membership(
+        self, membership: DevicePerformanceClassMembership
+    ) -> None:
+        """Persist a physical device's verified or pending class membership."""
 
-        Unfiltered this answers "ever measured anywhere"; the filters scope
-        the answer to one performance class / fingerprint — the reuse
-        judgment context (§9).
-        """
+    def measured_operator_signature_ids_for_environment(
+        self, fingerprint: EnvironmentFingerprint
+    ) -> AbstractSet[str]:
+        """Return reuse licensed for one physical environment."""
 
     def build_snapshot(
         self, snapshot_id: str, *, created_at: datetime | None = None
@@ -183,11 +188,9 @@ class OperatorSignatureIndex:
     """
 
     store: ProfileStore
-    device_performance_class_id: str | None = None
-    environment_fingerprint_id: str | None = None
+    environment: EnvironmentFingerprint
 
     def measured_signature_ids(self) -> AbstractSet[str]:
-        return self.store.measured_operator_signature_ids(
-            device_performance_class_id=self.device_performance_class_id,
-            environment_fingerprint_id=self.environment_fingerprint_id,
+        return self.store.measured_operator_signature_ids_for_environment(
+            self.environment
         )

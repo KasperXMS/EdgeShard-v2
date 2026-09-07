@@ -9,6 +9,7 @@ is a P2B DoD item on the RTX host and out of scope here.
 from __future__ import annotations
 
 import time
+from contextlib import nullcontext
 from typing import Any, ClassVar
 
 import pytest
@@ -86,7 +87,13 @@ def fake_cuda(monkeypatch: pytest.MonkeyPatch) -> type[_FakeEvent]:
     _FakeEvent.log = []
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(
+        torch.cuda,
+        "current_stream",
+        lambda device=None: ("current-stream", str(device)),
+    )
     monkeypatch.setattr(torch.cuda, "Event", _FakeEvent)
+    monkeypatch.setattr(torch.cuda, "device", lambda device: nullcontext())
     return _FakeEvent
 
 
@@ -100,6 +107,28 @@ def test_cuda_timer_contract(fake_cuda: type[_FakeEvent]) -> None:
     # create start+end events, record both, synchronize, then read.
     assert kinds == ["create", "create", "record", "record", "synchronize"]
     assert elapsed == 12.5
+
+
+def test_cuda_timer_uses_target_devices_current_stream(
+    fake_cuda: type[_FakeEvent], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    requested: list[torch.device] = []
+
+    def current_stream(device: torch.device | None = None) -> object:
+        assert device is not None
+        requested.append(device)
+        return f"stream-{device.index}"
+
+    monkeypatch.setattr(torch.cuda, "current_stream", current_stream)
+    timer = CudaEventTimer(device_index=1)
+    timer.start()
+    timer.stop()
+
+    assert requested == [torch.device("cuda", 1)]
+    assert [stream for kind, stream in fake_cuda.log if kind == "record"] == [
+        "stream-1",
+        "stream-1",
+    ]
 
 
 def test_cuda_timer_records_on_given_stream(fake_cuda: type[_FakeEvent]) -> None:

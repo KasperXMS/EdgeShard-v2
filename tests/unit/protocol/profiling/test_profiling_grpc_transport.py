@@ -13,6 +13,7 @@ import grpc
 import pytest
 from wire_fixtures import (
     CHARACTERIZATION,
+    ENVIRONMENT,
     FAILURE,
     INSTANCE_ID,
     MODEL,
@@ -63,6 +64,8 @@ from edgeshard.protocol.profiling.mapper import (
     GetExperimentResponse,
     GetProfilingCaseRequest,
     GetProfilingCaseResponse,
+    PrepareIperfServerRequest,
+    PrepareIperfServerResponse,
     PrepareProfilingSessionRequest,
     PrepareProfilingSessionResponse,
     ProfilingProtocolError,
@@ -71,6 +74,8 @@ from edgeshard.protocol.profiling.mapper import (
     RunProfilingCaseResponse,
     StartExperimentRequest,
     StartExperimentResponse,
+    StopIperfServerRequest,
+    StopIperfServerResponse,
 )
 from edgeshard.protocol.profiling.pb import profiling_pb2 as pb
 from edgeshard.protocol.profiling.pb import profiling_pb2_grpc as pb_grpc
@@ -94,6 +99,8 @@ class RecordingHandler:
         self.gets: list[GetProfilingCaseRequest] = []
         self.cancels: list[CancelProfilingCaseRequest] = []
         self.closes: list[CloseProfilingSessionRequest] = []
+        self.iperf_prepares: list[PrepareIperfServerRequest] = []
+        self.iperf_stops: list[StopIperfServerRequest] = []
         self.prepare_response = PrepareProfilingSessionResponse(
             accepted=True, session_facts=SESSION_FACTS
         )
@@ -107,6 +114,10 @@ class RecordingHandler:
             accepted=True, case_state=CaseState.CANCELLED
         )
         self.close_response = CloseProfilingSessionResponse(accepted=True)
+        self.iperf_prepare_response = PrepareIperfServerResponse(
+            accepted=True, port=45678
+        )
+        self.iperf_stop_response = StopIperfServerResponse(accepted=True)
         self.error: Exception | None = None
 
     async def prepare_profiling_session(
@@ -148,6 +159,18 @@ class RecordingHandler:
             raise self.error
         self.closes.append(request)
         return self.close_response
+
+    async def prepare_iperf_server(
+        self, request: PrepareIperfServerRequest
+    ) -> PrepareIperfServerResponse:
+        self.iperf_prepares.append(request)
+        return self.iperf_prepare_response
+
+    async def stop_iperf_server(
+        self, request: StopIperfServerRequest
+    ) -> StopIperfServerResponse:
+        self.iperf_stops.append(request)
+        return self.iperf_stop_response
 
 
 @pytest.fixture
@@ -266,6 +289,28 @@ async def test_close_roundtrip_over_grpc(transport) -> None:
     assert handler.closes == [CloseProfilingSessionRequest(**TOKENS)]
 
 
+async def test_destination_iperf_lifecycle_roundtrip_over_grpc(transport) -> None:
+    handler, client, _port = transport
+    token_fields = {
+        key: value for key, value in TOKENS.items() if key != "profiling_session_id"
+    }
+    prepare = PrepareIperfServerRequest(
+        **token_fields,
+        server_id="server-for-case",
+        timeout_s=7.5,
+        bind_address="100.64.0.20",
+    )
+    stop = StopIperfServerRequest(**token_fields, server_id="server-for-case")
+
+    prepared = await client.prepare_iperf_server(prepare)
+    stopped = await client.stop_iperf_server(stop)
+
+    assert prepared.port == 45678
+    assert stopped.accepted
+    assert handler.iperf_prepares == [prepare]
+    assert handler.iperf_stops == [stop]
+
+
 async def test_handler_protocol_error_aborts_rpc(transport) -> None:
     handler, client, _port = transport
     handler.error = ProfilingProtocolError("boom")
@@ -380,6 +425,8 @@ ADMIN_SNAPSHOT = ProfileSnapshot(
     model_characterizations=(CHARACTERIZATION,),
     measurements=(RECORD,),
     network_measurements=(),
+    profiling_cases=(MODEL_CASE,),
+    environment_fingerprints=(ENVIRONMENT,),
 )
 
 

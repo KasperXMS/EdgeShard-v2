@@ -184,11 +184,16 @@ class LocalWorkerInspector:
         self._capability_at = float("-inf")
         self._models: tuple[ModelInventoryEntry, ...] = ()
         self._models_at = float("-inf")
+        self._latest_state: WorkerState | None = None
         self._started = False
 
     @property
     def started(self) -> bool:
         return self._started
+
+    def current_state(self) -> WorkerState | None:
+        """Latest Phase 1 NVML/tegrastats sample for synchronous instruments."""
+        return self._latest_state
 
     async def start(self) -> None:
         """One-time static discovery; idempotent."""
@@ -240,6 +245,7 @@ class LocalWorkerInspector:
             runtime_instances=runtime_instances,
             models=self._models,
         )
+        self._latest_state = state
         logger.info(
             "local inspection complete worker_id=%s devices=%d pools=%d runtimes=%d models=%d",
             self._worker_id,
@@ -257,6 +263,7 @@ class LocalWorkerInspector:
         if self._owns_telemetry:
             await _close_samplers(self._telemetry_probes)
         self._owns_telemetry = False
+        self._latest_state = None
         if self._owns_docker_client and self._docker_client is not None:
             try:
                 self._docker_client.close()

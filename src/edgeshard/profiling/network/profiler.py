@@ -3,10 +3,10 @@
 ``NetworkProfiler`` turns a ``NetworkCaseSpec`` into an empirical
 :class:`MeasurementRecord` — RTT via the bounded system-ping runner,
 bandwidth via the JSON-only iperf3 runner. Probes run where the flow
-originates (§8.2): the case executes on the source worker, the
-destination address is resolved from Phase 1 facts (the deterministic
-primary IPv4 of the destination worker), and the iperf3 server on the
-destination is placed by P2G orchestration.
+originates (§8.2): the case executes on the source worker and resolves both
+ends through the explicitly selected interfaces. Ambiguous multi-NIC paths
+are rejected instead of silently probing an arbitrary address; the iperf3
+server on the destination is placed by P2G orchestration.
 
 Records always carry the measurement regime (§35: v1 measures
 ``IDLE_SINGLE_FLOW`` baselines, explicitly recorded so Phase 3 never
@@ -57,15 +57,17 @@ from edgeshard.profiling.network.classifier import (
     classify_pairs,
     classify_path,
     enumerate_pairs,
-    primary_ipv4_address,
     select_bandwidth_pairs,
+    selected_ipv4_address,
 )
 from edgeshard.profiling.network.iperf import (
     DEFAULT_IPERF3_DURATION_S,
+    DEFAULT_IPERF3_PORT,
     Iperf3Probe,
     Iperf3Runner,
 )
 from edgeshard.profiling.network.ping import DEFAULT_PING_CONCURRENCY, PingRunner
+from edgeshard.profiling.network.processes import terminate_process
 
 logger = logging.getLogger("profiling.network.profiler")
 
@@ -216,12 +218,16 @@ def bandwidth_cases(
             source,
             destination,
             same_subnet_prefix_length=same_subnet_prefix_length,
+            source_interface_id=pair.source_interface_id,
+            destination_interface_id=pair.destination_interface_id,
         )
         for direction in directions:
             spec = NetworkCaseSpec(
                 probe_kind=ProbeKind.BANDWIDTH,
                 source_worker_id=pair.source_worker_id,
                 destination_worker_id=pair.destination_worker_id,
+                source_interface_id=pair.source_interface_id,
+                destination_interface_id=pair.destination_interface_id,
                 path_class=path_class,
                 transport=transport,
                 direction=direction,
@@ -256,6 +262,7 @@ class NetworkProfiler:
         *,
         network_facts: Mapping[str, WorkerNetworkFacts],
         environment_fingerprint: str,
+        iperf_server_port: int | None = None,
     ) -> MeasurementRecord:
         """One RTT or bandwidth measurement for ``case``."""
         spec = require_network_spec(case)
@@ -265,13 +272,24 @@ class NetworkProfiler:
                 f"no network facts for destination worker "
                 f"{spec.destination_worker_id!r}"
             )
-        target = primary_ipv4_address(destination)
+        target = selected_ipv4_address(
+            destination, spec.destination_interface_id
+        )
+        source = network_facts.get(spec.source_worker_id)
+        source_address = (
+            selected_ipv4_address(source, spec.source_interface_id)
+            if source is not None
+            else None
+        )
         if target is None:
             raise ProfilingError(
                 ProfilingErrorCategory.NETWORK_UNREACHABLE,
                 f"destination worker {spec.destination_worker_id!r} has no "
-                "IPv4 address to probe",
-                {"destination_worker_id": spec.destination_worker_id},
+                "unambiguous IPv4 probe path; select destination_interface_id",
+                {
+                    "destination_worker_id": spec.destination_worker_id,
+                    "destination_interface_id": spec.destination_interface_id,
+                },
             )
         started_at = datetime.now(UTC)
         metadata: dict[str, JsonScalar] = {
@@ -283,7 +301,16 @@ class NetworkProfiler:
             "path_class": spec.path_class.value if spec.path_class is not None else None,
         }
         if spec.probe_kind is ProbeKind.RTT:
-            observation = await self._ping.probe(target, packet_count=spec.packet_count)
+            if spec.source_interface_id is not None:
+                observation = await self._ping.probe(
+                    target,
+                    packet_count=spec.packet_count,
+                    bind_address=source_address,
+                )
+            else:
+                observation = await self._ping.probe(
+                    target, packet_count=spec.packet_count
+                )
             metrics = MeasurementMetrics(
                 rtt=RttMetrics(
                     summary=observation.summary,
@@ -308,6 +335,8 @@ class NetworkProfiler:
                     direction=spec.direction,
                     duration_s=duration_s,
                     payload_bytes=spec.payload_bytes,
+                    bind_address=source_address,
+                    port=iperf_server_port or DEFAULT_IPERF3_PORT,
                 )
             )
             metrics = MeasurementMetrics(
@@ -346,6 +375,17 @@ class NetworkProfiler:
             sample_count,
         )
         return record
+
+    async def start_iperf_server(
+        self, *, port: int, bind_address: str | None = None
+    ) -> asyncio.subprocess.Process:
+        return await self._iperf.start_server(
+            port=port, bind_address=bind_address
+        )
+
+    @staticmethod
+    async def stop_iperf_server(process: asyncio.subprocess.Process) -> None:
+        await terminate_process(process)
 
     async def probe_rtt(
         self,

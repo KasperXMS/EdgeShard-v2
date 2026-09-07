@@ -105,9 +105,8 @@ def make_inspection(worker_id: str) -> LocalInspection:
 
     * The CPU device carries the ``derive_cpu_device_id`` id so the real
       ``resolve_torch_device`` maps it to ``torch.device("cpu")`` (§38).
-    * The only network interface is loopback, so the deterministic probe
-      target (numerically smallest IPv4, §33) is 127.0.0.1 and real pings
-      never leave this host.
+    * The only IPv4-capable interface is loopback, so path selection is
+      unambiguous and real pings never leave this host.
     * The state reports an *idle* device (the real lease floor is 5%
       utilization, §39) and the tiny-llama READY inventory entry the real
       ``resolve_model_source`` resolves against.
@@ -480,6 +479,8 @@ class TestModelChain:
         )
         assert second.accepted is False
         assert "zero cases" in second.detail
+        assert cluster.store is not None
+        before_rerun = len(cluster.store.query_measurements())
 
         third = await cluster.admin.start_experiment(
             mapper.StartExperimentRequest(
@@ -487,12 +488,18 @@ class TestModelChain:
             )
         )
         assert third.accepted is True, third.detail
-        # Canonical ids (§7): re-measuring the same intent is the *same*
-        # experiment, dispatched again against the same Worker.
-        assert third.experiment_id == first.experiment_id
+        assert third.experiment_id != first.experiment_id
         report3 = await drain(cluster.admin, third.experiment_id)
         assert report3.state is ExperimentState.COMPLETED
         assert len(report3.cases) == measured
+        first_stored = cluster.store.get_experiment(first.experiment_id)
+        third_stored = cluster.store.get_experiment(third.experiment_id)
+        assert first_stored is not None and third_stored is not None
+        assert (
+            first_stored.experiment.configuration_id
+            == third_stored.experiment.configuration_id
+        )
+        assert len(cluster.store.query_measurements()) == before_rerun + measured
 
 
 # ---------------------------------------------------------------------------

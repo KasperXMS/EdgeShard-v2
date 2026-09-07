@@ -198,7 +198,8 @@ class DefaultProfilingStrategy:
         cases: list[ProfilingCase] = []
         reuse: dict[str, IncrementalPlan] = {}
 
-        # Step 4 — operator microprofiles for what each device never measured (§28).
+        # Step 4 — operator microprofiles missing from each compatible,
+        # verified device-performance reuse scope (§28).
         for device_id in devices:
             plan = plan_incremental_profiling(
                 benchmarkable, measured_ids=measured.get(device_id, frozenset())

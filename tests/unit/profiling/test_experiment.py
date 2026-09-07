@@ -197,8 +197,10 @@ def test_decode_requires_context_length_and_prefill_forbids_it() -> None:
 def test_model_case_device_and_shape_validation() -> None:
     with pytest.raises(ValueError, match="device_ids"):
         _model_case(device_ids=())
-    with pytest.raises(ValueError, match="duplicate device_id"):
+    with pytest.raises(ValueError, match="single-device"):
         _model_case(device_ids=("GPU-uuid-1", "GPU-uuid-1"))
+    with pytest.raises(ValueError, match="single-device"):
+        _model_case(device_ids=("GPU-uuid-1", "GPU-uuid-2"))
     with pytest.raises(ValueError, match="sequence_length"):
         _model_case(sequence_length=0)
     with pytest.raises(ValueError, match="batch_size"):

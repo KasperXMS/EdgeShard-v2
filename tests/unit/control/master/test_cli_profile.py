@@ -211,7 +211,7 @@ class TestStartCommands:
                 "profile", "network", "bandwidth",
                 "--master", MASTER,
                 "--path-class", "wired_lan",
-                "--pair", "w-1:w-2",
+                "--pair", "w-1@zt0:w-2@zt1",
             ],
         )
 
@@ -222,6 +222,8 @@ class TestStartCommands:
         (pair,) = intent.extra_bandwidth_pairs
         assert pair.source_worker_id == "w-1"
         assert pair.destination_worker_id == "w-2"
+        assert pair.source_interface_id == "zt0"
+        assert pair.destination_interface_id == "zt1"
 
     def test_unknown_path_class_exits_nonzero(self, stub) -> None:
         result = runner.invoke(

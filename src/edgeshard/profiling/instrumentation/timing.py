@@ -102,7 +102,20 @@ class CudaEventTimer:
             if device_index is not None
             else torch.device("cuda", torch.cuda.current_device())
         )
-        self._stream = stream
+        # Resolve the current stream for the *target* device explicitly.
+        # torch.cuda.current_stream() without a device follows the process'
+        # ambient current device and can silently time cuda:0 while the
+        # workload executes on cuda:1.
+        self._stream = (
+            stream
+            if stream is not None
+            else torch.cuda.current_stream(device=self._device)
+        )
+        stream_device = getattr(self._stream, "device", None)
+        if stream_device is not None and torch.device(stream_device) != self._device:
+            raise ValueError(
+                f"CUDA stream belongs to {stream_device}, expected {self._device}"
+            )
         self._start_event: torch.cuda.Event | None = None
         self._end_event: torch.cuda.Event | None = None
 
@@ -111,8 +124,10 @@ class CudaEventTimer:
         return TimeUnit.MILLISECONDS
 
     def start(self) -> None:
-        self._start_event = torch.cuda.Event(enable_timing=True)  # type: ignore[no-untyped-call]
-        self._end_event = torch.cuda.Event(enable_timing=True)  # type: ignore[no-untyped-call]
+        # Bind event construction as well as recording to the target device.
+        with torch.cuda.device(self._device):
+            self._start_event = torch.cuda.Event(enable_timing=True)  # type: ignore[no-untyped-call]
+            self._end_event = torch.cuda.Event(enable_timing=True)  # type: ignore[no-untyped-call]
         self._start_event.record(self._stream)
 
     def stop(self) -> float:

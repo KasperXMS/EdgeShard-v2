@@ -21,6 +21,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 
+from edgeshard.profiling.domain.environment import EnvironmentFingerprint
 from edgeshard.profiling.domain.hashing import canonical_sha256
 from edgeshard.profiling.domain.model import ModelCharacterization, ModelReference
 from edgeshard.profiling.domain.signature import (
@@ -57,6 +58,7 @@ class ProfilingSessionRequest:
     model: ModelReference | None = None
     dtype: str | None = None
     quantization: str | None = None
+    target_layer_index: int | None = None
 
     def __post_init__(self) -> None:
         if not self.backend:
@@ -65,12 +67,16 @@ class ProfilingSessionRequest:
             if not device_id:
                 raise ValueError("device_ids must not contain empty entries")
         if self.kind is ProfilingSessionKind.MODEL:
-            if not self.device_ids:
-                raise ValueError("model sessions require at least one device_id")
+            if len(self.device_ids) != 1:
+                raise ValueError(
+                    "model sessions require exactly one device_id in Phase 2 v1"
+                )
             if self.model is None:
                 raise ValueError("model sessions require a model reference (§38)")
             if self.dtype is None:
                 raise ValueError("model sessions require the declared measurement dtype")
+            if self.target_layer_index is not None and self.target_layer_index < 0:
+                raise ValueError("target_layer_index must not be negative")
         else:
             if self.model is not None:
                 raise ValueError(
@@ -78,6 +84,10 @@ class ProfilingSessionRequest:
                 )
             if self.kind is ProfilingSessionKind.OPERATOR and not self.device_ids:
                 raise ValueError("operator sessions require at least one device_id")
+            if self.target_layer_index is not None:
+                raise ValueError(
+                    "target_layer_index is only valid for model sessions"
+                )
         if self.dtype is not None and not self.dtype:
             raise ValueError("dtype must not be empty when present")
         if self.quantization is not None and not self.quantization:
@@ -161,6 +171,7 @@ class ModelSessionFacts:
     layer_entries: tuple[LayerEntry, ...]
     module_entries: tuple[ModuleEntry, ...]
     operator_signatures: tuple[OperatorSignature, ...]
+    environment: EnvironmentFingerprint | None = None
 
     def __post_init__(self) -> None:
         if len(self.layer_entries) != self.characterization.num_layers:

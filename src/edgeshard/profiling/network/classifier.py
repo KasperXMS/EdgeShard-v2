@@ -14,9 +14,8 @@ policies:
   ``utun*``/``tun*``/``tap*``/``vxlan*`` — matching the Phase 1 host
   discovery conventions — wired ``eth*``/``en*``); an unmatched name is
   ``UNKNOWN``, never a silent default;
-* the probe target of a worker is its numerically smallest IPv4 address
-  (Phase 1 records no routing table, so this deterministic policy
-  approximates the default-route address);
+* real probes require an explicit interface on multi-NIC workers; a sole
+  IPv4-capable interface may be selected without ambiguity;
 * same-subnet detection compares the first ``same_subnet_prefix_length``
   bits (default /24) — Phase 1 records no netmasks, so the prefix length
   is an explicit configuration knob, not a hidden guess (§31).
@@ -206,6 +205,41 @@ def primary_ipv4_address(facts: WorkerNetworkFacts) -> str | None:
     return str(min(candidates)) if candidates else None
 
 
+def selected_interface(
+    facts: WorkerNetworkFacts, interface_id: str | None
+) -> InterfaceFacts | None:
+    """Resolve an explicit interface, or the sole probeable interface.
+
+    A multi-NIC host without an explicit selection is intentionally
+    ambiguous. Real probes must not guess a route from address ordering.
+    """
+    if interface_id is not None:
+        return next(
+            (
+                interface
+                for interface in facts.interfaces
+                if interface.interface_id == interface_id
+            ),
+            None,
+        )
+    candidates = tuple(
+        interface
+        for interface in facts.interfaces
+        if _ipv4_addresses(interface.addresses)
+    )
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def selected_ipv4_address(
+    facts: WorkerNetworkFacts, interface_id: str | None
+) -> str | None:
+    interface = selected_interface(facts, interface_id)
+    if interface is None:
+        return None
+    addresses = _ipv4_addresses(interface.addresses)
+    return str(addresses[0]) if addresses else None
+
+
 def probed_interface(facts: WorkerNetworkFacts) -> InterfaceFacts | None:
     """The interface owning the primary IPv4 address (classification input)."""
     primary = primary_ipv4_address(facts)
@@ -228,13 +262,16 @@ def classify_path(
     destination: WorkerNetworkFacts,
     *,
     same_subnet_prefix_length: int = DEFAULT_SAME_SUBNET_PREFIX_LENGTH,
+    source_interface_id: str | None = None,
+    destination_interface_id: str | None = None,
 ) -> NetworkPathClass:
     """Cheap path classification from facts only (§31).
 
     Inputs are interface metadata (name-derived kind), subnet membership
     (configurable prefix policy), overlay metadata, and host identity —
     no LLDP/SNMP/SDN. The classification is over the *probed* interfaces:
-    the ones owning each side's deterministic primary IPv4 address.
+    explicit ones when supplied, otherwise the legacy classification-only
+    primary address. Real probe execution never uses that legacy guess.
     """
     if not 1 <= same_subnet_prefix_length <= 32:
         raise ValueError(
@@ -243,15 +280,31 @@ def classify_path(
         )
     if source.worker_id == destination.worker_id or source.hostname == destination.hostname:
         return NetworkPathClass.SAME_HOST
-    source_interface = probed_interface(source)
-    destination_interface = probed_interface(destination)
+    source_interface = (
+        selected_interface(source, source_interface_id)
+        if source_interface_id is not None
+        else probed_interface(source)
+    )
+    destination_interface = (
+        selected_interface(destination, destination_interface_id)
+        if destination_interface_id is not None
+        else probed_interface(destination)
+    )
     if source_interface is None or destination_interface is None:
         return NetworkPathClass.OTHER
     kinds = (source_interface.kind, destination_interface.kind)
     if InterfaceKind.OVERLAY in kinds:
         return NetworkPathClass.OVERLAY
-    source_address = primary_ipv4_address(source)
-    destination_address = primary_ipv4_address(destination)
+    source_address = (
+        selected_ipv4_address(source, source_interface_id)
+        if source_interface_id is not None
+        else primary_ipv4_address(source)
+    )
+    destination_address = (
+        selected_ipv4_address(destination, destination_interface_id)
+        if destination_interface_id is not None
+        else primary_ipv4_address(destination)
+    )
     assert source_address is not None and destination_address is not None
     if not _same_subnet(source_address, destination_address, same_subnet_prefix_length):
         return NetworkPathClass.CROSS_SUBNET

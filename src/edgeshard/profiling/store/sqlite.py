@@ -26,6 +26,7 @@ Discipline enforced here:
 
 from __future__ import annotations
 
+import dataclasses
 import sqlite3
 import threading
 from collections.abc import Callable, Sequence
@@ -35,9 +36,11 @@ from pathlib import Path
 from edgeshard.profiling.codec import PayloadCodecError, decode_json, encode_json
 from edgeshard.profiling.domain.environment import (
     DevicePerformanceClass,
+    DevicePerformanceClassMembership,
     EnvironmentFingerprint,
     device_performance_class_id,
     environment_fingerprint_id,
+    environment_instance_id,
 )
 from edgeshard.profiling.domain.experiment import (
     CaseState,
@@ -46,6 +49,7 @@ from edgeshard.profiling.domain.experiment import (
     NetworkCaseSpec,
     ProfilingCase,
     ProfilingExperiment,
+    ProfilingFailure,
 )
 from edgeshard.profiling.domain.measurement import MeasurementRecord
 from edgeshard.profiling.domain.model import ModelCharacterization, model_signature_id
@@ -64,7 +68,7 @@ from edgeshard.profiling.domain.signature import (
     operator_signature_id,
     transformer_layer_signature_id,
 )
-from edgeshard.profiling.domain.snapshot import ProfileSnapshot
+from edgeshard.profiling.domain.snapshot import NetworkPathProfile, ProfileSnapshot
 from edgeshard.profiling.store.base import (
     ProfileStoreError,
     StoredCase,
@@ -87,12 +91,14 @@ CREATE TABLE IF NOT EXISTS profiling_cases (
     worker_id TEXT NOT NULL,
     kind     TEXT NOT NULL,
     state    TEXT NOT NULL,
+    failure_payload TEXT,
     payload  TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS measurements (
     measurement_id           TEXT PRIMARY KEY,
     case_id                  TEXT NOT NULL REFERENCES profiling_cases(case_id),
     environment_fingerprint_id TEXT NOT NULL,
+    environment_instance_id TEXT REFERENCES environment_instances(environment_instance_id),
     model_id                 TEXT,
     model_revision           TEXT,
     layer_signature_id       TEXT,
@@ -177,6 +183,21 @@ CREATE TABLE IF NOT EXISTS device_performance_classes (
     backend_family              TEXT NOT NULL,
     payload                     TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS environment_instances (
+    environment_instance_id     TEXT PRIMARY KEY,
+    environment_fingerprint_id  TEXT NOT NULL,
+    worker_id                   TEXT,
+    device_id                   TEXT,
+    payload                     TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS device_performance_class_memberships (
+    device_performance_class_id TEXT NOT NULL,
+    worker_id                   TEXT NOT NULL,
+    device_id                   TEXT NOT NULL,
+    verified                    INTEGER NOT NULL,
+    payload                     TEXT NOT NULL,
+    PRIMARY KEY (device_performance_class_id, worker_id, device_id)
+);
 CREATE INDEX IF NOT EXISTS ix_measurements_case ON measurements(case_id);
 CREATE INDEX IF NOT EXISTS ix_measurements_fingerprint
     ON measurements(environment_fingerprint_id);
@@ -213,6 +234,22 @@ class SqliteProfileStore:
         self._conn.execute("PRAGMA foreign_keys = ON")
         with self._lock, self._conn:
             self._conn.executescript(SCHEMA)
+            columns = {
+                row["name"]
+                for row in self._conn.execute("PRAGMA table_info(profiling_cases)")
+            }
+            if "failure_payload" not in columns:
+                self._conn.execute(
+                    "ALTER TABLE profiling_cases ADD COLUMN failure_payload TEXT"
+                )
+            measurement_columns = {
+                row["name"]
+                for row in self._conn.execute("PRAGMA table_info(measurements)")
+            }
+            if "environment_instance_id" not in measurement_columns:
+                self._conn.execute(
+                    "ALTER TABLE measurements ADD COLUMN environment_instance_id TEXT"
+                )
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -243,11 +280,18 @@ class SqliteProfileStore:
                 what=f"profiling case {case.case_id!r}",
             )
 
-    def update_case_state(self, case_id: str, state: CaseState) -> None:
+    def update_case_state(
+        self,
+        case_id: str,
+        state: CaseState,
+        failure: ProfilingFailure | None = None,
+    ) -> None:
+        failure_payload = encode_json(failure) if failure is not None else None
         with self._lock, self._conn:
             cursor = self._conn.execute(
-                "UPDATE profiling_cases SET state = ? WHERE case_id = ?",
-                (state.value, case_id),
+                "UPDATE profiling_cases SET state = ?, failure_payload = ? "
+                "WHERE case_id = ?",
+                (state.value, failure_payload, case_id),
             )
             if cursor.rowcount == 0:
                 raise ProfileStoreError(f"unknown profiling case {case_id!r}")
@@ -255,7 +299,8 @@ class SqliteProfileStore:
     def get_case(self, case_id: str) -> StoredCase | None:
         with self._lock:
             row = self._conn.execute(
-                "SELECT payload, state FROM profiling_cases WHERE case_id = ?",
+                "SELECT payload, state, failure_payload FROM profiling_cases "
+                "WHERE case_id = ?",
                 (case_id,),
             ).fetchone()
         if row is None:
@@ -263,11 +308,20 @@ class SqliteProfileStore:
         return StoredCase(
             case=self._decode(ProfilingCase, row["payload"], "profiling case"),
             state=CaseState(row["state"]),
+            failure=(
+                self._decode(
+                    ProfilingFailure, row["failure_payload"], "profiling failure"
+                )
+                if row["failure_payload"] is not None
+                else None
+            ),
         )
 
     def append_measurement(self, record: MeasurementRecord) -> bool:
         payload_text = encode_json(record)
         with self._lock, self._conn:
+            if record.environment is not None:
+                self.store_environment_fingerprint(record.environment)
             case_row = self._conn.execute(
                 "SELECT payload FROM profiling_cases WHERE case_id = ?",
                 (record.case_id,),
@@ -281,11 +335,12 @@ class SqliteProfileStore:
             columns = self._measurement_columns(record, case)
             inserted = self._insert_verified(
                 "INSERT OR IGNORE INTO measurements ("
-                "measurement_id, case_id, environment_fingerprint_id, model_id, "
+                "measurement_id, case_id, environment_fingerprint_id, "
+                "environment_instance_id, model_id, "
                 "model_revision, layer_signature_id, module_signature_id, "
                 "operator_signature_id, network_pair_id, probe_kind, started_at, "
                 "finished_at, sample_count, payload) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (*columns, payload_text),
                 select_sql="SELECT payload FROM measurements WHERE measurement_id = ?",
                 select_params=(record.measurement_id,),
@@ -567,8 +622,18 @@ class SqliteProfileStore:
 
     def store_environment_fingerprint(self, fingerprint: EnvironmentFingerprint) -> str:
         fingerprint_id = environment_fingerprint_id(fingerprint)
-        payload_text = encode_json(fingerprint)
+        compatibility_fingerprint = dataclasses.replace(
+            fingerprint,
+            capability_revision=None,
+            worker_id=None,
+            device_id=None,
+        )
+        payload_text = encode_json(compatibility_fingerprint)
+        instance_id = environment_instance_id(fingerprint)
+        instance_payload = encode_json(fingerprint)
         with self._lock, self._conn:
+            if fingerprint.device_performance_class is not None:
+                self.store_performance_class(fingerprint.device_performance_class)
             self._insert_verified(
                 "INSERT OR IGNORE INTO environment_fingerprints ("
                 "environment_fingerprint_id, backend, worker_id, device_id, "
@@ -589,6 +654,48 @@ class SqliteProfileStore:
                 payload_text=payload_text,
                 what=f"environment fingerprint {fingerprint_id!r}",
             )
+            self._insert_verified(
+                "INSERT OR IGNORE INTO environment_instances ("
+                "environment_instance_id, environment_fingerprint_id, worker_id, "
+                "device_id, payload) VALUES (?, ?, ?, ?, ?)",
+                (
+                    instance_id,
+                    fingerprint_id,
+                    fingerprint.worker_id,
+                    fingerprint.device_id,
+                    instance_payload,
+                ),
+                select_sql=(
+                    "SELECT payload FROM environment_instances "
+                    "WHERE environment_instance_id = ?"
+                ),
+                select_params=(instance_id,),
+                payload_text=instance_payload,
+                what=f"environment instance {instance_id!r}",
+            )
+            if (
+                fingerprint.device_performance_class_id is not None
+                and fingerprint.worker_id is not None
+                and fingerprint.device_id is not None
+            ):
+                existing = self._conn.execute(
+                    "SELECT COUNT(*) AS count FROM "
+                    "device_performance_class_memberships WHERE "
+                    "device_performance_class_id = ?",
+                    (fingerprint.device_performance_class_id,),
+                ).fetchone()
+                is_reference = existing is not None and int(existing["count"]) == 0
+                self.store_performance_class_membership(
+                    DevicePerformanceClassMembership(
+                        device_performance_class_id=(
+                            fingerprint.device_performance_class_id
+                        ),
+                        worker_id=fingerprint.worker_id,
+                        device_id=fingerprint.device_id,
+                        verified=is_reference,
+                        verified_at=self._clock() if is_reference else None,
+                    )
+                )
         return fingerprint_id
 
     def store_performance_class(self, performance_class: DevicePerformanceClass) -> str:
@@ -617,37 +724,101 @@ class SqliteProfileStore:
             )
         return class_id
 
-    # -- reuse queries (§28) and snapshot (§46) -------------------------------------
-
-    def measured_operator_signature_ids(
-        self,
-        *,
-        device_performance_class_id: str | None = None,
-        environment_fingerprint_id: str | None = None,
-    ) -> frozenset[str]:
-        sql = (
-            "SELECT DISTINCT operator_signature_id FROM measurements "
-            "WHERE operator_signature_id IS NOT NULL"
-        )
-        params: list[_SqlValue] = []
-        if environment_fingerprint_id is not None:
-            sql += " AND environment_fingerprint_id = ?"
-            params.append(environment_fingerprint_id)
-        if device_performance_class_id is not None:
-            sql += (
-                " AND environment_fingerprint_id IN ("
-                "SELECT environment_fingerprint_id FROM environment_fingerprints "
-                "WHERE device_performance_class_id = ?)"
+    def store_performance_class_membership(
+        self, membership: DevicePerformanceClassMembership
+    ) -> None:
+        payload_text = encode_json(membership)
+        with self._lock, self._conn:
+            current = self._conn.execute(
+                "SELECT verified FROM device_performance_class_memberships "
+                "WHERE device_performance_class_id = ? AND worker_id = ? "
+                "AND device_id = ?",
+                (
+                    membership.device_performance_class_id,
+                    membership.worker_id,
+                    membership.device_id,
+                ),
+            ).fetchone()
+            if current is not None and bool(current["verified"]) and not membership.verified:
+                return
+            self._conn.execute(
+                "INSERT INTO device_performance_class_memberships ("
+                "device_performance_class_id, worker_id, device_id, verified, payload) "
+                "VALUES (?, ?, ?, ?, ?) ON CONFLICT(device_performance_class_id, "
+                "worker_id, device_id) DO UPDATE SET verified=excluded.verified, "
+                "payload=excluded.payload",
+                (
+                    membership.device_performance_class_id,
+                    membership.worker_id,
+                    membership.device_id,
+                    int(membership.verified),
+                    payload_text,
+                ),
             )
-            params.append(device_performance_class_id)
-        with self._lock:
-            rows = self._conn.execute(sql, params).fetchall()
-        return frozenset(row["operator_signature_id"] for row in rows)
+
+    def measured_operator_signature_ids_for_environment(
+        self, fingerprint: EnvironmentFingerprint
+    ) -> frozenset[str]:
+        if fingerprint.worker_id is None or fingerprint.device_id is None:
+            return frozenset()
+        compatibility_id = environment_fingerprint_id(fingerprint)
+        class_id = fingerprint.device_performance_class_id
+        candidate_verified = False
+        if class_id is not None:
+            with self._lock:
+                row = self._conn.execute(
+                    "SELECT verified FROM device_performance_class_memberships "
+                    "WHERE device_performance_class_id = ? AND worker_id = ? "
+                    "AND device_id = ?",
+                    (class_id, fingerprint.worker_id, fingerprint.device_id),
+                ).fetchone()
+            candidate_verified = row is not None and bool(row["verified"])
+
+        reusable: set[str] = set()
+        for record in self.query_measurements(
+            environment_fingerprint_id=compatibility_id
+        ):
+            environment = record.environment
+            if environment is None:
+                continue
+            same_device = (
+                environment.worker_id == fingerprint.worker_id
+                and environment.device_id == fingerprint.device_id
+            )
+            cross_device_verified = False
+            if candidate_verified and class_id is not None:
+                with self._lock:
+                    row = self._conn.execute(
+                        "SELECT verified FROM device_performance_class_memberships "
+                        "WHERE device_performance_class_id = ? AND worker_id = ? "
+                        "AND device_id = ?",
+                        (class_id, environment.worker_id, environment.device_id),
+                    ).fetchone()
+                cross_device_verified = row is not None and bool(row["verified"])
+            if not (same_device or cross_device_verified):
+                continue
+            stored_case = self.get_case(record.case_id)
+            if (
+                stored_case is not None
+                and isinstance(stored_case.case.spec, ModelCaseSpec)
+                and stored_case.case.spec.operator_signature is not None
+            ):
+                reusable.add(
+                    operator_signature_id(
+                        stored_case.case.spec.operator_signature
+                    )
+                )
+        return frozenset(reusable)
+
+    # -- snapshot (§46) ------------------------------------------------------
 
     def build_snapshot(
         self, snapshot_id: str, *, created_at: datetime | None = None
     ) -> ProfileSnapshot:
         with self._lock:
+            case_rows = self._conn.execute(
+                "SELECT payload FROM profiling_cases ORDER BY case_id"
+            ).fetchall()
             characterization_rows = self._conn.execute(
                 "SELECT payload FROM model_characterizations "
                 "ORDER BY model_signature_id"
@@ -655,6 +826,35 @@ class SqliteProfileStore:
             measurement_rows = self._conn.execute(
                 "SELECT payload FROM measurements "
                 "ORDER BY started_at, measurement_id"
+            ).fetchall()
+            layer_rows = self._conn.execute(
+                "SELECT payload FROM transformer_layer_signatures "
+                "ORDER BY layer_signature_id"
+            ).fetchall()
+            module_rows = self._conn.execute(
+                "SELECT payload FROM module_signatures ORDER BY module_signature_id"
+            ).fetchall()
+            operator_rows = self._conn.execute(
+                "SELECT payload FROM operator_signatures ORDER BY operator_signature_id"
+            ).fetchall()
+            fingerprint_rows = self._conn.execute(
+                "SELECT payload FROM environment_instances "
+                "ORDER BY environment_instance_id"
+            ).fetchall()
+            performance_class_rows = self._conn.execute(
+                "SELECT payload FROM device_performance_classes "
+                "ORDER BY device_performance_class_id"
+            ).fetchall()
+            membership_rows = self._conn.execute(
+                "SELECT payload FROM device_performance_class_memberships "
+                "ORDER BY device_performance_class_id, worker_id, device_id"
+            ).fetchall()
+            endpoint_rows = self._conn.execute(
+                "SELECT payload FROM network_endpoints ORDER BY worker_id, interface_id"
+            ).fetchall()
+            path_rows = self._conn.execute(
+                "SELECT payload, path_class FROM network_pairs "
+                "WHERE path_class IS NOT NULL ORDER BY network_pair_id"
             ).fetchall()
         characterizations = tuple(
             self._decode(ModelCharacterization, row["payload"], "characterization")
@@ -674,6 +874,57 @@ class SqliteProfileStore:
             model_characterizations=characterizations,
             measurements=tuple(measurements),
             network_measurements=tuple(network_measurements),
+            profiling_cases=tuple(
+                self._decode(ProfilingCase, row["payload"], "profiling case")
+                for row in case_rows
+            ),
+            layer_signatures=tuple(
+                self._decode(
+                    TransformerLayerSignature, row["payload"], "layer signature"
+                )
+                for row in layer_rows
+            ),
+            module_signatures=tuple(
+                self._decode(ModuleSignature, row["payload"], "module signature")
+                for row in module_rows
+            ),
+            operator_signatures=tuple(
+                self._decode(OperatorSignature, row["payload"], "operator signature")
+                for row in operator_rows
+            ),
+            environment_fingerprints=tuple(
+                self._decode(
+                    EnvironmentFingerprint, row["payload"], "environment fingerprint"
+                )
+                for row in fingerprint_rows
+            ),
+            device_performance_classes=tuple(
+                self._decode(
+                    DevicePerformanceClass, row["payload"], "device performance class"
+                )
+                for row in performance_class_rows
+            ),
+            device_performance_class_memberships=tuple(
+                self._decode(
+                    DevicePerformanceClassMembership,
+                    row["payload"],
+                    "device performance class membership",
+                )
+                for row in membership_rows
+            ),
+            network_endpoints=tuple(
+                self._decode(
+                    NetworkEndpointProfile, row["payload"], "network endpoint"
+                )
+                for row in endpoint_rows
+            ),
+            network_paths=tuple(
+                NetworkPathProfile(
+                    pair=self._decode(NetworkPair, row["payload"], "network pair"),
+                    path_class=NetworkPathClass(row["path_class"]),
+                )
+                for row in path_rows
+            ),
         )
 
     # -- internals ------------------------------------------------------------------
@@ -715,6 +966,11 @@ class SqliteProfileStore:
             record.measurement_id,
             record.case_id,
             record.environment_fingerprint,
+            (
+                environment_instance_id(record.environment)
+                if record.environment is not None
+                else None
+            ),
             model_id,
             revision,
             layer_id,

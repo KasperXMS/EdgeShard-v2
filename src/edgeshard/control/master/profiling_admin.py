@@ -26,10 +26,8 @@ Honesty rules this module enforces:
 - a request that cannot be expanded is a protocol-level ``ValueError`` →
   the servicer aborts INVALID_ARGUMENT, mirroring the Worker plane (§47).
 
-Typed case failures are not part of the store's ledger (it keeps states,
-§43), so ``GetExperiment`` enriches stored states with the failures from
-this process's cached run reports; after a Master restart a FAILED case is
-reported without its failure object — absence, never a reconstruction.
+Typed case failures are persisted with the case ledger, so
+``GetExperiment`` remains diagnostic after a Master restart.
 """
 
 from __future__ import annotations
@@ -53,6 +51,7 @@ from edgeshard.profiling.domain.experiment import (
     ProfilingFailure,
     ProfilingRequest,
 )
+from edgeshard.profiling.domain.network import ProbeKind
 from edgeshard.profiling.domain.session import (
     ProfilingSessionKind,
     ProfilingSessionRequest,
@@ -117,6 +116,7 @@ class MasterProfilingAdmin:
             strategy_id=self._strategy.strategy_id,
             cases=cases,
             requested_by=intent.requested_by,
+            force_new_execution=not intent.missing_only,
         )
         self._launch(experiment.experiment_id)
         logger.info(
@@ -163,8 +163,8 @@ class MasterProfilingAdmin:
                 "background run of experiment %s raised: %r", experiment_id, exc
             )
             return
-        # Cache the terminal report: it carries the typed failures the store
-        # deliberately does not keep (§43), used to enrich GetExperiment.
+        # Keep the terminal report for callers already attached to this
+        # process. The durable store remains authoritative after restart.
         self._reports[experiment_id] = task.result()
 
     # -- GetExperiment (§49) ----------------------------------------------------
@@ -178,13 +178,7 @@ class MasterProfilingAdmin:
         return mapper.GetExperimentResponse(found=True, status=self._enrich(status))
 
     def _enrich(self, status: ExperimentStatus) -> ExperimentStatus:
-        """Attach this process's cached typed failures to stored case states.
-
-        The store keeps case *states* only (§43); failures live in the run
-        report. Without a cached report (e.g. after a Master restart) the
-        enriched status simply carries no failure objects — honest absence
-        (§52.2), never a reconstruction from strings.
-        """
+        """Merge a cached report without overriding durable typed failures."""
         report = self._reports.get(status.experiment.experiment_id)
         if report is None:
             return status
@@ -332,6 +326,29 @@ class MasterProfilingAdmin:
             plan.endpoint_profiles, plan.classified_pairs
         )
         cases = plan.cases
+        if intent.extra_bandwidth_pairs:
+            explicit = {
+                (
+                    pair.source_worker_id,
+                    pair.destination_worker_id,
+                    pair.source_interface_id,
+                    pair.destination_interface_id,
+                )
+                for pair in intent.extra_bandwidth_pairs
+            }
+            cases = tuple(
+                case
+                for case in cases
+                if not isinstance(case.spec, NetworkCaseSpec)
+                or case.spec.probe_kind is not ProbeKind.BANDWIDTH
+                or (
+                    case.spec.source_worker_id,
+                    case.spec.destination_worker_id,
+                    case.spec.source_interface_id,
+                    case.spec.destination_interface_id,
+                )
+                in explicit
+            )
         if intent.network_probe is not None:
             cases = tuple(
                 case
@@ -357,31 +374,47 @@ class MasterProfilingAdmin:
         # (a MODEL prepare loads and characterizes the checkpoint, §38), and
         # the strategy plans from the reported facts — the Master never
         # loads a model itself (§40, §46).
-        inspection = ProfilingSessionRequest(
-            kind=ProfilingSessionKind.MODEL,
-            device_ids=intent.device_ids,
-            model=model,
-            dtype=dtype,
-        )
-        measured = self._measured_by_device(intent)
         cases: list[ProfilingCase] = []
         for worker_id in workers:
-            facts = await self._controller.inspect_model(
-                worker_id=worker_id, request=inspection
-            )
-            if isinstance(facts, ProfilingFailure):
-                raise _AdminRejection(
-                    f"model inspection failed on worker {worker_id!r}: "
-                    f"[{facts.category.value}] {facts.message}"
+            for device_id in intent.device_ids:
+                inspection = ProfilingSessionRequest(
+                    kind=ProfilingSessionKind.MODEL,
+                    device_ids=(device_id,),
+                    model=model,
+                    dtype=dtype,
                 )
-            self._controller.record_model_facts(facts)
-            plan = self._strategy.plan_model_cases(
-                worker_id=worker_id,
-                facts=facts,
-                device_ids=intent.device_ids,
-                measured_signature_ids=measured,
-            )
-            cases.extend(plan.cases)
+                facts = await self._controller.inspect_model(
+                    worker_id=worker_id, request=inspection
+                )
+                if isinstance(facts, ProfilingFailure):
+                    raise _AdminRejection(
+                        f"model inspection failed on worker {worker_id!r} "
+                        f"device {device_id!r}: "
+                        f"[{facts.category.value}] {facts.message}"
+                    )
+                self._controller.record_model_facts(facts)
+                measured: Mapping[str, AbstractSet[str]] | None = None
+                if intent.missing_only:
+                    operator_environment = (
+                        dataclasses.replace(facts.environment, model_revision=None)
+                        if facts.environment is not None
+                        else None
+                    )
+                    measured_ids = (
+                        self._controller.measured_operator_signature_ids_for_environment(
+                            operator_environment
+                        )
+                        if operator_environment is not None
+                        else frozenset()
+                    )
+                    measured = {device_id: measured_ids}
+                plan = self._strategy.plan_model_cases(
+                    worker_id=worker_id,
+                    facts=facts,
+                    device_ids=(device_id,),
+                    measured_signature_ids=measured,
+                )
+                cases.extend(plan.cases)
         if intent.kind is ProfilingSessionKind.OPERATOR:
             cases = [
                 case
@@ -390,21 +423,5 @@ class MasterProfilingAdmin:
                 and case.spec.granularity is ProfilingGranularity.OPERATOR
             ]
         return tuple(cases)
-
-    def _measured_by_device(
-        self, intent: ProfilingRequest
-    ) -> Mapping[str, AbstractSet[str]] | None:
-        """The §28 reuse answer per device, or None to re-measure everything.
-
-        v1 scopes reuse to "ever measured anywhere" — device performance
-        classes and environment fingerprints (§9) are persisted by the store
-        but assigning them needs hardware identity the Master does not have
-        yet (§48: no over-engineering; the knob exists in the store query).
-        """
-        if not intent.missing_only:
-            return None
-        measured_ids = self._controller.measured_operator_signature_ids()
-        return dict.fromkeys(intent.device_ids, measured_ids)
-
 
 __all__ = ["MasterProfilingAdmin"]

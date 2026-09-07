@@ -63,6 +63,7 @@ class Iperf3Probe:
     duration_s: float = DEFAULT_IPERF3_DURATION_S
     payload_bytes: int | None = None
     port: int = DEFAULT_IPERF3_PORT
+    bind_address: str | None = None
 
     def __post_init__(self) -> None:
         if not self.target:
@@ -73,15 +74,25 @@ class Iperf3Probe:
             raise ValueError(f"payload_bytes must be positive, got {self.payload_bytes}")
         if not 1 <= self.port <= 65535:
             raise ValueError(f"port must be within [1, 65535], got {self.port}")
+        if self.bind_address is not None and not self.bind_address:
+            raise ValueError("bind_address must not be empty when present")
 
 
 def iperf3_server_command(
-    *, port: int = DEFAULT_IPERF3_PORT, binary: str = DEFAULT_IPERF3_BINARY
+    *,
+    port: int = DEFAULT_IPERF3_PORT,
+    binary: str = DEFAULT_IPERF3_BINARY,
+    bind_address: str | None = None,
 ) -> tuple[str, ...]:
     """One-off server invocation (``-1``: exits after a single test)."""
     if not 1 <= port <= 65535:
         raise ValueError(f"port must be within [1, 65535], got {port}")
-    return (binary, "-s", "-1", "-p", str(port))
+    command = [binary, "-s", "-1", "-p", str(port)]
+    if bind_address is not None:
+        if not bind_address:
+            raise ValueError("bind_address must not be empty when present")
+        command += ["-B", bind_address]
+    return tuple(command)
 
 
 def iperf3_client_command(
@@ -110,6 +121,8 @@ def iperf3_client_command(
         command += ["-l", str(probe.payload_bytes)]
     if probe.direction is NetworkDirection.REVERSE:
         command += ["-R"]
+    if probe.bind_address is not None:
+        command += ["-B", probe.bind_address]
     return tuple(command)
 
 
@@ -201,7 +214,9 @@ class Iperf3Runner:
         self._timeout_grace_s = timeout_grace_s
         self._server_startup_s = server_startup_s
 
-    async def start_server(self, *, port: int = DEFAULT_IPERF3_PORT) -> asyncio.subprocess.Process:
+    async def start_server(
+        self, *, port: int = DEFAULT_IPERF3_PORT, bind_address: str | None = None
+    ) -> asyncio.subprocess.Process:
         """Spawn a one-off iperf3 server; caller guarantees termination.
 
         In the real cluster the server runs on the *destination* worker —
@@ -209,9 +224,27 @@ class Iperf3Runner:
         method covers the local/loopback case; either way cleanup goes
         through :func:`terminate_process` (no runaway servers).
         """
-        process = await self._spawn(iperf3_server_command(port=port, binary=self._binary))
-        if self._server_startup_s > 0.0:
-            await asyncio.sleep(self._server_startup_s)
+        process = await self._spawn(
+            iperf3_server_command(
+                port=port, binary=self._binary, bind_address=bind_address
+            )
+        )
+        try:
+            if self._server_startup_s > 0.0:
+                await asyncio.sleep(self._server_startup_s)
+            if process.returncode is not None:
+                _stdout, stderr = await process.communicate()
+                raise ProfilingError(
+                    ProfilingErrorCategory.IPERF_UNAVAILABLE,
+                    "temporary iperf3 server exited before becoming ready",
+                    {
+                        "port": port,
+                        "stderr": stderr.decode("utf-8", errors="replace"),
+                    },
+                )
+        except BaseException:
+            await terminate_process(process)
+            raise
         return process
 
     async def run_client(self, probe: Iperf3Probe) -> Iperf3Observation:

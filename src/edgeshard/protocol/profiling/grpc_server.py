@@ -47,6 +47,14 @@ class WorkerProfilingHandler(Protocol):
         self, request: mapper.CloseProfilingSessionRequest
     ) -> mapper.CloseProfilingSessionResponse: ...
 
+    async def prepare_iperf_server(
+        self, request: mapper.PrepareIperfServerRequest
+    ) -> mapper.PrepareIperfServerResponse: ...
+
+    async def stop_iperf_server(
+        self, request: mapper.StopIperfServerRequest
+    ) -> mapper.StopIperfServerResponse: ...
+
 
 class WorkerProfilingServicer(pb_grpc.WorkerProfilingServiceServicer):
     """WorkerProfilingService implementation over a WorkerProfilingHandler."""
@@ -118,6 +126,34 @@ class WorkerProfilingServicer(pb_grpc.WorkerProfilingServiceServicer):
         except (mapper.ProfilingProtocolError, ValueError) as exc:
             await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(exc))
             raise  # unreachable: grpc.aio abort raises AbortError
+
+    async def PrepareIperfServer(
+        self,
+        request: pb.PrepareIperfServerRequest,
+        context: grpc.aio.ServicerContext,
+    ) -> pb.PrepareIperfServerResponse:
+        try:
+            response = await self._handler.prepare_iperf_server(
+                mapper.prepare_iperf_server_request_from_wire(request)
+            )
+            return mapper.prepare_iperf_server_response_to_wire(response)
+        except (mapper.ProfilingProtocolError, ValueError) as exc:
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(exc))
+            raise
+
+    async def StopIperfServer(
+        self,
+        request: pb.StopIperfServerRequest,
+        context: grpc.aio.ServicerContext,
+    ) -> pb.StopIperfServerResponse:
+        try:
+            response = await self._handler.stop_iperf_server(
+                mapper.stop_iperf_server_request_from_wire(request)
+            )
+            return mapper.stop_iperf_server_response_to_wire(response)
+        except (mapper.ProfilingProtocolError, ValueError) as exc:
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(exc))
+            raise
 
 
 async def start_profiling_server(

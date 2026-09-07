@@ -159,6 +159,16 @@ class TestPingCommand:
         )
         assert command == ("ping", "-c", "5", "-W", "1", "host.local")  # ceil to whole seconds
 
+    def test_explicit_source_address_is_bound_per_platform(self) -> None:
+        linux = ping_command(
+            "10.0.0.2", platform="linux", bind_address="10.0.0.1"
+        )
+        windows = ping_command(
+            "10.0.0.2", platform="win32", bind_address="10.0.0.1"
+        )
+        assert linux[-3:] == ("-I", "10.0.0.1", "10.0.0.2")
+        assert windows[-3:] == ("-S", "10.0.0.1", "10.0.0.2")
+
     def test_default_packet_count_within_spec_range(self) -> None:
         """§33 policy: 5-10 packets per pair."""
         assert 5 <= DEFAULT_PING_PACKET_COUNT <= 10

@@ -33,6 +33,8 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
+from edgeshard.cluster.capability import WorkerCapability
+from edgeshard.cluster.state import WorkerState
 from edgeshard.profiling.domain.experiment import (
     CaseOutcome,
     CaseState,
@@ -110,6 +112,9 @@ class ProfilingSessionRecord:
     request: ProfilingSessionRequest
     prepared_at: datetime
     capability_revision: str | None = None
+    capability: WorkerCapability | None = None
+    worker_state: WorkerState | None = None
+    worker_state_source: Callable[[], WorkerState | None] | None = None
     session_facts: ModelSessionFacts | None = None
     network_facts: Mapping[str, WorkerNetworkFacts] = field(default_factory=dict)
     model_handle: object | None = None
@@ -210,6 +215,9 @@ class ProfilingSessionManager:
         *,
         now: datetime,
         capability_revision: str | None = None,
+        capability: WorkerCapability | None = None,
+        worker_state: WorkerState | None = None,
+        worker_state_source: Callable[[], WorkerState | None] | None = None,
         session_facts: ModelSessionFacts | None = None,
         network_facts: Mapping[str, WorkerNetworkFacts] | None = None,
         model_handle: object | None = None,
@@ -223,6 +231,9 @@ class ProfilingSessionManager:
             request=request,
             prepared_at=now,
             capability_revision=capability_revision,
+            capability=capability,
+            worker_state=worker_state,
+            worker_state_source=worker_state_source,
             session_facts=session_facts,
             network_facts=dict(network_facts or {}),
             model_handle=model_handle,

@@ -14,7 +14,7 @@ from edgeshard.profiling.domain.environment import (
 from edgeshard.profiling.domain.hashing import normalized_items
 
 GOLDEN_CLASS_ID = "7ed7b70ac1723246b6d1f0f07e0373ff2a206d7452ae6de0b6234750db8468dd"
-GOLDEN_FINGERPRINT_ID = "edf7dfd13244ab096df908ce3907456ee2a88244eba5c1b0c0b824b85621dd4f"
+GOLDEN_FINGERPRINT_ID = "b16df46175f42d2c72c008f211820be0cc36082dc29df2791abf4b0fdb64ce49"
 
 
 def _rtx4090_class(**overrides: object) -> DevicePerformanceClass:
@@ -96,7 +96,11 @@ def test_fingerprint_id_excludes_provenance_only_fields() -> None:
 def test_fingerprint_id_includes_compatibility_context() -> None:
     baseline = environment_fingerprint_id(_fingerprint())
     assert baseline != environment_fingerprint_id(_fingerprint(torch_version="2.7.0"))
-    assert baseline != environment_fingerprint_id(_fingerprint(capability_revision="rev-2"))
+    # Host-wide discovery revisions include unrelated NIC/container facts and
+    # are provenance, not device performance compatibility.
+    assert baseline == environment_fingerprint_id(
+        _fingerprint(capability_revision="rev-2")
+    )
     assert baseline != environment_fingerprint_id(
         _fingerprint(profiling_implementation_revision="0.2.0")
     )

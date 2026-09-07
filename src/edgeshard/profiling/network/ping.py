@@ -69,6 +69,7 @@ def ping_command(
     packet_count: int = DEFAULT_PING_PACKET_COUNT,
     packet_timeout_s: float = DEFAULT_PING_PACKET_TIMEOUT_S,
     platform: str = sys.platform,
+    bind_address: str | None = None,
 ) -> tuple[str, ...]:
     """Platform-correct ``ping`` invocation for one probe.
 
@@ -83,23 +84,31 @@ def ping_command(
         raise ValueError(f"packet_count must be positive, got {packet_count}")
     if packet_timeout_s <= 0.0:
         raise ValueError(f"packet_timeout_s must be positive, got {packet_timeout_s}")
+    if bind_address is not None and not bind_address:
+        raise ValueError("bind_address must not be empty when present")
     if platform == "win32":
-        return (
+        command = [
             "ping",
             "-n",
             str(packet_count),
             "-w",
             str(int(packet_timeout_s * 1000)),
-            target,
-        )
-    return (
+        ]
+        if bind_address is not None:
+            command += ["-S", bind_address]
+        command.append(target)
+        return tuple(command)
+    command = [
         "ping",
         "-c",
         str(packet_count),
         "-W",
         str(math.ceil(packet_timeout_s)),
-        target,
-    )
+    ]
+    if bind_address is not None:
+        command += ["-I", bind_address]
+    command.append(target)
+    return tuple(command)
 
 
 def parse_ping_output(stdout: str) -> tuple[float, ...]:
@@ -180,7 +189,13 @@ class PingRunner:
             )
         self._concurrency = concurrency
 
-    async def probe(self, target: str, *, packet_count: int | None = None) -> PingObservation:
+    async def probe(
+        self,
+        target: str,
+        *,
+        packet_count: int | None = None,
+        bind_address: str | None = None,
+    ) -> PingObservation:
         """One RTT probe against ``target``; failures stay typed (§42)."""
         count = packet_count if packet_count is not None else self._packet_count
         if count < 1:
@@ -190,6 +205,7 @@ class PingRunner:
             packet_count=count,
             packet_timeout_s=self._packet_timeout_s,
             platform=self._platform,
+            bind_address=bind_address,
         )
         try:
             process = await self._process_factory(command)

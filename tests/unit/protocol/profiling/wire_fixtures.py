@@ -10,6 +10,10 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+from edgeshard.profiling.domain.environment import (
+    EnvironmentFingerprint,
+    environment_fingerprint_id,
+)
 from edgeshard.profiling.domain.experiment import (
     CaseOutcome,
     ModelCaseSpec,
@@ -180,10 +184,20 @@ NETWORK_CASE = ProfilingCase.for_spec(
     ),
 )
 
+ENVIRONMENT = EnvironmentFingerprint(
+    backend="torch",
+    profiling_implementation_revision="test",
+    torch_version="test",
+    dtype="fp32",
+    worker_id=WORKER_ID,
+    device_id="gpu-0",
+)
+
 RECORD = MeasurementRecord(
     measurement_id="m-1",
     case_id=MODEL_CASE.case_id,
-    environment_fingerprint="fp-1",
+    environment_fingerprint=environment_fingerprint_id(ENVIRONMENT),
+    environment=ENVIRONMENT,
     started_at=NOW,
     finished_at=LATER,
     sample_count=3,

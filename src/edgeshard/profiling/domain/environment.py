@@ -10,11 +10,10 @@ Two distinct identities that must never be conflated (§52.3):
   §29.
 
 ``EnvironmentFingerprint`` records the full measurement context needed to
-judge reuse later (§9). Its ``worker_id``/``device_id`` fields are marked
-provenance-only and are excluded from ``environment_fingerprint_id``; every
-other field — including the host-scoped ``capability_revision`` — is part of
-the compatibility identity. Volatile telemetry (temperature, utilization)
-belongs to the measurement context, never to the fingerprint (§9).
+judge reuse later (§9). Physical provenance and the host-wide
+``capability_revision`` are excluded from ``environment_fingerprint_id``;
+device-relevant software and hardware compatibility remain in it. Volatile
+telemetry belongs to measurement context, never to the fingerprint (§9).
 
 ``MemoryModel`` mirrors ``edgeshard.cluster.capability.MemoryModel`` by
 value; the domain package imports nothing but the stdlib (P2A DoD), so the
@@ -24,6 +23,7 @@ bridge lives in the implementation layers.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
 
 from edgeshard.profiling.domain.hashing import canonical_sha256, check_normalized_items
@@ -94,6 +94,7 @@ class EnvironmentFingerprint:
     profiling_implementation_revision: str
 
     device_performance_class_id: str | None = None
+    device_performance_class: DevicePerformanceClass | None = None
     capability_revision: str | None = None
 
     torch_version: str | None = None
@@ -116,6 +117,13 @@ class EnvironmentFingerprint:
             raise ValueError("backend must not be empty")
         if not self.profiling_implementation_revision:
             raise ValueError("profiling_implementation_revision must not be empty")
+        if self.device_performance_class is not None:
+            expected = device_performance_class_id(self.device_performance_class)
+            if self.device_performance_class_id != expected:
+                raise ValueError(
+                    "device_performance_class_id does not match the embedded "
+                    "DevicePerformanceClass"
+                )
         for field_name in (
             "device_performance_class_id",
             "capability_revision",
@@ -137,10 +145,9 @@ class EnvironmentFingerprint:
 def environment_fingerprint_id(fingerprint: EnvironmentFingerprint) -> str:
     """Canonical SHA-256 identity of the compatibility context (spec §7, §9).
 
-    Excludes exactly the provenance-only fields (``worker_id``,
-    ``device_id``) so identical environments on different physical devices
-    fingerprint identically; everything else — including the host-scoped
-    ``capability_revision`` — participates. Reuse queries (§28) filter on
+    Excludes provenance-only fields (``worker_id``, ``device_id``) and the
+    host-wide ``capability_revision`` so unrelated NIC/container discovery
+    changes do not invalidate device profiles. Reuse queries (§28) filter on
     the performance class and compatibility fields, never on volatile
     telemetry, which is not recorded here at all.
     """
@@ -148,7 +155,6 @@ def environment_fingerprint_id(fingerprint: EnvironmentFingerprint) -> str:
         (
             "environment_fingerprint",
             fingerprint.device_performance_class_id,
-            fingerprint.capability_revision,
             fingerprint.torch_version,
             fingerprint.cuda_version,
             fingerprint.driver_version,
@@ -160,3 +166,45 @@ def environment_fingerprint_id(fingerprint: EnvironmentFingerprint) -> str:
             fingerprint.profiling_implementation_revision,
         )
     )
+
+
+def environment_instance_id(fingerprint: EnvironmentFingerprint) -> str:
+    """Identity of the full provenance-bearing fingerprint record.
+
+    ``environment_fingerprint_id`` is deliberately a compatibility hash and
+    may be shared by multiple physical devices. Persistence therefore uses a
+    second identity that includes provenance, while measurements keep the
+    compatibility hash used by reuse queries.
+    """
+    return canonical_sha256(("environment_instance", fingerprint))
+
+
+@dataclass(frozen=True)
+class DevicePerformanceClassMembership:
+    """Verified (or pending) membership of one physical device in a class."""
+
+    device_performance_class_id: str
+    worker_id: str
+    device_id: str
+    verified: bool
+    verified_at: datetime | None = None
+    evidence_measurement_ids: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.device_performance_class_id:
+            raise ValueError("device_performance_class_id must not be empty")
+        if not self.worker_id or not self.device_id:
+            raise ValueError("performance-class membership requires worker_id/device_id")
+        if self.verified and self.verified_at is None:
+            raise ValueError("verified membership requires verified_at")
+        if not self.verified and self.verified_at is not None:
+            raise ValueError("unverified membership must not carry verified_at")
+        if self.verified_at is not None and (
+            self.verified_at.tzinfo is None
+            or self.verified_at.tzinfo.utcoffset(self.verified_at) is None
+        ):
+            raise ValueError("verified_at must be timezone-aware")
+        if len(set(self.evidence_measurement_ids)) != len(
+            self.evidence_measurement_ids
+        ):
+            raise ValueError("evidence_measurement_ids must be unique")

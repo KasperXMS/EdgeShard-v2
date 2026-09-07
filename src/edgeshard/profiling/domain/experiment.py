@@ -181,6 +181,11 @@ class ModelCaseSpec:
     def __post_init__(self) -> None:
         if not self.device_ids:
             raise ValueError("device_ids must not be empty")
+        if len(self.device_ids) != 1:
+            raise ValueError(
+                "model profiling cases are single-device in Phase 2 v1; "
+                f"got {len(self.device_ids)} device_ids"
+            )
         seen: set[str] = set()
         for device_id in self.device_ids:
             if not device_id:
@@ -395,12 +400,15 @@ class ProfilingExperiment:
     created_at: datetime
     requested_by: str | None
     case_ids: tuple[str, ...]
+    configuration_id: str | None = None
 
     def __post_init__(self) -> None:
         if not self.experiment_id:
             raise ValueError("experiment_id must not be empty")
         if not self.strategy_id:
             raise ValueError("strategy_id must not be empty")
+        if self.configuration_id is not None and not self.configuration_id:
+            raise ValueError("configuration_id must not be empty when present")
         _require_aware(self.created_at, "created_at")
         if self.requested_by is not None and not self.requested_by:
             raise ValueError("requested_by must not be empty when present")
@@ -428,12 +436,14 @@ class ProfilingExperiment:
         but never affects the id.
         """
         ordered = tuple(dict.fromkeys(case_ids))
+        configuration_id = profiling_experiment_id(strategy_id, ordered)
         return cls(
-            experiment_id=profiling_experiment_id(strategy_id, ordered),
+            experiment_id=configuration_id,
             strategy_id=strategy_id,
             created_at=created_at,
             requested_by=requested_by,
             case_ids=ordered,
+            configuration_id=configuration_id,
         )
 
 

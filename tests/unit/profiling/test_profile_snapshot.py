@@ -7,6 +7,14 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from edgeshard.profiling.domain.environment import (
+    EnvironmentFingerprint,
+    environment_fingerprint_id,
+)
+from edgeshard.profiling.domain.experiment import (
+    ModelCaseSpec,
+    ProfilingCase,
+)
 from edgeshard.profiling.domain.measurement import (
     LatencyMetrics,
     MeasurementMetrics,
@@ -20,9 +28,38 @@ from edgeshard.profiling.domain.model import (
     ModelStage,
     StageKind,
 )
+from edgeshard.profiling.domain.signature import (
+    GemmSignature,
+    OperatorKind,
+    OperatorSignature,
+    ProfilingGranularity,
+)
 from edgeshard.profiling.domain.snapshot import ProfileSnapshot
 
 NOW = datetime(2026, 9, 7, 12, 0, tzinfo=UTC)
+
+ENVIRONMENT = EnvironmentFingerprint(
+    backend="torch",
+    profiling_implementation_revision="test",
+    torch_version="test",
+    dtype="fp32",
+    worker_id="w-1",
+    device_id="gpu-0",
+)
+OPERATOR_SIGNATURE = OperatorSignature(
+    kind=OperatorKind.GEMM,
+    parameters=GemmSignature(m=1, n=1, k=1, dtype="fp32"),
+    backend_family="torch",
+)
+CASE = ProfilingCase.for_spec(
+    "w-1",
+    ModelCaseSpec(
+        granularity=ProfilingGranularity.OPERATOR,
+        device_ids=("gpu-0",),
+        dtype="fp32",
+        operator_signature=OPERATOR_SIGNATURE,
+    ),
+)
 
 
 def _characterization(
@@ -48,8 +85,9 @@ def _characterization(
 def _record(measurement_id: str) -> MeasurementRecord:
     return MeasurementRecord(
         measurement_id=measurement_id,
-        case_id="c-1",
-        environment_fingerprint="f" * 64,
+        case_id=CASE.case_id,
+        environment_fingerprint=environment_fingerprint_id(ENVIRONMENT),
+        environment=ENVIRONMENT,
         started_at=NOW,
         finished_at=NOW + timedelta(seconds=1),
         sample_count=1,
@@ -70,6 +108,9 @@ def _snapshot(**overrides: object) -> ProfileSnapshot:
         "model_characterizations": (_characterization(),),
         "measurements": (_record("m-1"),),
         "network_measurements": (_record("m-net-1"),),
+        "profiling_cases": (CASE,),
+        "operator_signatures": (OPERATOR_SIGNATURE,),
+        "environment_fingerprints": (ENVIRONMENT,),
     }
     base.update(overrides)
     return ProfileSnapshot(**base)  # type: ignore[arg-type]
@@ -109,3 +150,13 @@ def test_empty_snapshot_is_valid() -> None:
         model_characterizations=(), measurements=(), network_measurements=()
     )
     assert snapshot.measurements == ()
+
+
+def test_snapshot_rejects_measurement_without_self_contained_facts() -> None:
+    record = dataclasses.replace(_record("m-orphan"), environment=None)
+    with pytest.raises(ValueError, match="full environment"):
+        _snapshot(measurements=(record,), network_measurements=())
+    with pytest.raises(ValueError, match="missing profiling cases"):
+        _snapshot(profiling_cases=())
+    with pytest.raises(ValueError, match="missing environment fingerprints"):
+        _snapshot(environment_fingerprints=())

@@ -193,6 +193,14 @@ class TestCommandBuilders:
         with pytest.raises(ValueError, match="port"):
             iperf3_server_command(port=0)
 
+    def test_client_and_server_bind_explicit_interfaces(self) -> None:
+        server = iperf3_server_command(bind_address="100.64.0.20")
+        client = iperf3_client_command(
+            Iperf3Probe(target="100.64.0.20", bind_address="100.64.0.10")
+        )
+        assert server[-2:] == ("-B", "100.64.0.20")
+        assert client[-2:] == ("-B", "100.64.0.10")
+
 
 class TestParseIperf3Json:
     def test_tcp_prefers_receiver_side_throughput(self) -> None:
@@ -310,6 +318,18 @@ class TestIperf3RunnerClient:
 
 
 class TestIperf3RunnerServer:
+    async def test_cancelled_startup_terminates_server(self) -> None:
+        server = FakeProcess()
+        runner = Iperf3Runner(
+            process_factory=FakeFactory(server), server_startup_s=10.0
+        )
+        task = asyncio.create_task(runner.start_server())
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert server.terminated
+
     async def test_measure_spawns_server_then_client_and_terminates(self) -> None:
         server = FakeProcess()
         client = FakeProcess(stdout=json.dumps(TCP_JSON).encode())

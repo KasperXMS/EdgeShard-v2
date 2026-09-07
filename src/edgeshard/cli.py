@@ -552,8 +552,19 @@ def _parse_path_class(value: str) -> NetworkPathClass:
 def _parse_pair(value: str) -> NetworkPair:
     parts = value.split(":")
     if len(parts) != 2 or not parts[0] or not parts[1]:
-        _fail(f"--pair must be SRC_WORKER:DST_WORKER, got {value!r}")
-    return NetworkPair(source_worker_id=parts[0], destination_worker_id=parts[1])
+        _fail(f"--pair must be SRC[@INTERFACE]:DST[@INTERFACE], got {value!r}")
+    source = parts[0].split("@", maxsplit=1)
+    destination = parts[1].split("@", maxsplit=1)
+    if any(not component for component in (*source, *destination)):
+        _fail(f"--pair must be SRC[@INTERFACE]:DST[@INTERFACE], got {value!r}")
+    return NetworkPair(
+        source_worker_id=source[0],
+        destination_worker_id=destination[0],
+        source_interface_id=source[1] if len(source) == 2 else None,
+        destination_interface_id=(
+            destination[1] if len(destination) == 2 else None
+        ),
+    )
 
 
 @profile_model_app.command("inspect")
@@ -710,8 +721,8 @@ def profile_network_bandwidth(
         list[str] | None,
         typer.Option(
             "--pair",
-            help="Explicit directed pair SRC:DST added regardless of the "
-            "sparse selection (§34); repeatable.",
+            help="Explicit directed pair SRC[@INTERFACE]:DST[@INTERFACE]; when "
+            "provided, bandwidth probes are limited to these paths; repeatable.",
         ),
     ] = None,
     requested_by: RequestedByOption = None,
@@ -741,8 +752,8 @@ def profile_status(
     """Print the Master-side lifecycle status of one experiment (§49).
 
     Unknown experiments exit non-zero: absence is reported, never guessed
-    (§52.2). Typed case failures are shown when this Master process ran the
-    experiment; the store keeps states only (§43).
+    (§52.2). Typed case failures are durable and remain visible after a
+    Master restart (§43).
     """
     response = _admin_call(
         master,

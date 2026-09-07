@@ -31,6 +31,10 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 
+from edgeshard.profiling.domain.environment import (
+    EnvironmentFingerprint,
+    environment_fingerprint_id,
+)
 from edgeshard.profiling.domain.hashing import (
     JsonScalar,
     check_normalized_items,
@@ -342,6 +346,7 @@ class MeasurementRecord:
     metrics: MeasurementMetrics
 
     metadata: tuple[tuple[str, JsonScalar], ...] = ()
+    environment: EnvironmentFingerprint | None = None
 
     def __post_init__(self) -> None:
         if not self.measurement_id:
@@ -350,6 +355,15 @@ class MeasurementRecord:
             raise ValueError("case_id must not be empty")
         if not self.environment_fingerprint:
             raise ValueError("environment_fingerprint must not be empty")
+        if (
+            self.environment is not None
+            and environment_fingerprint_id(self.environment)
+            != self.environment_fingerprint
+        ):
+            raise ValueError(
+                "environment_fingerprint does not match the embedded "
+                "EnvironmentFingerprint"
+            )
         _require_aware(self.started_at, "started_at")
         _require_aware(self.finished_at, "finished_at")
         if self.finished_at < self.started_at:

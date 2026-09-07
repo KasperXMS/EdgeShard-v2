@@ -15,6 +15,7 @@ import dataclasses
 import pytest
 from wire_fixtures import (
     CHARACTERIZATION,
+    ENVIRONMENT,
     FAILURE,
     FAILURE_OUTCOME,
     INSTANCE_ID,
@@ -55,12 +56,14 @@ from edgeshard.protocol.profiling.mapper import (
     CloseProfilingSessionResponse,
     GetProfilingCaseRequest,
     GetProfilingCaseResponse,
+    PrepareIperfServerRequest,
     PrepareProfilingSessionRequest,
     PrepareProfilingSessionResponse,
     ProfilingProtocolError,
     ProfilingRejection,
     RunProfilingCaseRequest,
     RunProfilingCaseResponse,
+    StopIperfServerRequest,
 )
 from edgeshard.protocol.profiling.pb import profiling_pb2 as pb
 
@@ -127,6 +130,25 @@ def test_prepare_request_device_session_forbids_facts() -> None:
         make_prepare_request(
             session_request=OPERATOR_SESSION_REQUEST, network_facts=(NETWORK_FACTS,)
         )
+
+
+def test_iperf_server_lifecycle_requests_roundtrip() -> None:
+    token_fields = {
+        key: value for key, value in TOKENS.items() if key != "profiling_session_id"
+    }
+    prepare = PrepareIperfServerRequest(
+        **token_fields,
+        server_id="case-server",
+        timeout_s=12.0,
+        bind_address="100.64.0.20",
+    )
+    stop = StopIperfServerRequest(**token_fields, server_id="case-server")
+    assert mapper.prepare_iperf_server_request_from_wire(
+        mapper.prepare_iperf_server_request_to_wire(prepare)
+    ) == prepare
+    assert mapper.stop_iperf_server_request_from_wire(
+        mapper.stop_iperf_server_request_to_wire(stop)
+    ) == stop
 
 
 @pytest.mark.parametrize(
@@ -592,6 +614,8 @@ ADMIN_SNAPSHOT = ProfileSnapshot(
     model_characterizations=(CHARACTERIZATION,),
     measurements=(RECORD,),
     network_measurements=(),
+    profiling_cases=(MODEL_CASE,),
+    environment_fingerprints=(ENVIRONMENT,),
 )
 
 

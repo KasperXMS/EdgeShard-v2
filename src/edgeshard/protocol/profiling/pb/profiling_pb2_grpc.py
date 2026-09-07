@@ -63,6 +63,16 @@ class WorkerProfilingServiceStub:
                 request_serializer=profiling__pb2.CloseProfilingSessionRequest.SerializeToString,
                 response_deserializer=profiling__pb2.CloseProfilingSessionResponse.FromString,
                 _registered_method=True)
+        self.PrepareIperfServer = channel.unary_unary(
+                '/edgeshard.profiling.v1.WorkerProfilingService/PrepareIperfServer',
+                request_serializer=profiling__pb2.PrepareIperfServerRequest.SerializeToString,
+                response_deserializer=profiling__pb2.PrepareIperfServerResponse.FromString,
+                _registered_method=True)
+        self.StopIperfServer = channel.unary_unary(
+                '/edgeshard.profiling.v1.WorkerProfilingService/StopIperfServer',
+                request_serializer=profiling__pb2.StopIperfServerRequest.SerializeToString,
+                response_deserializer=profiling__pb2.StopIperfServerResponse.FromString,
+                _registered_method=True)
 
 
 class WorkerProfilingServiceServicer:
@@ -102,6 +112,18 @@ class WorkerProfilingServiceServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def PrepareIperfServer(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def StopIperfServer(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_WorkerProfilingServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -129,6 +151,16 @@ def add_WorkerProfilingServiceServicer_to_server(servicer, server):
                     servicer.CloseProfilingSession,
                     request_deserializer=profiling__pb2.CloseProfilingSessionRequest.FromString,
                     response_serializer=profiling__pb2.CloseProfilingSessionResponse.SerializeToString,
+            ),
+            'PrepareIperfServer': grpc.unary_unary_rpc_method_handler(
+                    servicer.PrepareIperfServer,
+                    request_deserializer=profiling__pb2.PrepareIperfServerRequest.FromString,
+                    response_serializer=profiling__pb2.PrepareIperfServerResponse.SerializeToString,
+            ),
+            'StopIperfServer': grpc.unary_unary_rpc_method_handler(
+                    servicer.StopIperfServer,
+                    request_deserializer=profiling__pb2.StopIperfServerRequest.FromString,
+                    response_serializer=profiling__pb2.StopIperfServerResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -270,6 +302,60 @@ class WorkerProfilingService:
             '/edgeshard.profiling.v1.WorkerProfilingService/CloseProfilingSession',
             profiling__pb2.CloseProfilingSessionRequest.SerializeToString,
             profiling__pb2.CloseProfilingSessionResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def PrepareIperfServer(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/edgeshard.profiling.v1.WorkerProfilingService/PrepareIperfServer',
+            profiling__pb2.PrepareIperfServerRequest.SerializeToString,
+            profiling__pb2.PrepareIperfServerResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def StopIperfServer(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/edgeshard.profiling.v1.WorkerProfilingService/StopIperfServer',
+            profiling__pb2.StopIperfServerRequest.SerializeToString,
+            profiling__pb2.StopIperfServerResponse.FromString,
             options,
             channel_credentials,
             insecure,

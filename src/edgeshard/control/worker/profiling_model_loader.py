@@ -1,9 +1,9 @@
 """MODEL-session checkpoint loading for the Worker runner (spec §38).
 
-``PrepareProfilingSession(kind=MODEL)`` does the expensive static work once:
-resolve the requested :class:`ModelReference` to a local ModelStore
-snapshot, load the checkpoint onto the session device, enumerate layers and
-profile modules through the family adapter, extract the representative
+``PrepareProfilingSession(kind=MODEL)`` resolves the requested
+:class:`ModelReference`, characterizes it from configuration/layout, loads
+only the requested layer shard onto the session device, enumerates profile
+modules through the family adapter, and extracts representative
 operator signatures, and package everything as
 :class:`~edgeshard.profiling.domain.session.ModelSessionFacts` for the
 Master's planner (§47) — plus the live handles the layer/module profilers
@@ -25,13 +25,14 @@ from typing import Protocol
 
 import torch
 import torch.nn as nn
-from transformers import AutoModelForCausalLM
 
 from edgeshard.cluster.inventory import ModelAvailability, ModelInventoryEntry
 from edgeshard.model.adapters.base import load_model_config
 from edgeshard.model.adapters.registry import default_registry, resolve_adapter_for_source
 from edgeshard.model.layout import ModelLayout
 from edgeshard.model.source import ModelSource
+from edgeshard.model.spec import BlockRange, ShardSpec
+from edgeshard.model.weights.safetensors import SafetensorsWeightLoader
 from edgeshard.profiling.domain.experiment import (
     ModelCaseSpec,
     ProfilingErrorCategory,
@@ -58,7 +59,10 @@ from edgeshard.profiling.model.adapters.base import (
 )
 from edgeshard.profiling.model.characterization import model_reference_for
 from edgeshard.profiling.model.layer_profiler import transformer_layer_signature
-from edgeshard.profiling.operator.extractor import TorchExportExtractor
+from edgeshard.profiling.operator.extractor import (
+    TorchExportExtractor,
+    TorchProfilerExtractor,
+)
 from edgeshard.profiling.operator.normalizer import (
     OperatorNormalizer,
     unique_operator_signatures,
@@ -68,6 +72,7 @@ from edgeshard.runtime.model_store import ModelStore
 logger = logging.getLogger("worker.profiling.model_loader")
 
 MODEL_EXTRACTION_SEQUENCE_LENGTH = 128
+MODEL_EXTRACTION_SEQUENCE_LENGTHS = (128, 512, 2048)
 """Sequence length of the representative layer export at prepare time.
 
 Operator signatures embed their shapes, so the extraction length defines
@@ -197,12 +202,11 @@ class ModelSessionLoader(Protocol):
 
 
 class TorchModelSessionLoader:
-    """Default loader: HF checkpoint → enumerated facts + live handles.
+    """Default loader: config characterization plus one live layer shard.
 
-    ``device`` is the torch device the session's single lease resolved to;
-    the checkpoint is loaded on CPU (snapshot weights are read once) and
-    moved to the target device before any enumeration, so observed weight
-    dtypes/devices are the ones every case benchmarks against (§21).
+    ``device`` is the torch device the session's single lease resolved to.
+    Characterization is config/layout-only; Phase 0's shard skeleton and
+    safetensors loader materialize just the target layer before benchmarking.
     """
 
     def __init__(self, *, device: torch.device | None = None) -> None:
@@ -215,14 +219,40 @@ class TorchModelSessionLoader:
             raise ValueError("model session requests carry model and dtype (§38)")
         path = source.ensure_local()
         config = load_model_config(source)
-        layout = resolve_adapter_for_source(source, default_registry()).inspect(source)
+        runtime_adapter = resolve_adapter_for_source(source, default_registry())
+        layout = runtime_adapter.inspect(source)
         adapter = resolve_profiling_adapter(layout, config)
         dtype = torch_dtype(request.dtype)  # label validity first, never guessed
-        try:
-            model: nn.Module = (
-                AutoModelForCausalLM.from_pretrained(path).eval().to(dtype=dtype)
+        reference = model_reference_for(source, config)
+        # Characterization is config/layout-only. It deliberately happens
+        # before any target-device allocation, so model facts do not require
+        # the whole checkpoint—or even one shard—to fit on that device.
+        characterization = adapter.characterize(
+            layout,
+            config,
+            reference,
+            dtype=request.dtype,
+            quantization=request.quantization,
+        )
+        target_layer_index = request.target_layer_index or 0
+        if target_layer_index >= layout.num_blocks:
+            raise ProfilingError(
+                ProfilingErrorCategory.UNSUPPORTED_GRANULARITY,
+                f"target layer {target_layer_index} is outside the model's "
+                f"0..{layout.num_blocks - 1} range",
             )
-            model = model.to(self._device)
+        try:
+            shard = ShardSpec(
+                model_id=request.model.model_id,
+                blocks=BlockRange(target_layer_index, target_layer_index + 1),
+                include_input_stage=False,
+                include_output_stage=False,
+            )
+            model = runtime_adapter.build_skeleton(source, shard)
+            SafetensorsWeightLoader().load_shard(model, source, layout, shard)
+            model.to(device=self._device, dtype=dtype)
+            runtime_adapter.restore_high_precision_buffers(model)
+            model.eval()
         except ProfilingError:
             raise
         except Exception as exc:
@@ -232,40 +262,51 @@ class TorchModelSessionLoader:
                 {"path": str(path), "dtype": request.dtype},
             ) from exc
 
-        reference = model_reference_for(source, config)
-        characterization = adapter.characterize(
-            layout, config, reference, dtype=request.dtype, quantization=request.quantization
+        local_layers = adapter.enumerate_transformer_layers(model, layout)
+        if len(local_layers) != 1:
+            raise ProfilingError(
+                ProfilingErrorCategory.INTERNAL_ERROR,
+                "selective profiling shard did not contain exactly one layer",
+            )
+        local_layer = local_layers[0]
+        layer = LayerReference(
+            index=target_layer_index,
+            module_path=layout.block_prefix(target_layer_index),
+            layer=local_layer.layer,
         )
-        layers = adapter.enumerate_transformer_layers(model, layout)
+        layers = (layer,)
         layer_signature = transformer_layer_signature(characterization)
-        modules: list[ProfileModule] = []
-        module_entries: list[ModuleEntry] = []
-        for layer in layers:
-            for module in adapter.enumerate_profile_modules(
+        modules = list(
+            adapter.enumerate_profile_modules(
                 layer, layout, quantization=characterization.quantization
-            ):
-                modules.append(module)
+            )
+        )
+        module_entries: list[ModuleEntry] = []
+        for layer_index in range(characterization.num_layers):
+            for module in modules:
                 module_entries.append(
                     ModuleEntry(
                         name=module.name,
-                        module_path=module.module_path,
+                        module_path=(
+                            f"{layout.block_prefix(layer_index)}.{module.name}"
+                        ),
                         kind=module.kind,
-                        layer_index=layer.index,
+                        layer_index=layer_index,
                         signature=module.signature,
                     )
                 )
         operator_signatures = self._extract_operator_signatures(
-            request, adapter, model, layers[0], layout, layer_signature
+            request, adapter, model, layer, layout, layer_signature
         )
         facts = ModelSessionFacts(
             characterization=characterization,
             layer_entries=tuple(
                 LayerEntry(
-                    index=layer.index,
-                    module_path=layer.module_path,
+                    index=index,
+                    module_path=layout.block_prefix(index),
                     signature=layer_signature,
                 )
-                for layer in layers
+                for index in range(characterization.num_layers)
             ),
             module_entries=tuple(module_entries),
             operator_signatures=operator_signatures,
@@ -303,26 +344,45 @@ class TorchModelSessionLoader:
         adapter's own shape-correct inputs with a fixed seed, and extraction
         failures stay typed (``EXPORT_FAILED``) preparation failures (§42).
         """
-        extraction_case = ModelCaseSpec(
-            granularity=ProfilingGranularity.TRANSFORMER_LAYER,
-            device_ids=request.device_ids,
-            dtype=str(request.dtype),
-            model=request.model,
-            layer_signature=layer_signature,
-            batch_size=1,
-            sequence_length=MODEL_EXTRACTION_SEQUENCE_LENGTH,
-        )
-        inputs = adapter.build_layer_inputs(
-            extraction_case, model, layer, layout, seed=MODEL_EXTRACTION_SEED
-        )
-        graph = TorchExportExtractor().extract(layer.layer, (), dict(inputs))
-        normalized = OperatorNormalizer().normalize(graph)
-        return unique_operator_signatures([normalized])
+        normalized_graphs = []
+        for sequence_length in MODEL_EXTRACTION_SEQUENCE_LENGTHS:
+            extraction_case = ModelCaseSpec(
+                granularity=ProfilingGranularity.TRANSFORMER_LAYER,
+                device_ids=request.device_ids,
+                dtype=str(request.dtype),
+                model=request.model,
+                layer_signature=layer_signature,
+                layer_index=layer.index,
+                batch_size=1,
+                sequence_length=sequence_length,
+            )
+            inputs = adapter.build_layer_inputs(
+                extraction_case, model, layer, layout, seed=MODEL_EXTRACTION_SEED
+            )
+            try:
+                graph = TorchExportExtractor().extract(
+                    layer.layer, (), dict(inputs)
+                )
+            except ProfilingError as exc:
+                if exc.category is not ProfilingErrorCategory.EXPORT_FAILED:
+                    raise
+                logger.warning(
+                    "torch.export failed for seq=%d; falling back to structural "
+                    "torch.profiler extraction: %s",
+                    sequence_length,
+                    exc,
+                )
+                graph = TorchProfilerExtractor().extract(
+                    layer.layer, (), dict(inputs)
+                )
+            normalized_graphs.append(OperatorNormalizer().normalize(graph))
+        return unique_operator_signatures(normalized_graphs)
 
 
 __all__ = [
     "MODEL_EXTRACTION_SEED",
     "MODEL_EXTRACTION_SEQUENCE_LENGTH",
+    "MODEL_EXTRACTION_SEQUENCE_LENGTHS",
     "LoadedModelSession",
     "ModelSessionLoader",
     "TorchModelSessionLoader",

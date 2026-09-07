@@ -29,6 +29,7 @@ from edgeshard.profiling.domain.environment import (
     DevicePerformanceClass,
     EnvironmentFingerprint,
     MemoryModel,
+    environment_fingerprint_id,
 )
 from edgeshard.profiling.domain.experiment import (
     CaseOutcome,
@@ -485,15 +486,45 @@ class TestRoundTrips:
         assert decode_json(WorkerNetworkFacts, encode_json(NETWORK_FACTS)) == NETWORK_FACTS
 
     def test_profile_snapshot(self) -> None:
+        environment = EnvironmentFingerprint(
+            backend="torch",
+            profiling_implementation_revision="test",
+            torch_version="test",
+            dtype="fp32",
+            worker_id="w-1",
+            device_id="gpu-0",
+        )
+        case = ProfilingCase.for_spec(
+            "w-1",
+            ModelCaseSpec(
+                granularity=ProfilingGranularity.OPERATOR,
+                device_ids=("gpu-0",),
+                dtype="fp32",
+                operator_signature=OPERATOR_VARIANTS[0],
+            ),
+        )
+
+        def self_contained(record: MeasurementRecord, measurement_id: str) -> MeasurementRecord:
+            return replace(
+                record,
+                measurement_id=measurement_id,
+                case_id=case.case_id,
+                environment_fingerprint=environment_fingerprint_id(environment),
+                environment=environment,
+            )
+
         snapshot = ProfileSnapshot(
             snapshot_id="snap-1",
             created_at=NOW,
             model_characterizations=(CHARACTERIZATION,),
-            measurements=(replace(LATENCY_RECORD, measurement_id="m-latency"),),
+            measurements=(self_contained(LATENCY_RECORD, "m-latency"),),
             network_measurements=(
-                replace(RTT_RECORD, measurement_id="m-rtt"),
-                replace(BANDWIDTH_RECORD, measurement_id="m-bandwidth"),
+                self_contained(RTT_RECORD, "m-rtt"),
+                self_contained(BANDWIDTH_RECORD, "m-bandwidth"),
             ),
+            profiling_cases=(case,),
+            operator_signatures=(OPERATOR_VARIANTS[0],),
+            environment_fingerprints=(environment,),
         )
         assert decode_json(ProfileSnapshot, encode_json(snapshot)) == snapshot
 

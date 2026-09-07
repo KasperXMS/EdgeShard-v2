@@ -37,11 +37,16 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
+from uuid import uuid4
 
 import grpc
 
 from edgeshard.control.master.service import MasterService
+from edgeshard.profiling.domain.environment import (
+    DevicePerformanceClassMembership,
+    EnvironmentFingerprint,
+)
 from edgeshard.profiling.domain.experiment import (
     CaseOutcome,
     CaseState,
@@ -54,9 +59,11 @@ from edgeshard.profiling.domain.experiment import (
     ProfilingErrorCategory,
     ProfilingExperiment,
     ProfilingFailure,
+    profiling_case_id,
+    profiling_experiment_id,
 )
 from edgeshard.profiling.domain.hashing import JsonScalar, canonical_sha256
-from edgeshard.profiling.domain.network import NetworkEndpointProfile
+from edgeshard.profiling.domain.network import NetworkEndpointProfile, ProbeKind
 from edgeshard.profiling.domain.session import (
     ModelSessionFacts,
     ProfilingSessionKind,
@@ -68,6 +75,7 @@ from edgeshard.profiling.domain.snapshot import ProfileSnapshot
 from edgeshard.profiling.network.classifier import (
     ClassifiedPair,
     WorkerNetworkFacts,
+    selected_ipv4_address,
     worker_network_facts,
 )
 from edgeshard.profiling.store.base import ProfileStore, ProfileStoreError, StoredExperiment
@@ -79,14 +87,21 @@ from edgeshard.protocol.profiling.mapper import (
     CloseProfilingSessionResponse,
     GetProfilingCaseRequest,
     GetProfilingCaseResponse,
+    PrepareIperfServerRequest,
+    PrepareIperfServerResponse,
     PrepareProfilingSessionRequest,
     PrepareProfilingSessionResponse,
     ProfilingRejection,
     RunProfilingCaseRequest,
     RunProfilingCaseResponse,
+    StopIperfServerRequest,
+    StopIperfServerResponse,
 )
 
 logger = logging.getLogger("edgeshard.control.master.profiling")
+
+if TYPE_CHECKING:
+    from edgeshard.profiling.operator.profiler import PerformanceClassVerification
 
 _TERMINAL_CASE_STATES = frozenset(
     {CaseState.COMPLETED, CaseState.FAILED, CaseState.CANCELLED}
@@ -166,6 +181,20 @@ class ProfilingTransport(Protocol):
         timeout: float | None = None,
     ) -> CloseProfilingSessionResponse: ...
 
+    async def prepare_iperf_server(
+        self,
+        request: PrepareIperfServerRequest,
+        *,
+        timeout: float | None = None,
+    ) -> PrepareIperfServerResponse: ...
+
+    async def stop_iperf_server(
+        self,
+        request: StopIperfServerRequest,
+        *,
+        timeout: float | None = None,
+    ) -> StopIperfServerResponse: ...
+
     async def close(self) -> None: ...
 
 
@@ -205,6 +234,14 @@ class _DispatchTokens:
 
 
 @dataclass(frozen=True)
+class _IperfServerLease:
+    transport: ProfilingTransport
+    tokens: _DispatchTokens
+    server_id: str
+    port: int
+
+
+@dataclass(frozen=True)
 class _SessionPlan:
     """One Worker session and the cases that share it (§38)."""
 
@@ -229,29 +266,44 @@ def _session_kind(case: ProfilingCase) -> ProfilingSessionKind:
 def _group_key(case: ProfilingCase) -> tuple[object, ...]:
     """Cases sharing one key share one session (§38: build state once).
 
-    Model cases split by (backend, model, dtype) — a session loads exactly
-    one checkpoint at one declared dtype; operator cases split by backend
-    only (each case carries its own signature and dtype, §25); network cases
-    all share the source worker's single session.
+    Model cases split by backend/model/dtype, target device, and selective
+    layer target. Operator cases split by backend and target device. Network
+    cases all share the source worker's session.
     """
     spec = case.spec
     if isinstance(spec, NetworkCaseSpec):
         return (ProfilingSessionKind.NETWORK,)
     if spec.granularity is ProfilingGranularity.OPERATOR:
-        return (ProfilingSessionKind.OPERATOR, spec.backend)
-    return (ProfilingSessionKind.MODEL, spec.backend, spec.model, spec.dtype)
+        return (ProfilingSessionKind.OPERATOR, spec.backend, spec.device_ids[0])
+    target_layer = (
+        spec.layer_index
+        if spec.granularity is ProfilingGranularity.TRANSFORMER_LAYER
+        else 0
+    )
+    return (
+        ProfilingSessionKind.MODEL,
+        spec.backend,
+        spec.model,
+        spec.dtype,
+        spec.device_ids[0],
+        target_layer,
+    )
 
 
 def _session_request(cases: Sequence[ProfilingCase]) -> ProfilingSessionRequest:
     """The session request covering every case of one group.
 
-    Leases the *union* of the group's devices so each case's ``device_ids``
-    is a subset of the leased set (§39: the Worker refuses unleased devices).
+    Device sessions lease exactly one target device (§39); MODEL sessions
+    additionally carry the one layer shard that preparation must load.
     """
     model_specs = [case.spec for case in cases if isinstance(case.spec, ModelCaseSpec)]
     if not model_specs:
         return ProfilingSessionRequest(kind=ProfilingSessionKind.NETWORK)
     devices = tuple(sorted({d for spec in model_specs for d in spec.device_ids}))
+    if len(devices) != 1:
+        raise ValueError(
+            "device-bound profiling sessions require exactly one target device"
+        )
     first = model_specs[0]
     if first.granularity is ProfilingGranularity.OPERATOR:
         return ProfilingSessionRequest(
@@ -271,6 +323,11 @@ def _session_request(cases: Sequence[ProfilingCase]) -> ProfilingSessionRequest:
         backend=first.backend,
         model=first.model,
         dtype=first.dtype,
+        target_layer_index=(
+            first.layer_index
+            if first.granularity is ProfilingGranularity.TRANSFORMER_LAYER
+            else 0
+        ),
     )
 
 
@@ -329,7 +386,7 @@ def _transport_failure(exc: grpc.aio.AioRpcError, what: str) -> ProfilingFailure
         category=category,
         message=f"{what} transport failed: {code.name if code is not None else 'unknown'}",
         details=(
-            ("grpc_code", code.value if code is not None else -1),
+            ("grpc_code", code.name if code is not None else "unknown"),
             ("transport_detail", exc.details()),
         ),
     )
@@ -395,24 +452,57 @@ class ProfilingController:
         strategy_id: str,
         cases: Sequence[ProfilingCase],
         requested_by: str | None = None,
+        force_new_execution: bool = False,
     ) -> ProfilingExperiment:
-        """Persist a new experiment definition (idempotent, §7/§44).
+        """Persist one configuration or an explicit new execution (§7/§44).
 
-        Cases deduplicate on their canonical ids, and the experiment id is
-        the canonical hash of the strategy plus the case set — re-planning
-        the same logical job replays the stored definition instead of forking
-        the append-oriented ledger. An already-persisted experiment (terminal
-        or not) is returned exactly as stored: its ``created_at`` and history
-        are never rewritten.
+        Normal creation is idempotent by stable configuration identity and
+        supports restart/resume. ``force_new_execution`` retains that identity
+        but allocates fresh experiment/case execution ids so a requested rerun
+        appends measurements without rewriting terminal history.
         """
+        configuration_case_ids = tuple(
+            sorted(
+                {
+                    profiling_case_id(case.worker_id, case.spec)
+                    for case in cases
+                }
+            )
+        )
+        configuration_id = profiling_experiment_id(
+            strategy_id, configuration_case_ids
+        )
+        execution_cases = tuple(cases)
+        experiment_id = configuration_id
+        if force_new_execution:
+            run_nonce = uuid4().hex
+            execution_cases = tuple(
+                dataclasses.replace(
+                    case,
+                    case_id=canonical_sha256(
+                        (
+                            "profiling_case_execution",
+                            profiling_case_id(case.worker_id, case.spec),
+                            run_nonce,
+                        )
+                    ),
+                )
+                for case in cases
+            )
+            experiment_id = canonical_sha256(
+                ("profiling_execution", configuration_id, run_nonce)
+            )
+
         unique: dict[str, ProfilingCase] = {}
-        for case in cases:
+        for case in execution_cases:
             unique.setdefault(case.case_id, case)
-        experiment = ProfilingExperiment.for_cases(
+        experiment = ProfilingExperiment(
+            experiment_id=experiment_id,
+            configuration_id=configuration_id,
             strategy_id=strategy_id,
-            case_ids=tuple(unique),
             created_at=self._clock(),
             requested_by=requested_by,
+            case_ids=tuple(unique),
         )
         existing = self._store.get_experiment(experiment.experiment_id)
         if existing is not None:
@@ -441,10 +531,9 @@ class ProfilingController:
     def experiment_status(self, experiment_id: str) -> ExperimentStatus | None:
         """Read-back view of one experiment for the admin plane (§49).
 
-        ``None`` for an unknown id (never a guess, §52.2). Case failures are
-        *not* part of the store's ledger — it keeps states only (§43) — so
-        returned :class:`CaseStatus` entries carry their state and the admin
-        layer enriches them with the typed failures from its run reports.
+        ``None`` for an unknown id (never a guess, §52.2). Typed failures are
+        read from the same durable ledger as case state, so a Master restart
+        does not erase the reason a case failed or was cancelled.
         """
         stored = self._store.get_experiment(experiment_id)
         if stored is None:
@@ -462,6 +551,7 @@ class ProfilingController:
                     case_id=case_id,
                     worker_id=stored_case.case.worker_id,
                     state=stored_case.state,
+                    failure=stored_case.failure,
                 )
             )
         return ExperimentStatus(
@@ -489,16 +579,41 @@ class ProfilingController:
         """Public view of the Master-resolved network facts (§30, §52.2)."""
         return self._cluster_network_facts()
 
-    def measured_operator_signature_ids(
-        self,
-        *,
-        device_performance_class_id: str | None = None,
-        environment_fingerprint_id: str | None = None,
+    def measured_operator_signature_ids_for_environment(
+        self, fingerprint: EnvironmentFingerprint
     ) -> AbstractSet[str]:
-        """The §28 incremental-reuse answer straight from the store."""
-        return self._store.measured_operator_signature_ids(
-            device_performance_class_id=device_performance_class_id,
-            environment_fingerprint_id=environment_fingerprint_id,
+        """Reuse licensed for this physical and compatible environment."""
+        return self._store.measured_operator_signature_ids_for_environment(
+            fingerprint
+        )
+
+    def record_performance_class_verification(
+        self,
+        fingerprint: EnvironmentFingerprint,
+        verification: PerformanceClassVerification,
+        *,
+        evidence_measurement_ids: tuple[str, ...] = (),
+    ) -> None:
+        """Persist a verification verdict that directly gates reuse planning."""
+        class_id = fingerprint.device_performance_class_id
+        if (
+            class_id is None
+            or fingerprint.worker_id is None
+            or fingerprint.device_id is None
+        ):
+            raise ValueError(
+                "performance-class verification requires class, worker, and device ids"
+            )
+        self._store.store_environment_fingerprint(fingerprint)
+        self._store.store_performance_class_membership(
+            DevicePerformanceClassMembership(
+                device_performance_class_id=class_id,
+                worker_id=fingerprint.worker_id,
+                device_id=fingerprint.device_id,
+                verified=verification.compatible,
+                verified_at=self._clock() if verification.compatible else None,
+                evidence_measurement_ids=evidence_measurement_ids,
+            )
         )
 
     def record_model_facts(self, facts: ModelSessionFacts) -> None:
@@ -517,6 +632,8 @@ class ProfilingController:
             self._store.store_module_signature(module_entry.signature)
         for signature in facts.operator_signatures:
             self._store.store_operator_signature(signature)
+        if facts.environment is not None:
+            self._store.store_environment_fingerprint(facts.environment)
         logger.info(
             "recorded model facts: %s (%d layer, %d module, %d operator "
             "signature(s))",
@@ -645,6 +762,11 @@ class ProfilingController:
                     case_id=case_id,
                     worker_id=stored_case.case.worker_id,
                     state=stored_case.state,
+                    outcome=(
+                        CaseOutcome.from_failure(stored_case.failure)
+                        if stored_case.failure is not None
+                        else None
+                    ),
                     detail="terminal in the store; replayed without re-dispatch (§50)",
                 )
                 continue
@@ -722,6 +844,11 @@ class ProfilingController:
                     case_id=case_id,
                     worker_id=stored_case.case.worker_id,
                     state=stored_case.state,
+                    outcome=(
+                        CaseOutcome.from_failure(stored_case.failure)
+                        if stored_case.failure is not None
+                        else None
+                    ),
                     detail="terminal in the store; untouched by cancellation (§44)",
                 )
             else:
@@ -840,14 +967,14 @@ class ProfilingController:
             if not cases:
                 return tuple(reports)
 
-        prepared = await self._prepare(transport, tokens, plan, facts)
-        if isinstance(prepared, ProfilingFailure):
-            reports.extend(
-                self._record_failure(case, prepared, "session prepare failed")
-                for case in cases
-            )
-            return tuple(reports)
         try:
+            prepared = await self._prepare(transport, tokens, plan, facts)
+            if isinstance(prepared, ProfilingFailure):
+                reports.extend(
+                    self._record_failure(case, prepared, "session prepare failed")
+                    for case in cases
+                )
+                return tuple(reports)
             for case in cases:
                 reports.append(
                     await self._run_case(transport, tokens, plan.session_id, case)
@@ -968,12 +1095,26 @@ class ProfilingController:
         case: ProfilingCase,
     ) -> CaseReport:
         self._store.update_case_state(case.case_id, CaseState.RUNNING)
+        iperf_lease: _IperfServerLease | None = None
+        if (
+            isinstance(case.spec, NetworkCaseSpec)
+            and case.spec.probe_kind is ProbeKind.BANDWIDTH
+        ):
+            prepared = await self._prepare_remote_iperf_server(case)
+            if isinstance(prepared, ProfilingFailure):
+                return self._record_failure(
+                    case, prepared, "destination iperf3 server preparation failed"
+                )
+            iperf_lease = prepared
         request = RunProfilingCaseRequest(
             worker_id=tokens.worker_id,
             instance_id=tokens.instance_id,
             registration_session_id=tokens.registration_session_id,
             profiling_session_id=session_id,
             case=case,
+            iperf_server_port=(
+                iperf_lease.port if iperf_lease is not None else None
+            ),
         )
         try:
             response = await transport.run_profiling_case(
@@ -996,6 +1137,9 @@ class ProfilingController:
             return self._record_failure(
                 case, _unexpected_failure(exc, "RunProfilingCase"), "run raised"
             )
+        finally:
+            if iperf_lease is not None:
+                await self._stop_remote_iperf_server(iperf_lease)
         if not response.accepted:
             failure = _rejection_failure(
                 response.reason, response.detail, "RunProfilingCase"
@@ -1042,6 +1186,32 @@ class ProfilingController:
                     ),
                     "protocol violation; measurement not persisted",
                 )
+            environment = record.environment
+            expected_device = (
+                case.spec.device_ids[0]
+                if isinstance(case.spec, ModelCaseSpec)
+                else None
+            )
+            if (
+                environment is None
+                or environment.worker_id != case.worker_id
+                or environment.device_id != expected_device
+            ):
+                return self._record_failure(
+                    case,
+                    ProfilingFailure(
+                        category=ProfilingErrorCategory.INTERNAL_ERROR,
+                        message=(
+                            "measurement lacks a complete, correctly attributed "
+                            "EnvironmentFingerprint"
+                        ),
+                        details=(
+                            ("expected_device_id", expected_device),
+                            ("expected_worker_id", case.worker_id),
+                        ),
+                    ),
+                    "protocol violation; measurement not persisted",
+                )
             try:
                 if not self._store.append_measurement(record):
                     logger.info(
@@ -1062,13 +1232,103 @@ class ProfilingController:
             state = CaseState.COMPLETED
         else:
             state = CaseState.FAILED
-        self._store.update_case_state(case.case_id, state)
+        self._store.update_case_state(
+            case.case_id,
+            state,
+            outcome.failure if outcome.record is None else None,
+        )
         return CaseReport(
             case_id=case.case_id,
             worker_id=case.worker_id,
             state=state,
             outcome=outcome,
         )
+
+    async def _prepare_remote_iperf_server(
+        self, case: ProfilingCase
+    ) -> _IperfServerLease | ProfilingFailure:
+        spec = case.spec
+        assert isinstance(spec, NetworkCaseSpec)
+        resolved = self._resolve_tokens(spec.destination_worker_id)
+        if isinstance(resolved, ProfilingFailure):
+            return resolved
+        transport = self._transport_factory(resolved.endpoint)
+        destination_facts = self._cluster_network_facts().get(
+            spec.destination_worker_id
+        )
+        bind_address = (
+            selected_ipv4_address(
+                destination_facts, spec.destination_interface_id
+            )
+            if destination_facts is not None
+            else None
+        )
+        if bind_address is None:
+            await transport.close()
+            return ProfilingFailure(
+                category=ProfilingErrorCategory.NETWORK_UNREACHABLE,
+                message=(
+                    "bandwidth destination has no unambiguous IPv4 probe path; "
+                    "set destination_interface_id explicitly on multi-NIC workers"
+                ),
+            )
+        server_id = canonical_sha256(("iperf_server", case.case_id))
+        timeout_s = (spec.duration_s or 0.0) + 30.0
+        request = PrepareIperfServerRequest(
+            worker_id=resolved.worker_id,
+            instance_id=resolved.instance_id,
+            registration_session_id=resolved.registration_session_id,
+            server_id=server_id,
+            timeout_s=timeout_s,
+            bind_address=bind_address,
+        )
+        try:
+            response = await transport.prepare_iperf_server(
+                request, timeout=self._rpc_timeout
+            )
+        except grpc.aio.AioRpcError as exc:
+            await transport.close()
+            return _transport_failure(exc, "PrepareIperfServer")
+        except Exception as exc:
+            await transport.close()
+            return _unexpected_failure(exc, "PrepareIperfServer")
+        if not response.accepted or response.port is None:
+            await transport.close()
+            return _rejection_failure(
+                response.reason, response.detail, "PrepareIperfServer"
+            )
+        return _IperfServerLease(
+            transport=transport,
+            tokens=resolved,
+            server_id=server_id,
+            port=response.port,
+        )
+
+    async def _stop_remote_iperf_server(self, lease: _IperfServerLease) -> None:
+        request = StopIperfServerRequest(
+            worker_id=lease.tokens.worker_id,
+            instance_id=lease.tokens.instance_id,
+            registration_session_id=lease.tokens.registration_session_id,
+            server_id=lease.server_id,
+        )
+        try:
+            response = await lease.transport.stop_iperf_server(
+                request, timeout=self._rpc_timeout
+            )
+            if not response.accepted:
+                logger.warning(
+                    "destination iperf3 server %s refused cleanup: %s",
+                    lease.server_id,
+                    response.detail,
+                )
+        except Exception:
+            logger.warning(
+                "destination iperf3 server %s cleanup failed",
+                lease.server_id,
+                exc_info=True,
+            )
+        finally:
+            await lease.transport.close()
 
     async def _close_session(
         self, transport: ProfilingTransport, tokens: _DispatchTokens, session_id: str
@@ -1299,7 +1559,7 @@ class ProfilingController:
         self, case: ProfilingCase, failure: ProfilingFailure, detail: str
     ) -> CaseReport:
         """One case FAILED with a typed failure, persisted (§42/§44)."""
-        self._store.update_case_state(case.case_id, CaseState.FAILED)
+        self._store.update_case_state(case.case_id, CaseState.FAILED, failure)
         return CaseReport(
             case_id=case.case_id,
             worker_id=case.worker_id,
@@ -1313,7 +1573,7 @@ class ProfilingController:
             category=ProfilingErrorCategory.CANCELLED,
             message="case cancelled by the Master (§40)",
         )
-        self._store.update_case_state(case.case_id, CaseState.CANCELLED)
+        self._store.update_case_state(case.case_id, CaseState.CANCELLED, failure)
         return CaseReport(
             case_id=case.case_id,
             worker_id=case.worker_id,
@@ -1337,6 +1597,11 @@ class ProfilingController:
                     case_id=case_id,
                     worker_id=stored_case.case.worker_id,
                     state=stored_case.state,
+                    outcome=(
+                        CaseOutcome.from_failure(stored_case.failure)
+                        if stored_case.failure is not None
+                        else None
+                    ),
                     detail="replayed from the store (§44); nothing dispatched",
                 )
             )

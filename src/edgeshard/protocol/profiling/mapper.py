@@ -365,6 +365,7 @@ class RunProfilingCaseRequest:
     registration_session_id: str
     profiling_session_id: str
     case: ProfilingCase
+    iperf_server_port: int | None = None
 
     def __post_init__(self) -> None:
         _check_tokens(
@@ -378,6 +379,10 @@ class RunProfilingCaseRequest:
                 f"case/envelope worker_id mismatch: case is assigned to "
                 f"{self.case.worker_id!r} but the envelope targets {self.worker_id!r}"
             )
+        if self.iperf_server_port is not None and not (
+            1 <= self.iperf_server_port <= 65535
+        ):
+            raise ValueError("iperf_server_port must be within [1, 65535]")
 
 
 @dataclass(frozen=True)
@@ -418,6 +423,7 @@ def run_case_request_to_wire(request: RunProfilingCaseRequest) -> pb.RunProfilin
         profiling_session_id=request.profiling_session_id,
         case_id=request.case.case_id,
         case_payload=encode_json(request.case),
+        iperf_server_port=request.iperf_server_port or 0,
     )
 
 
@@ -434,6 +440,9 @@ def run_case_request_from_wire(wire: pb.RunProfilingCaseRequest) -> RunProfiling
         registration_session_id=wire.registration_session_id,
         profiling_session_id=wire.profiling_session_id,
         case=case,
+        iperf_server_port=(
+            int(wire.iperf_server_port) if wire.iperf_server_port else None
+        ),
     )
 
 
@@ -758,6 +767,169 @@ def close_session_response_from_wire(
 
 
 # ---------------------------------------------------------------------------
+# Destination-side temporary iperf3 server lifecycle.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PrepareIperfServerRequest:
+    worker_id: str
+    instance_id: str
+    registration_session_id: str
+    server_id: str
+    port: int | None = None
+    timeout_s: float = 30.0
+    bind_address: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.worker_id or not self.instance_id or not self.registration_session_id:
+            raise ValueError("iperf server request requires registration tokens")
+        if not self.server_id:
+            raise ValueError("server_id must not be empty")
+        if self.port is not None and not 1 <= self.port <= 65535:
+            raise ValueError("port must be within [1, 65535]")
+        if self.timeout_s <= 0:
+            raise ValueError("timeout_s must be positive")
+        if self.bind_address is not None and not self.bind_address:
+            raise ValueError("bind_address must not be empty when present")
+
+
+@dataclass(frozen=True)
+class PrepareIperfServerResponse:
+    accepted: bool
+    detail: str = ""
+    reason: ProfilingRejection | None = None
+    port: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.accepted:
+            if self.reason is not None or self.port is None:
+                raise ValueError("accepted iperf prepare requires a port and no reason")
+        elif not self.detail or self.reason is None or self.port is not None:
+            raise ValueError("rejected iperf prepare requires detail/reason only")
+
+
+@dataclass(frozen=True)
+class StopIperfServerRequest:
+    worker_id: str
+    instance_id: str
+    registration_session_id: str
+    server_id: str
+
+    def __post_init__(self) -> None:
+        if not self.worker_id or not self.instance_id or not self.registration_session_id:
+            raise ValueError("iperf stop request requires registration tokens")
+        if not self.server_id:
+            raise ValueError("server_id must not be empty")
+
+
+@dataclass(frozen=True)
+class StopIperfServerResponse:
+    accepted: bool
+    detail: str = ""
+    reason: ProfilingRejection | None = None
+
+    def __post_init__(self) -> None:
+        if self.accepted and self.reason is not None:
+            raise ValueError("accepted iperf stop must not carry a reason")
+        if not self.accepted and (not self.detail or self.reason is None):
+            raise ValueError("rejected iperf stop requires detail and reason")
+
+
+def prepare_iperf_server_request_to_wire(
+    request: PrepareIperfServerRequest,
+) -> pb.PrepareIperfServerRequest:
+    return pb.PrepareIperfServerRequest(
+        worker_id=request.worker_id,
+        instance_id=request.instance_id,
+        registration_session_id=request.registration_session_id,
+        server_id=request.server_id,
+        port=request.port or 0,
+        timeout_s=request.timeout_s,
+        bind_address=request.bind_address or "",
+    )
+
+
+def prepare_iperf_server_request_from_wire(
+    wire: pb.PrepareIperfServerRequest,
+) -> PrepareIperfServerRequest:
+    return PrepareIperfServerRequest(
+        worker_id=wire.worker_id,
+        instance_id=wire.instance_id,
+        registration_session_id=wire.registration_session_id,
+        server_id=wire.server_id,
+        port=int(wire.port) if wire.port else None,
+        timeout_s=float(wire.timeout_s),
+        bind_address=wire.bind_address or None,
+    )
+
+
+def prepare_iperf_server_response_to_wire(
+    response: PrepareIperfServerResponse,
+) -> pb.PrepareIperfServerResponse:
+    return pb.PrepareIperfServerResponse(
+        accepted=response.accepted,
+        detail=response.detail,
+        reason=_rejection_to_wire(response.reason),
+        port=response.port or 0,
+    )
+
+
+def prepare_iperf_server_response_from_wire(
+    wire: pb.PrepareIperfServerResponse,
+) -> PrepareIperfServerResponse:
+    accepted = bool(wire.accepted)
+    return PrepareIperfServerResponse(
+        accepted=accepted,
+        detail=wire.detail,
+        reason=_rejection_from_wire(wire.reason, accepted=accepted, label="iperf prepare"),
+        port=int(wire.port) if accepted else None,
+    )
+
+
+def stop_iperf_server_request_to_wire(
+    request: StopIperfServerRequest,
+) -> pb.StopIperfServerRequest:
+    return pb.StopIperfServerRequest(
+        worker_id=request.worker_id,
+        instance_id=request.instance_id,
+        registration_session_id=request.registration_session_id,
+        server_id=request.server_id,
+    )
+
+
+def stop_iperf_server_request_from_wire(
+    wire: pb.StopIperfServerRequest,
+) -> StopIperfServerRequest:
+    return StopIperfServerRequest(
+        worker_id=wire.worker_id,
+        instance_id=wire.instance_id,
+        registration_session_id=wire.registration_session_id,
+        server_id=wire.server_id,
+    )
+
+
+def stop_iperf_server_response_to_wire(
+    response: StopIperfServerResponse,
+) -> pb.StopIperfServerResponse:
+    return pb.StopIperfServerResponse(
+        accepted=response.accepted,
+        detail=response.detail,
+        reason=_rejection_to_wire(response.reason),
+    )
+
+
+def stop_iperf_server_response_from_wire(
+    wire: pb.StopIperfServerResponse,
+) -> StopIperfServerResponse:
+    accepted = bool(wire.accepted)
+    return StopIperfServerResponse(
+        accepted=accepted,
+        detail=wire.detail,
+        reason=_rejection_from_wire(wire.reason, accepted=accepted, label="iperf stop"),
+    )
+
+
 # ProfilingAdminService (§49): the CLI submits intents, reads back status.
 # No session tokens here — the admin plane terminates at the Master, which
 # owns registration state; refusals are plain accepted=False + detail.

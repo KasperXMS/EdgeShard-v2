@@ -18,6 +18,7 @@ domain DTOs out. Profilers are recording fakes (the real ones are tested in
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import shutil
 from datetime import UTC, datetime
@@ -26,21 +27,33 @@ from pathlib import Path
 import pytest
 import torch
 import torch.nn as nn
+from transformers import AutoModelForCausalLM
 
 from edgeshard.cluster.inventory import ModelAvailability, ModelInventoryEntry
 from edgeshard.cluster.state import (
     DeviceAvailability,
     DeviceState,
+    MemoryPoolState,
     WorkerState,
 )
+from edgeshard.control.worker import profiling_model_loader as model_loader_module
 from edgeshard.control.worker.agent import LocalInspection
 from edgeshard.control.worker.profiling_leases import DeviceLeaseManager
-from edgeshard.control.worker.profiling_model_loader import LoadedModelSession
-from edgeshard.control.worker.profiling_runner import WorkerProfilingRunner
+from edgeshard.control.worker.profiling_model_loader import (
+    MODEL_EXTRACTION_SEQUENCE_LENGTHS,
+    LoadedModelSession,
+)
+from edgeshard.control.worker.profiling_runner import (
+    WorkerProfilingRunner,
+    default_instrumentation,
+)
 from edgeshard.control.worker.profiling_sessions import (
     ProfilingSessionManager,
+    ProfilingSessionRecord,
     RegistrationTokens,
 )
+from edgeshard.profiling.benchmark.harness import InstrumentationBundle
+from edgeshard.profiling.domain.environment import environment_fingerprint_id
 from edgeshard.profiling.domain.experiment import (
     CaseState,
     ModelCaseSpec,
@@ -79,21 +92,31 @@ from edgeshard.profiling.domain.signature import (
     TransformerLayerSignature,
 )
 from edgeshard.profiling.errors import ProfilingError
+from edgeshard.profiling.instrumentation.timing import WallClockTimer
 from edgeshard.profiling.model.adapters.base import LayerReference, ProfileModule
 from edgeshard.profiling.network.classifier import (
     InterfaceFacts,
     InterfaceKind,
     WorkerNetworkFacts,
 )
+from edgeshard.profiling.operator.extractor import RawOperatorGraph
 from edgeshard.protocol.profiling.mapper import (
     CancelProfilingCaseRequest,
     CloseProfilingSessionRequest,
     GetProfilingCaseRequest,
+    PrepareIperfServerRequest,
     PrepareProfilingSessionRequest,
     ProfilingRejection,
     RunProfilingCaseRequest,
+    StopIperfServerRequest,
 )
-from factories import make_rtx_capability, make_worker_identity
+from factories import (
+    RTX_GPU_DEVICE_ID,
+    make_jetson_capability,
+    make_rtx_capability,
+    make_worker_identity,
+    make_worker_state,
+)
 
 NOW = datetime(2026, 9, 7, 12, 0, tzinfo=UTC)
 LATER = datetime(2026, 9, 7, 12, 5, tzinfo=UTC)
@@ -266,13 +289,29 @@ class RecordingNetworkProfiler:
         self.calls: list[ProfilingCase] = []
         self.facts: list[object] = []
         self.error = error
+        self.server_starts: list[tuple[int, str | None]] = []
+        self.server_stops: list[object] = []
 
-    async def profile(self, case, *, network_facts, environment_fingerprint):
+    async def profile(
+        self,
+        case,
+        *,
+        network_facts,
+        environment_fingerprint,
+        iperf_server_port=None,
+    ):
         self.calls.append(case)
         self.facts.append(network_facts)
         if self.error is not None:
             raise self.error
         return make_record(case)
+
+    async def start_iperf_server(self, *, port: int, bind_address=None):
+        self.server_starts.append((port, bind_address))
+        return object()
+
+    async def stop_iperf_server(self, process) -> None:
+        self.server_stops.append(process)
 
 
 class StubLoader:
@@ -560,13 +599,15 @@ async def test_prepare_model_session_loads_once_and_replays() -> None:
     rig = make_rig(make_state(models=(MODEL_ENTRY,)))
     first = await prepare(rig, MODEL_SESSION)
     assert first.accepted is True
-    assert first.session_facts == STUB_FACTS
+    assert first.session_facts is not None
+    assert dataclasses.replace(first.session_facts, environment=None) == STUB_FACTS
+    assert first.session_facts.environment is not None
     assert rig.loader.load_count == 1
     # A retried prepare (lost response) replays the cached session: no
     # second checkpoint load (§37), identical facts (§6 determinism).
     second = await prepare(rig, MODEL_SESSION)
     assert second.accepted is True
-    assert second.session_facts == STUB_FACTS
+    assert second.session_facts == first.session_facts
     assert rig.loader.load_count == 1
 
 
@@ -670,6 +711,126 @@ async def test_run_operator_case_completes() -> None:
     assert kwargs["environment_fingerprint"]
     assert kwargs["device"] == torch.device("cpu")
     assert kwargs["instrumentation"] is not None
+
+
+async def test_second_gpu_case_execution_and_fingerprint_agree() -> None:
+    state = make_state(
+        devices=(
+            DeviceState(
+                device_id="gpu-0",
+                utilization=0.0,
+                temperature_c=40.0,
+                power_w=None,
+                availability=DeviceAvailability.AVAILABLE,
+                running_runtime_ids=(),
+            ),
+            DeviceState(
+                device_id="gpu-1",
+                utilization=0.0,
+                temperature_c=40.0,
+                power_w=None,
+                availability=DeviceAvailability.AVAILABLE,
+                running_runtime_ids=(),
+            ),
+        )
+    )
+    rig = make_rig(state)
+    rig.runner._device_resolver = lambda device_id, worker_id: torch.device(
+        "cuda", int(device_id[-1])
+    )
+    rig.runner._instrumentation_factory = lambda device: InstrumentationBundle(
+        timer=WallClockTimer()
+    )
+    session = ProfilingSessionRequest(
+        kind=ProfilingSessionKind.OPERATOR, device_ids=("gpu-1",)
+    )
+    assert (await prepare(rig, session)).accepted
+    case = operator_case(device_ids=("gpu-1",))
+
+    response = await rig.runner.run_profiling_case(run_request(case))
+
+    assert response.outcome.succeeded
+    record = response.outcome.record
+    assert record is not None and record.environment is not None
+    assert rig.operator.kwargs[0]["device"] == torch.device("cuda", 1)
+    assert case.spec.device_ids == ("gpu-1",)
+    assert record.environment.device_id == "gpu-1"
+    assert record.environment_fingerprint == environment_fingerprint_id(
+        record.environment
+    )
+
+
+def test_default_instrumentation_reuses_phase1_shared_jetson_pool() -> None:
+    capability = make_jetson_capability()
+    state = make_worker_state(
+        WORKER_ID, device_ids=("gpu-system",), pool_ids=("system-memory",)
+    )
+    state_holder = [state]
+    record = ProfilingSessionRecord(
+        session_id="jetson-session",
+        request=ProfilingSessionRequest(
+            kind=ProfilingSessionKind.OPERATOR, device_ids=("gpu-system",)
+        ),
+        prepared_at=NOW,
+        capability_revision=capability.capability_revision,
+        capability=capability,
+        worker_state=state,
+        worker_state_source=lambda: state_holder[0],
+    )
+
+    bundle = default_instrumentation(
+        torch.device("cpu"), device_id="gpu-system", record=record
+    )
+
+    assert bundle.physical_memory is not None
+    assert bundle.telemetry is not None
+    bundle.physical_memory.open()
+    bundle.telemetry.capture_initial()
+    state_holder[0] = dataclasses.replace(
+        state,
+        device_states=(dataclasses.replace(state.device_states[0], utilization=77.0),),
+        memory_states=(
+            MemoryPoolState(
+                memory_pool_id="system-memory", available_bytes=17 * 2**30
+            ),
+        ),
+    )
+    physical = bundle.physical_memory.close()
+    telemetry = bundle.telemetry.capture_final()
+    assert physical.pool_id == "system-memory"
+    assert physical.used_after is not None and physical.used_before is not None
+    assert physical.used_after > physical.used_before
+    assert telemetry is not None
+    assert telemetry.initial is not None
+    assert telemetry.initial.device_id == "gpu-system"
+    assert telemetry.final is not None and telemetry.final.utilization == 77.0
+
+
+def test_default_instrumentation_maps_phase1_nvml_gpu_state() -> None:
+    capability = make_rtx_capability()
+    state = make_worker_state(WORKER_ID)
+    record = ProfilingSessionRecord(
+        session_id="rtx-session",
+        request=ProfilingSessionRequest(
+            kind=ProfilingSessionKind.OPERATOR,
+            device_ids=(RTX_GPU_DEVICE_ID,),
+        ),
+        prepared_at=NOW,
+        capability_revision=capability.capability_revision,
+        capability=capability,
+        worker_state=state,
+    )
+
+    bundle = default_instrumentation(
+        torch.device("cpu"), device_id=RTX_GPU_DEVICE_ID, record=record
+    )
+    assert bundle.physical_memory is not None
+    assert bundle.telemetry is not None
+    bundle.telemetry.capture_initial()
+    telemetry = bundle.telemetry.capture_final()
+    assert telemetry is not None and telemetry.initial is not None
+    assert telemetry.initial.device_id == RTX_GPU_DEVICE_ID
+    assert telemetry.initial.utilization == 21.0
 
 
 async def test_duplicate_run_replays_recorded_outcome() -> None:
@@ -969,6 +1130,41 @@ async def test_network_case_unknown_destination_fails_typed() -> None:
     assert rig.network.calls == []
 
 
+async def test_temporary_iperf_server_is_ready_idempotent_and_cleaned_up() -> None:
+    rig = make_rig()
+    request = PrepareIperfServerRequest(
+        **fields(),
+        server_id="case-server",
+        port=45678,
+        timeout_s=30.0,
+        bind_address="127.0.0.1",
+    )
+    first = await rig.runner.prepare_iperf_server(request)
+    replay = await rig.runner.prepare_iperf_server(request)
+
+    assert first.accepted and replay.accepted
+    assert first.port == replay.port == 45678
+    assert rig.network.server_starts == [(45678, "127.0.0.1")]
+
+    stopped = await rig.runner.stop_iperf_server(
+        StopIperfServerRequest(**fields(), server_id="case-server")
+    )
+    assert stopped.accepted
+    assert len(rig.network.server_stops) == 1
+
+
+async def test_temporary_iperf_server_timeout_prevents_process_leak() -> None:
+    rig = make_rig()
+    response = await rig.runner.prepare_iperf_server(
+        PrepareIperfServerRequest(
+            **fields(), server_id="expiring-server", port=45679, timeout_s=0.01
+        )
+    )
+    assert response.accepted
+    await asyncio.sleep(0.03)
+    assert len(rig.network.server_stops) == 1
+
+
 # ---------------------------------------------------------------------------
 # Close and shutdown (§38, §39: no lease outlives its session or the runner)
 # ---------------------------------------------------------------------------
@@ -1035,6 +1231,7 @@ def model_store_with_tiny_llama(
 
 async def test_real_model_session_prepare_and_layer_run(
     model_store_with_tiny_llama: tuple[Path, WorkerState],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Prepare a MODEL session through the real TorchModelSessionLoader.
 
@@ -1044,18 +1241,29 @@ async def test_real_model_session_prepare_and_layer_run(
     'registration → prepare → facts' on a CPU-only host.
     """
     root, state = model_store_with_tiny_llama
+    monkeypatch.setattr(
+        AutoModelForCausalLM,
+        "from_pretrained",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            torch.OutOfMemoryError("whole model does not fit")
+        ),
+    )
     rig = make_rig(state, model_store_root=root, real_loader=True)
     request = ProfilingSessionRequest(
         kind=ProfilingSessionKind.MODEL,
         device_ids=(CPU_DEVICE,),
         model=ModelReference(model_id="tiny/llama", revision="main"),
         dtype="fp32",
+        target_layer_index=2,
     )
     prepared = await prepare(rig, request)
     assert prepared.accepted is True, prepared.detail
     facts = prepared.session_facts
     assert facts.characterization.num_layers == 4  # TINY_LLAMA_CONFIG
     assert len(facts.layer_entries) == 4
+    handle = rig.sessions.peek(SESSION_ID).model_handle
+    assert isinstance(handle, LoadedModelSession)
+    assert len(handle.layers) == 1
     assert facts.module_entries  # attention + mlp per layer
     assert facts.operator_signatures  # the representative export produced ops
     assert rig.leases.leased_device_ids == (CPU_DEVICE,)
@@ -1080,3 +1288,43 @@ async def test_real_model_session_prepare_and_layer_run(
 
     await rig.runner.shutdown()
     assert rig.leases.leased_device_ids == ()
+
+
+async def test_model_loader_export_failure_uses_structural_profiler_fallback(
+    model_store_with_tiny_llama: tuple[Path, WorkerState],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, state = model_store_with_tiny_llama
+    export_calls = 0
+    profiler_calls = 0
+
+    def fail_export(self, target, args, kwargs):
+        nonlocal export_calls
+        export_calls += 1
+        raise ProfilingError(
+            ProfilingErrorCategory.EXPORT_FAILED, "synthetic export rejection"
+        )
+
+    def structural_only(self, target, args, kwargs):
+        nonlocal profiler_calls
+        profiler_calls += 1
+        return RawOperatorGraph(extractor="torch_profiler", operations=())
+
+    monkeypatch.setattr(model_loader_module.TorchExportExtractor, "extract", fail_export)
+    monkeypatch.setattr(
+        model_loader_module.TorchProfilerExtractor, "extract", structural_only
+    )
+    rig = make_rig(state, model_store_root=root, real_loader=True)
+    request = ProfilingSessionRequest(
+        kind=ProfilingSessionKind.MODEL,
+        device_ids=(CPU_DEVICE,),
+        model=ModelReference(model_id="tiny/llama", revision="main"),
+        dtype="fp32",
+        target_layer_index=0,
+    )
+
+    prepared = await prepare(rig, request)
+
+    assert prepared.accepted, prepared.detail
+    assert MODEL_EXTRACTION_SEQUENCE_LENGTHS == (128, 512, 2048)
+    assert export_calls == profiler_calls == len(MODEL_EXTRACTION_SEQUENCE_LENGTHS)
