@@ -575,6 +575,15 @@ class ProfilingController:
             )
         )
 
+    def profiling_device_ids(self, worker_id: str) -> tuple[str, ...]:
+        """Device ids owned by one registered profiling Worker."""
+        record = self._service.registry.find(worker_id)
+        if record is None or record.profiling_endpoint is None:
+            return ()
+        return tuple(
+            device.identity.device_id for device in record.capability.devices
+        )
+
     def cluster_network_facts(self) -> dict[str, WorkerNetworkFacts]:
         """Public view of the Master-resolved network facts (§30, §52.2)."""
         return self._cluster_network_facts()

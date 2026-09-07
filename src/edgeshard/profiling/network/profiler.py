@@ -56,7 +56,7 @@ from edgeshard.profiling.network.classifier import (
     WorkerNetworkFacts,
     classify_pairs,
     classify_path,
-    enumerate_pairs,
+    enumerate_probe_paths,
     select_bandwidth_pairs,
     selected_ipv4_address,
 )
@@ -132,10 +132,11 @@ def pipeline_payload_sizes(
 def rtt_matrix_cases(
     facts: Iterable[WorkerNetworkFacts],
     *,
+    pairs: Iterable[NetworkPair] | None = None,
     packet_count: int | None = None,
     same_subnet_prefix_length: int = DEFAULT_SAME_SUBNET_PREFIX_LENGTH,
 ) -> tuple[ProfilingCase, ...]:
-    """Dense RTT matrix: one case per directed pair (§32-§33).
+    """Dense RTT matrix over explicit interface paths (§32-§33).
 
     Every case executes on its pair's source worker (``ProfilingCase``
     enforces it); the derived ``PathClass`` is attached as case metadata.
@@ -143,15 +144,25 @@ def rtt_matrix_cases(
     workers = tuple(facts)
     by_id = {worker.worker_id: worker for worker in workers}
     cases = []
-    for pair in enumerate_pairs(workers):
+    selected = enumerate_probe_paths(workers) if pairs is None else tuple(pairs)
+    for pair in selected:
+        if pair.source_worker_id not in by_id or pair.destination_worker_id not in by_id:
+            raise ValueError(
+                "explicit RTT pair references unknown worker(s): "
+                f"{pair.source_worker_id!r} -> {pair.destination_worker_id!r}"
+            )
         spec = NetworkCaseSpec(
             probe_kind=ProbeKind.RTT,
             source_worker_id=pair.source_worker_id,
             destination_worker_id=pair.destination_worker_id,
+            source_interface_id=pair.source_interface_id,
+            destination_interface_id=pair.destination_interface_id,
             path_class=classify_path(
                 by_id[pair.source_worker_id],
                 by_id[pair.destination_worker_id],
                 same_subnet_prefix_length=same_subnet_prefix_length,
+                source_interface_id=pair.source_interface_id,
+                destination_interface_id=pair.destination_interface_id,
             ),
             packet_count=packet_count,
         )
@@ -281,6 +292,16 @@ class NetworkProfiler:
             if source is not None
             else None
         )
+        if source is None or source_address is None:
+            raise ProfilingError(
+                ProfilingErrorCategory.NETWORK_UNREACHABLE,
+                f"source worker {spec.source_worker_id!r} has no unambiguous "
+                "IPv4 probe path; select source_interface_id",
+                {
+                    "source_worker_id": spec.source_worker_id,
+                    "source_interface_id": spec.source_interface_id,
+                },
+            )
         if target is None:
             raise ProfilingError(
                 ProfilingErrorCategory.NETWORK_UNREACHABLE,
@@ -301,16 +322,11 @@ class NetworkProfiler:
             "path_class": spec.path_class.value if spec.path_class is not None else None,
         }
         if spec.probe_kind is ProbeKind.RTT:
-            if spec.source_interface_id is not None:
-                observation = await self._ping.probe(
-                    target,
-                    packet_count=spec.packet_count,
-                    bind_address=source_address,
-                )
-            else:
-                observation = await self._ping.probe(
-                    target, packet_count=spec.packet_count
-                )
+            observation = await self._ping.probe(
+                target,
+                packet_count=spec.packet_count,
+                bind_address=source_address,
+            )
             metrics = MeasurementMetrics(
                 rtt=RttMetrics(
                     summary=observation.summary,

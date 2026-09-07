@@ -117,12 +117,14 @@ class ProfilingStrategy(Protocol):
         self,
         *,
         facts: Iterable[WorkerNetworkFacts],
+        rtt_pairs: Iterable[NetworkPair] | None = None,
         extra_bandwidth_pairs: Iterable[NetworkPair] = (),
         bandwidth_path_classes: Iterable[NetworkPathClass] | None = None,
     ) -> NetworkProfilingPlan:
         """Plan the §47 network workflow over the cluster's facts.
 
-        ``extra_bandwidth_pairs`` is the §34 explicit-pair knob;
+        ``rtt_pairs`` optionally replaces the default explicit-interface RTT
+        matrix; ``extra_bandwidth_pairs`` is the §34 explicit-pair knob;
         ``bandwidth_path_classes`` restricts the sparse class-driven
         bandwidth selection (the §49 ``--path-class`` knob) without
         touching the dense RTT matrix.

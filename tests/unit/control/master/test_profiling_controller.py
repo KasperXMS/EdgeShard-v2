@@ -395,6 +395,8 @@ async def register_worker(
     worker_id: str,
     *,
     profiling_endpoint: str | None = ENDPOINT_1,
+    capability=None,
+    initial_state=None,
 ) -> tuple[str, str, str]:
     """Register a real worker; returns (worker_id, instance_id, session_id)."""
     identity = make_worker_identity(worker_id)
@@ -402,8 +404,8 @@ async def register_worker(
         protocol_version=CONTROL_PROTOCOL_VERSION,
         instance_id=str(uuid.uuid4()),
         identity=identity,
-        capability=make_rtx_capability(),
-        initial_state=make_worker_state(identity.worker_id),
+        capability=capability or make_rtx_capability(),
+        initial_state=initial_state or make_worker_state(identity.worker_id),
         profiling_endpoint=profiling_endpoint,
     )
     response = await rig.service.register_worker(request)

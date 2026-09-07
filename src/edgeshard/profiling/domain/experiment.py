@@ -448,21 +448,35 @@ class ProfilingExperiment:
 
 
 @dataclass(frozen=True)
+class WorkerDeviceTarget:
+    """One Worker-local device selected for model profiling."""
+
+    worker_id: str
+    device_id: str
+
+    def __post_init__(self) -> None:
+        if not self.worker_id:
+            raise ValueError("worker_id must not be empty")
+        if not self.device_id:
+            raise ValueError("device_id must not be empty")
+
+
+@dataclass(frozen=True)
 class ProfilingRequest:
     """Operator intent for one profiling experiment (spec §49).
 
     The admin wire contract (``StartExperiment``): the CLI submits *intent*,
     never planned cases — planning is the Master's job through the strategy
     layer (§46-§47), so a request is fully described before any Worker is
-    contacted. Empty ``worker_ids`` means "every registered Worker with a
-    profiling endpoint"; the Master resolves and refuses unknown ids rather
-    than guessing (§52.2).
+    contacted. Network requests use ``worker_ids``. Model-family requests use
+    explicit ``worker_device_targets`` so every device id is interpreted only
+    in its owning Worker's local namespace.
 
     Kind-specific shape mirrors :class:`ProfilingSessionRequest`:
 
     * ``MODEL``/``OPERATOR`` benchmark through a characterized checkpoint and
       therefore require ``model``, the declared ``dtype`` (§17), and
-      ``device_ids``; ``OPERATOR`` additionally honors ``missing_only`` (the
+      ``worker_device_targets``; ``OPERATOR`` additionally honors ``missing_only`` (the
       §28 incremental-reuse filter — ``False`` re-measures everything).
     * ``NETWORK`` forbids all model/device knobs and accepts the probe
       selection (``network_probe``: ``None`` = RTT + bandwidth, §47) plus the
@@ -476,10 +490,12 @@ class ProfilingRequest:
     dtype: str | None = None
     worker_ids: tuple[str, ...] = ()
     device_ids: tuple[str, ...] = ()
+    worker_device_targets: tuple[WorkerDeviceTarget, ...] = ()
     missing_only: bool = True
     network_probe: ProbeKind | None = None
     bandwidth_path_classes: tuple[NetworkPathClass, ...] = ()
     extra_bandwidth_pairs: tuple[NetworkPair, ...] = ()
+    network_pairs: tuple[NetworkPair, ...] = ()
     requested_by: str | None = None
 
     def __post_init__(self) -> None:
@@ -497,6 +513,14 @@ class ProfilingRequest:
             if device_id in seen_devices:
                 raise ValueError(f"duplicate device_id {device_id!r}")
             seen_devices.add(device_id)
+        if len(set(self.worker_device_targets)) != len(self.worker_device_targets):
+            raise ValueError("worker_device_targets must not contain duplicates")
+        if len(set(self.network_pairs)) != len(self.network_pairs):
+            raise ValueError("network_pairs must not contain duplicates")
+        if self.network_pairs and self.extra_bandwidth_pairs:
+            raise ValueError(
+                "network_pairs cannot be combined with legacy extra_bandwidth_pairs"
+            )
         if self.requested_by is not None and not self.requested_by:
             raise ValueError("requested_by must not be empty when present")
         if self.kind is ProfilingSessionKind.NETWORK:
@@ -511,6 +535,10 @@ class ProfilingRequest:
             raise ValueError("network requests must not carry a dtype")
         if self.device_ids:
             raise ValueError("network requests must not carry device_ids (§33-36)")
+        if self.worker_device_targets:
+            raise ValueError(
+                "network requests must not carry worker_device_targets (§33-36)"
+            )
         if not self.missing_only:
             raise ValueError(
                 "missing_only=False is meaningless for network requests — "
@@ -526,17 +554,29 @@ class ProfilingRequest:
             raise ValueError(
                 f"{self.kind.value} requests require the declared measurement dtype"
             )
-        if not self.device_ids:
+        if self.worker_device_targets:
+            if self.worker_ids or self.device_ids:
+                raise ValueError(
+                    "explicit worker_device_targets cannot be combined with "
+                    "worker_ids/device_ids"
+                )
+        elif len(self.worker_ids) != 1 or not self.device_ids:
             raise ValueError(
-                f"{self.kind.value} requests require at least one device_id"
+                f"{self.kind.value} requests require explicit worker_device_targets; "
+                "the compatibility form requires exactly one worker_id and at "
+                "least one local device_id"
             )
         if self.network_probe is not None:
             raise ValueError(
                 f"{self.kind.value} requests must not select a network probe"
             )
-        if self.bandwidth_path_classes or self.extra_bandwidth_pairs:
+        if (
+            self.bandwidth_path_classes
+            or self.extra_bandwidth_pairs
+            or self.network_pairs
+        ):
             raise ValueError(
-                f"{self.kind.value} requests must not carry bandwidth knobs (§34)"
+                f"{self.kind.value} requests must not carry network knobs (§34)"
             )
 
 

@@ -16,7 +16,7 @@ import pytest
 
 import edgeshard.control.worker.agent as agent_module
 from edgeshard.cluster.capability import OSInfo
-from edgeshard.cluster.state import WorkerState
+from edgeshard.cluster.state import MemoryPoolState, WorkerState
 from edgeshard.control.worker.agent import LocalWorkerInspector
 from edgeshard.control.worker.config import (
     ModelStoreSection,
@@ -62,6 +62,26 @@ class CountingTelemetryProbe:
     async def sample(self) -> StateFragment:
         self.sample_calls += 1
         return StateFragment()
+
+
+class FreshCountingTelemetryProbe(CountingTelemetryProbe):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fresh_calls = 0
+
+    async def sample(self) -> StateFragment:
+        self.sample_calls += 1
+        return StateFragment(
+            memory_states=(MemoryPoolState("pool", 100),)
+        )
+
+    def sample_fresh(self) -> StateFragment:
+        self.fresh_calls += 1
+        return StateFragment(
+            memory_states=(
+                MemoryPoolState("pool", 100 - 10 * self.fresh_calls),
+            )
+        )
 
 
 class ClosableTelemetryProbe(CountingTelemetryProbe):
@@ -163,6 +183,27 @@ async def test_static_capability_cached_while_telemetry_samples_every_beat(
     identity = inspection.identity
     state: WorkerState = inspection.state
     assert state.worker_id == identity.worker_id
+    await inspector.close()
+
+
+async def test_profiling_fresh_samples_reuse_live_inspector_backend(
+    tmp_path: Path,
+) -> None:
+    probe = FreshCountingTelemetryProbe()
+    inspector = make_inspector(
+        make_config(tmp_path), FakeClock(), CountingCapabilityProbe(), probe
+    )
+    await inspector.start()
+    initial = await inspector.inspect()
+
+    first = inspector.sample_fresh_state()
+    second = inspector.sample_fresh_state()
+
+    assert initial.state.memory_states[0].available_bytes == 100
+    assert first is not None and first.memory_states[0].available_bytes == 90
+    assert second is not None and second.memory_states[0].available_bytes == 80
+    assert probe.sample_calls == 1
+    assert probe.fresh_calls == 2
     await inspector.close()
 
 

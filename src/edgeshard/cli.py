@@ -15,8 +15,8 @@ The Phase 0 forms stay as compatibility aliases during Phase 1::
 Phase 2 adds the profiling operator surface (spec §49)::
 
     edgeshard profile model inspect --model ID [--config worker.yaml]
-    edgeshard profile model run --master EP --model ID --dtype D --device DEV
-    edgeshard profile operator run --master EP --model ID --dtype D --device DEV
+    edgeshard profile model run --master EP --model ID --dtype D --target WORKER@DEVICE
+    edgeshard profile operator run --master EP --model ID --dtype D --target WORKER@DEVICE
     edgeshard profile network rtt --master EP
     edgeshard profile network bandwidth --master EP [--path-class wired_lan]
     edgeshard profile status --master EP --experiment ID
@@ -71,7 +71,7 @@ from edgeshard.control.worker.profiling_sessions import (
 )
 from edgeshard.model.errors import EdgeShardError
 from edgeshard.profiling.codec import encode_payload
-from edgeshard.profiling.domain.experiment import ProfilingRequest
+from edgeshard.profiling.domain.experiment import ProfilingRequest, WorkerDeviceTarget
 from edgeshard.profiling.domain.model import ModelReference
 from edgeshard.profiling.domain.network import NetworkPair, NetworkPathClass, ProbeKind
 from edgeshard.profiling.domain.session import ProfilingSessionKind, ProfilingSessionRequest
@@ -461,11 +461,11 @@ WorkerListOption = Annotated[
         "hosting the profiling service.",
     ),
 ]
-DeviceListOption = Annotated[
+WorkerDeviceTargetListOption = Annotated[
     list[str],
     typer.Option(
-        "--device",
-        help="Device id the benchmarks lease (§39); repeatable, at least one.",
+        "--target",
+        help="Worker-local device target WORKER@DEVICE; repeatable.",
     ),
 ]
 ModelIdOption = Annotated[
@@ -567,6 +567,13 @@ def _parse_pair(value: str) -> NetworkPair:
     )
 
 
+def _parse_worker_device_target(value: str) -> WorkerDeviceTarget:
+    worker_id, separator, device_id = value.partition("@")
+    if not separator or not worker_id or not device_id:
+        _fail(f"--target must be WORKER@DEVICE, got {value!r}")
+    return WorkerDeviceTarget(worker_id=worker_id, device_id=device_id)
+
+
 @profile_model_app.command("inspect")
 def profile_model_inspect(
     model: ModelIdOption,
@@ -630,8 +637,7 @@ def profile_model_run(
     master: MasterEndpointOption,
     model: ModelIdOption,
     dtype: DtypeOption,
-    device: DeviceListOption,
-    worker: WorkerListOption = None,
+    target: WorkerDeviceTargetListOption,
     revision: RevisionOption = None,
     include_measured: IncludeMeasuredOption = False,
     requested_by: RequestedByOption = None,
@@ -647,8 +653,9 @@ def profile_model_run(
             kind=ProfilingSessionKind.MODEL,
             model=ModelReference(model_id=model, revision=revision),
             dtype=dtype,
-            worker_ids=tuple(worker or ()),
-            device_ids=tuple(device),
+            worker_device_targets=tuple(
+                _parse_worker_device_target(value) for value in target
+            ),
             missing_only=not include_measured,
             requested_by=requested_by,
         )
@@ -661,8 +668,7 @@ def profile_operator_run(
     master: MasterEndpointOption,
     model: ModelIdOption,
     dtype: DtypeOption,
-    device: DeviceListOption,
-    worker: WorkerListOption = None,
+    target: WorkerDeviceTargetListOption,
     revision: RevisionOption = None,
     include_measured: IncludeMeasuredOption = False,
     requested_by: RequestedByOption = None,
@@ -678,8 +684,9 @@ def profile_operator_run(
             kind=ProfilingSessionKind.OPERATOR,
             model=ModelReference(model_id=model, revision=revision),
             dtype=dtype,
-            worker_ids=tuple(worker or ()),
-            device_ids=tuple(device),
+            worker_device_targets=tuple(
+                _parse_worker_device_target(value) for value in target
+            ),
             missing_only=not include_measured,
             requested_by=requested_by,
         )
@@ -691,14 +698,23 @@ def profile_operator_run(
 def profile_network_rtt(
     master: MasterEndpointOption,
     worker: WorkerListOption = None,
+    pair: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--pair",
+            help="Explicit RTT path SRC@INTERFACE:DST@INTERFACE; repeatable.",
+        ),
+    ] = None,
     requested_by: RequestedByOption = None,
 ) -> None:
     """Dispatch the dense cheap RTT matrix over the selected workers (§33)."""
+    pairs = tuple(_parse_pair(value) for value in pair or ())
     intent = _build_intent(
         lambda: ProfilingRequest(
             kind=ProfilingSessionKind.NETWORK,
             worker_ids=tuple(worker or ()),
             network_probe=ProbeKind.RTT,
+            network_pairs=pairs,
             requested_by=requested_by,
         )
     )
@@ -736,7 +752,7 @@ def profile_network_bandwidth(
             worker_ids=tuple(worker or ()),
             network_probe=ProbeKind.BANDWIDTH,
             bandwidth_path_classes=classes,
-            extra_bandwidth_pairs=pairs,
+            network_pairs=pairs,
             requested_by=requested_by,
         )
     )

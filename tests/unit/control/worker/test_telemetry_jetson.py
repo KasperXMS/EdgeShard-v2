@@ -253,9 +253,12 @@ async def test_repeated_samples_reuse_the_single_process(tmp_path: Path) -> None
     )
     try:
         first = await backend.sample()
-        second = await backend.sample()
+        second = backend.sample_fresh()
+        third = await backend.sample()
         _, first_gpu = first.device_states
         _, second_gpu = second.device_states
-        assert first_gpu.utilization == second_gpu.utilization == 34.0
+        _, third_gpu = third.device_states
+        assert first_gpu.utilization == second_gpu.utilization == third_gpu.utilization == 34.0
+        assert second.memory_states[0].memory_pool_id == SYSTEM_MEMORY_POOL_ID
     finally:
         await backend.close()

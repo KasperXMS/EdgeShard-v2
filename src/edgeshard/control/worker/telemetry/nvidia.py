@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 from collections.abc import Callable, Sequence
 from typing import Any
 
@@ -53,9 +54,15 @@ class NvidiaTelemetryProbe:
     ) -> None:
         self._nvml = nvml
         self._static_device_ids = static_device_ids
+        self._sample_lock = threading.Lock()
 
     async def sample(self) -> StateFragment:
-        return await asyncio.to_thread(self._sample_blocking)
+        return await asyncio.to_thread(self.sample_fresh)
+
+    def sample_fresh(self) -> StateFragment:
+        """Fresh NVML sample through this long-lived backend instance."""
+        with self._sample_lock:
+            return self._sample_blocking()
 
     def _sample_blocking(self) -> StateFragment:
         nvml = self._nvml if self._nvml is not None else import_nvml()

@@ -23,6 +23,7 @@ import asyncio
 import contextlib
 import logging
 import re
+import threading
 from dataclasses import dataclass
 
 import psutil
@@ -228,17 +229,26 @@ class JetsonTelemetryBackend:
         self._tegrastats = tegrastats or TegrastatsProcess()
         self._cpu_sample_interval_s = cpu_sample_interval_s
         self._first_sample_timeout_s = first_sample_timeout_s
+        self._sample_lock = threading.Lock()
 
     async def sample(self) -> StateFragment:
         await self._tegrastats.start()
         sample = self._tegrastats.latest
         if sample is None:
-            sample = await self._tegrastats.wait_first(self._first_sample_timeout_s)
-
-        memory = psutil.virtual_memory()
-        utilization = await asyncio.to_thread(
-            psutil.cpu_percent, interval=self._cpu_sample_interval_s
+            await self._tegrastats.wait_first(self._first_sample_timeout_s)
+        return await asyncio.to_thread(
+            self._sample_blocking, self._cpu_sample_interval_s
         )
+
+    def sample_fresh(self) -> StateFragment:
+        """Read fresh physical state without restarting ``tegrastats``."""
+        return self._sample_blocking(None)
+
+    def _sample_blocking(self, cpu_interval_s: float | None) -> StateFragment:
+        with self._sample_lock:
+            sample = self._tegrastats.latest
+            memory = psutil.virtual_memory()
+            utilization = psutil.cpu_percent(interval=cpu_interval_s)
         utilization = max(0.0, min(100.0, float(utilization)))
 
         return StateFragment(

@@ -41,7 +41,7 @@ from edgeshard.control.worker.discovery.nvidia import NvidiaCapabilityProbe
 from edgeshard.control.worker.identity import IdentityManager, build_worker_identity
 from edgeshard.control.worker.model_inventory import scan_model_inventory
 from edgeshard.control.worker.runtime_inventory import scan_runtime_inventory
-from edgeshard.control.worker.telemetry.base import TelemetryProbe
+from edgeshard.control.worker.telemetry.base import StateFragment, TelemetryProbe
 from edgeshard.control.worker.telemetry.host import HostTelemetryProbe
 from edgeshard.control.worker.telemetry.jetson import JetsonTelemetryBackend
 from edgeshard.control.worker.telemetry.nvidia import NvidiaTelemetryProbe
@@ -191,9 +191,43 @@ class LocalWorkerInspector:
     def started(self) -> bool:
         return self._started
 
-    def current_state(self) -> WorkerState | None:
-        """Latest Phase 1 NVML/tegrastats sample for synchronous instruments."""
-        return self._latest_state
+    def sample_fresh_state(self) -> WorkerState | None:
+        """Lightweight fresh telemetry sample for profiling instrumentation.
+
+        This reuses the inspector's existing Phase 1 backends. In particular,
+        Jetson reads the already-running tegrastats process and never creates
+        a profiling-owned process.
+        """
+        if not self._started or self._worker_id is None:
+            return None
+        fragments: list[StateFragment] = []
+        for probe in self._telemetry_probes:
+            sample_fresh = getattr(probe, "sample_fresh", None)
+            if not callable(sample_fresh):
+                logger.warning(
+                    "telemetry probe %s has no fresh-sample interface; skipping it",
+                    type(probe).__name__,
+                )
+                continue
+            fragments.append(sample_fresh())
+        if not fragments:
+            return None
+        previous = self._latest_state
+        runtime_instances = previous.runtime_instances if previous is not None else ()
+        state = WorkerState(
+            worker_id=self._worker_id,
+            device_states=enrich_device_states(
+                [device for fragment in fragments for device in fragment.device_states],
+                runtime_instances,
+            ),
+            memory_states=tuple(
+                memory for fragment in fragments for memory in fragment.memory_states
+            ),
+            runtime_instances=runtime_instances,
+            models=self._models,
+        )
+        self._latest_state = state
+        return state
 
     async def start(self) -> None:
         """One-time static discovery; idempotent."""

@@ -42,6 +42,7 @@ from edgeshard.profiling.dtypes import dtype_byte_size
 from edgeshard.profiling.errors import ProfilingError
 from edgeshard.profiling.network.classifier import (
     InterfaceFacts,
+    InterfaceKind,
     WorkerNetworkFacts,
     classify_interface,
 )
@@ -313,6 +314,40 @@ class TestCaseBuilders:
         first = rtt_matrix_cases(workers)
         second = rtt_matrix_cases(workers)
         assert [case.case_id for case in first] == [case.case_id for case in second]
+
+    def test_multi_nic_rtt_matrix_expands_explicit_interface_paths(self) -> None:
+        def multi(worker_id: str, suffix: int) -> WorkerNetworkFacts:
+            return WorkerNetworkFacts(
+                worker_id=worker_id,
+                hostname=f"host-{worker_id}",
+                interfaces=(
+                    InterfaceFacts(
+                        "lan", "eth0", InterfaceKind.WIRED, None,
+                        (f"192.168.1.{suffix}",), 1500,
+                    ),
+                    InterfaceFacts(
+                        "overlay", "zt0", InterfaceKind.OVERLAY, "zerotier",
+                        (f"100.64.0.{suffix}",), 2800,
+                    ),
+                ),
+            )
+
+        cases = rtt_matrix_cases([multi("w1", 10), multi("w2", 20)])
+
+        assert len(cases) == 8
+        assert all(case.spec.source_interface_id is not None for case in cases)
+        assert all(case.spec.destination_interface_id is not None for case in cases)
+        paths = {
+            (
+                case.spec.source_worker_id,
+                case.spec.source_interface_id,
+                case.spec.destination_worker_id,
+                case.spec.destination_interface_id,
+            )
+            for case in cases
+        }
+        assert ("w1", "lan", "w2", "lan") in paths
+        assert ("w1", "overlay", "w2", "overlay") in paths
 
     def test_bandwidth_cases_are_sparse_with_both_directions(self) -> None:
         """§34: representatives per class; forward and reverse are distinct cases."""
@@ -657,7 +692,9 @@ class TestNetworkProfilerFactResolution:
 
     async def test_typed_probe_failure_propagates(self) -> None:
         class FailingPing(FakePingRunner):
-            async def probe(self, target, *, packet_count=None):
+            async def probe(
+                self, target, *, packet_count=None, bind_address=None
+            ):
                 raise ProfilingError(
                     ProfilingErrorCategory.NETWORK_UNREACHABLE, "all packets lost"
                 )

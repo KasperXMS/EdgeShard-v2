@@ -335,6 +335,36 @@ def enumerate_pairs(facts: Iterable[WorkerNetworkFacts]) -> tuple[NetworkPair, .
     )
 
 
+def enumerate_probe_paths(
+    facts: Iterable[WorkerNetworkFacts],
+) -> tuple[NetworkPair, ...]:
+    """All directed, explicitly bound IPv4 interface paths.
+
+    Multi-NIC Workers produce one case per source/destination interface
+    combination. This may include unreachable combinations, which become
+    typed probe failures; it never chooses an interface from address order.
+    """
+    workers = tuple(facts)
+    worker_ids = [worker.worker_id for worker in workers]
+    if len(set(worker_ids)) != len(worker_ids):
+        raise ValueError("worker facts contain duplicate worker_id entries")
+    return tuple(
+        NetworkPair(
+            source_worker_id=source.worker_id,
+            destination_worker_id=destination.worker_id,
+            source_interface_id=source_interface.interface_id,
+            destination_interface_id=destination_interface.interface_id,
+        )
+        for source in workers
+        for destination in workers
+        if source.worker_id != destination.worker_id
+        for source_interface in source.interfaces
+        if _ipv4_addresses(source_interface.addresses)
+        for destination_interface in destination.interfaces
+        if _ipv4_addresses(destination_interface.addresses)
+    )
+
+
 @dataclass(frozen=True)
 class ClassifiedPair:
     """A directed pair with its derived classification (§31-§32).
@@ -427,6 +457,7 @@ __all__ = [
     "classify_path",
     "endpoint_profiles",
     "enumerate_pairs",
+    "enumerate_probe_paths",
     "primary_ipv4_address",
     "probed_interface",
     "select_bandwidth_pairs",

@@ -212,11 +212,9 @@ class _StateTelemetryInstrumentation:
         self._record = record
 
     def capture(self) -> DeviceObservation | None:
-        state = (
-            self._record.worker_state_source()
-            if self._record.worker_state_source is not None
-            else self._record.worker_state
-        )
+        if self._record.worker_state_source is None:
+            return None
+        state = self._record.worker_state_source()
         if state is None:
             return None
         device_state = next(
@@ -277,17 +275,20 @@ def default_instrumentation(
 ) -> InstrumentationBundle:
     """The v1 bundle: device-correct timing, allocator memory on CUDA (§11-14).
 
-    Physical-memory and telemetry instruments need pool/platform wiring the
-    serve path does not provide yet; their metrics stay ``None`` (§52.2)
-    rather than approximated.
+    Physical-memory and telemetry instruments reuse the Worker inspector's
+    live Phase 1 backend through ``worker_state_source``. Each open/poll/close
+    obtains a fresh sample; Jetson keeps the same long-lived tegrastats reader.
     """
     timer = CudaEventTimer(device.index) if device.type == "cuda" else WallClockTimer()
     allocator = CudaAllocatorMemoryProbe(device.index) if device.type == "cuda" else None
     physical: PhysicalMemoryProbe | None = None
     telemetry: TelemetryContextCollector | None = None
-    if record is not None and device_id is not None:
+    if (
+        record is not None
+        and device_id is not None
+        and record.worker_state_source is not None
+    ):
         capability = record.capability
-        state = record.worker_state
         device_capability = (
             next(
                 (
@@ -314,11 +315,8 @@ def default_instrumentation(
         )
         if pool is not None:
             def read_available() -> int | None:
-                current_state = (
-                    record.worker_state_source()
-                    if record.worker_state_source is not None
-                    else state
-                )
+                assert record.worker_state_source is not None
+                current_state = record.worker_state_source()
                 if current_state is None:
                     return None
                 current = next(
@@ -501,7 +499,9 @@ class WorkerProfilingRunner:
             capability_revision=inspection.capability.capability_revision or None,
             capability=inspection.capability,
             worker_state=inspection.state,
-            worker_state_source=getattr(self._inspector, "current_state", None),
+            worker_state_source=getattr(
+                self._inspector, "sample_fresh_state", None
+            ),
             session_facts=model_handle.facts if model_handle is not None else None,
             network_facts=network_facts,
             model_handle=model_handle,

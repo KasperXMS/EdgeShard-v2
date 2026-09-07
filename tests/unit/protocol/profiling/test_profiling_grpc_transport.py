@@ -39,6 +39,7 @@ from edgeshard.profiling.domain.experiment import (
     ProfilingErrorCategory,
     ProfilingExperiment,
     ProfilingRequest,
+    WorkerDeviceTarget,
 )
 from edgeshard.profiling.domain.session import ProfilingSessionKind
 from edgeshard.profiling.domain.snapshot import ProfileSnapshot
@@ -404,8 +405,7 @@ ADMIN_INTENT = ProfilingRequest(
     kind=ProfilingSessionKind.MODEL,
     model=MODEL,
     dtype="fp32",
-    worker_ids=(WORKER_ID,),
-    device_ids=("gpu-0",),
+    worker_device_targets=(WorkerDeviceTarget(WORKER_ID, "gpu-0"),),
     requested_by="operator",
 )
 ADMIN_EXPERIMENT = ProfilingExperiment.for_cases(

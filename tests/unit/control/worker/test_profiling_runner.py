@@ -766,6 +766,13 @@ def test_default_instrumentation_reuses_phase1_shared_jetson_pool() -> None:
         WORKER_ID, device_ids=("gpu-system",), pool_ids=("system-memory",)
     )
     state_holder = [state]
+    fresh_calls = 0
+
+    def fresh_state() -> WorkerState:
+        nonlocal fresh_calls
+        fresh_calls += 1
+        return state_holder[0]
+
     record = ProfilingSessionRecord(
         session_id="jetson-session",
         request=ProfilingSessionRequest(
@@ -775,7 +782,7 @@ def test_default_instrumentation_reuses_phase1_shared_jetson_pool() -> None:
         capability_revision=capability.capability_revision,
         capability=capability,
         worker_state=state,
-        worker_state_source=lambda: state_holder[0],
+        worker_state_source=fresh_state,
     )
 
     bundle = default_instrumentation(
@@ -784,11 +791,23 @@ def test_default_instrumentation_reuses_phase1_shared_jetson_pool() -> None:
 
     assert bundle.physical_memory is not None
     assert bundle.telemetry is not None
+    assert {device.memory_pool_id for device in capability.devices} == {
+        "system-memory"
+    }
+    assert len(capability.memory_pools) == 1
     bundle.physical_memory.open()
-    bundle.telemetry.capture_initial()
     state_holder[0] = dataclasses.replace(
         state,
         device_states=(dataclasses.replace(state.device_states[0], utilization=77.0),),
+        memory_states=(
+            MemoryPoolState(
+                memory_pool_id="system-memory", available_bytes=12 * 2**30
+            ),
+        ),
+    )
+    bundle.physical_memory.poll()
+    state_holder[0] = dataclasses.replace(
+        state_holder[0],
         memory_states=(
             MemoryPoolState(
                 memory_pool_id="system-memory", available_bytes=17 * 2**30
@@ -796,10 +815,20 @@ def test_default_instrumentation_reuses_phase1_shared_jetson_pool() -> None:
         ),
     )
     physical = bundle.physical_memory.close()
+    bundle.telemetry.capture_initial()
+    state_holder[0] = dataclasses.replace(
+        state_holder[0],
+        device_states=(
+            dataclasses.replace(state_holder[0].device_states[0], utilization=77.0),
+        ),
+    )
     telemetry = bundle.telemetry.capture_final()
     assert physical.pool_id == "system-memory"
     assert physical.used_after is not None and physical.used_before is not None
     assert physical.used_after > physical.used_before
+    assert physical.used_peak is not None
+    assert physical.used_peak > physical.used_after
+    assert fresh_calls == 5
     assert telemetry is not None
     assert telemetry.initial is not None
     assert telemetry.initial.device_id == "gpu-system"
@@ -819,6 +848,7 @@ def test_default_instrumentation_maps_phase1_nvml_gpu_state() -> None:
         capability_revision=capability.capability_revision,
         capability=capability,
         worker_state=state,
+        worker_state_source=lambda: state,
     )
 
     bundle = default_instrumentation(
@@ -831,6 +861,28 @@ def test_default_instrumentation_maps_phase1_nvml_gpu_state() -> None:
     assert telemetry is not None and telemetry.initial is not None
     assert telemetry.initial.device_id == RTX_GPU_DEVICE_ID
     assert telemetry.initial.utilization == 21.0
+
+
+def test_default_instrumentation_does_not_claim_cached_physical_peak() -> None:
+    capability = make_rtx_capability()
+    state = make_worker_state(WORKER_ID)
+    record = ProfilingSessionRecord(
+        session_id="cached-only",
+        request=ProfilingSessionRequest(
+            kind=ProfilingSessionKind.OPERATOR,
+            device_ids=(RTX_GPU_DEVICE_ID,),
+        ),
+        prepared_at=NOW,
+        capability=capability,
+        worker_state=state,
+    )
+
+    bundle = default_instrumentation(
+        torch.device("cpu"), device_id=RTX_GPU_DEVICE_ID, record=record
+    )
+
+    assert bundle.physical_memory is None
+    assert bundle.telemetry is None
 
 
 async def test_duplicate_run_replays_recorded_outcome() -> None:

@@ -142,8 +142,7 @@ class TestStartCommands:
                 "--master", MASTER,
                 "--model", "tiny/llama",
                 "--dtype", "fp32",
-                "--device", "gpu-0",
-                "--worker", "w-1",
+                "--target", "w-1@gpu-0",
                 "--requested-by", "alice",
             ],
         )
@@ -158,8 +157,9 @@ class TestStartCommands:
         assert intent.model is not None
         assert intent.model.model_id == "tiny/llama"
         assert intent.dtype == "fp32"
-        assert intent.worker_ids == ("w-1",)
-        assert intent.device_ids == ("gpu-0",)
+        assert len(intent.worker_device_targets) == 1
+        assert intent.worker_device_targets[0].worker_id == "w-1"
+        assert intent.worker_device_targets[0].device_id == "gpu-0"
         assert intent.missing_only is True
         assert intent.requested_by == "alice"
 
@@ -175,7 +175,7 @@ class TestStartCommands:
                 "--master", MASTER,
                 "--model", "tiny/llama",
                 "--dtype", "bf16",
-                "--device", "gpu-0",
+                "--target", "w-1@gpu-0",
                 "--include-measured",
             ],
         )
@@ -200,6 +200,23 @@ class TestStartCommands:
         assert intent.network_probe is ProbeKind.RTT
         assert intent.worker_ids == ()
 
+    def test_network_rtt_explicit_interface_path(self, stub) -> None:
+        stub.responses["start"] = mapper.StartExperimentResponse(
+            accepted=True, experiment_id="exp-rtt-path"
+        )
+        result = runner.invoke(
+            app,
+            [
+                "profile", "network", "rtt",
+                "--master", MASTER,
+                "--pair", "w-1@lan:w-2@zt",
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        (pair,) = stub.requests[0][1].request.network_pairs
+        assert pair.source_interface_id == "lan"
+        assert pair.destination_interface_id == "zt"
+
     def test_network_bandwidth_knobs(self, stub) -> None:
         stub.responses["start"] = mapper.StartExperimentResponse(
             accepted=True, experiment_id="exp-4"
@@ -219,7 +236,7 @@ class TestStartCommands:
         intent = stub.requests[0][1].request
         assert intent.network_probe is ProbeKind.BANDWIDTH
         assert intent.bandwidth_path_classes == (NetworkPathClass.WIRED_LAN,)
-        (pair,) = intent.extra_bandwidth_pairs
+        (pair,) = intent.network_pairs
         assert pair.source_worker_id == "w-1"
         assert pair.destination_worker_id == "w-2"
         assert pair.source_interface_id == "zt0"

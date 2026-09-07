@@ -67,6 +67,7 @@ from edgeshard.profiling.domain.experiment import (
     ExperimentState,
     ProfilingErrorCategory,
     ProfilingRequest,
+    WorkerDeviceTarget,
 )
 from edgeshard.profiling.domain.model import ModelReference
 from edgeshard.profiling.domain.network import ProbeKind
@@ -379,8 +380,9 @@ def operator_intent(worker_id: str, cpu_device_id: str, **overrides: object) -> 
         "kind": ProfilingSessionKind.OPERATOR,
         "model": MODEL,
         "dtype": "fp32",
-        "device_ids": (cpu_device_id,),
-        "worker_ids": (worker_id,),
+        "worker_device_targets": (
+            WorkerDeviceTarget(worker_id, cpu_device_id),
+        ),
         "requested_by": "integration",
     }
     base.update(overrides)

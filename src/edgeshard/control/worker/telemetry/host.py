@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 
 import psutil
 
@@ -30,12 +31,21 @@ class HostTelemetryProbe:
     def __init__(self, worker_id: str, cpu_sample_interval_s: float | None = None) -> None:
         self._device_id = derive_cpu_device_id(worker_id)
         self._cpu_sample_interval_s = cpu_sample_interval_s
+        self._sample_lock = threading.Lock()
 
     async def sample(self) -> StateFragment:
-        memory = psutil.virtual_memory()
-        utilization = await asyncio.to_thread(
-            psutil.cpu_percent, interval=self._cpu_sample_interval_s
+        return await asyncio.to_thread(
+            self._sample_blocking, self._cpu_sample_interval_s
         )
+
+    def sample_fresh(self) -> StateFragment:
+        """Fresh non-blocking psutil sample for profiling instrumentation."""
+        return self._sample_blocking(None)
+
+    def _sample_blocking(self, cpu_interval_s: float | None) -> StateFragment:
+        with self._sample_lock:
+            memory = psutil.virtual_memory()
+            utilization = psutil.cpu_percent(interval=cpu_interval_s)
         # Clamp defensively: psutil already reports 0-100 system-wide, and
         # the domain rejects anything outside.
         utilization = max(0.0, min(100.0, float(utilization)))

@@ -24,3 +24,9 @@ class TelemetryProbe(Protocol):
     """Dynamic telemetry backend (spec §25): sampled per heartbeat."""
 
     async def sample(self) -> StateFragment: ...
+
+
+class FreshTelemetryProbe(Protocol):
+    """Synchronous lightweight sample from an already-created backend."""
+
+    def sample_fresh(self) -> StateFragment: ...

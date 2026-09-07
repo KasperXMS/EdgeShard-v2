@@ -276,6 +276,7 @@ class DefaultProfilingStrategy:
         self,
         *,
         facts: Iterable[WorkerNetworkFacts],
+        rtt_pairs: Iterable[NetworkPair] | None = None,
         extra_bandwidth_pairs: Iterable[NetworkPair] = (),
         bandwidth_path_classes: Iterable[NetworkPathClass] | None = None,
     ) -> NetworkProfilingPlan:
@@ -288,7 +289,9 @@ class DefaultProfilingStrategy:
         )
         # Step 3 — dense cheap RTT matrix over all directed pairs (§33).
         rtt = rtt_matrix_cases(
-            workers, same_subnet_prefix_length=self._same_subnet_prefix_length
+            workers,
+            pairs=rtt_pairs,
+            same_subnet_prefix_length=self._same_subnet_prefix_length,
         )
         # Steps 4-5 — sparse per-class bandwidth plus the explicit-pair knob (§34).
         bandwidth = bandwidth_cases(

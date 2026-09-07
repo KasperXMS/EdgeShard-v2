@@ -10,6 +10,7 @@ typed failures (§43), and shutdown leaves experiments resumable (§50).
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 from pathlib import Path
 
 from test_profiling_controller import (
@@ -35,6 +36,7 @@ from edgeshard.profiling.domain.experiment import (
     ProfilingErrorCategory,
     ProfilingFailure,
     ProfilingRequest,
+    WorkerDeviceTarget,
 )
 from edgeshard.profiling.domain.network import NetworkPair, ProbeKind
 from edgeshard.profiling.domain.session import ProfilingSessionKind
@@ -47,6 +49,12 @@ from edgeshard.protocol.profiling.mapper import (
     RunProfilingCaseResponse,
     StartExperimentRequest,
 )
+from factories import (
+    RTX_GPU_DEVICE_ID,
+    finalize,
+    make_rtx_capability,
+    make_worker_state,
+)
 
 
 def model_intent(**overrides: object) -> ProfilingRequest:
@@ -54,8 +62,9 @@ def model_intent(**overrides: object) -> ProfilingRequest:
         "kind": ProfilingSessionKind.MODEL,
         "model": MODEL,
         "dtype": "fp32",
-        "device_ids": ("gpu-0",),
-        "worker_ids": (W1,),
+        "worker_device_targets": (
+            WorkerDeviceTarget(W1, RTX_GPU_DEVICE_ID),
+        ),
         "requested_by": "operator",
     }
     base.update(overrides)
@@ -77,8 +86,16 @@ def make_admin(rig: Rig) -> MasterProfilingAdmin:
 
 
 def script_healthy_inspection(rig: Rig) -> None:
+    assert SESSION_FACTS.environment is not None
+    facts = dataclasses.replace(
+        SESSION_FACTS,
+        environment=dataclasses.replace(
+            SESSION_FACTS.environment,
+            device_id=RTX_GPU_DEVICE_ID,
+        ),
+    )
     transport_for(rig).prepare_response = PrepareProfilingSessionResponse(
-        accepted=True, session_facts=SESSION_FACTS
+        accepted=True, session_facts=facts
     )
 
 
@@ -179,6 +196,34 @@ class TestStartExperimentNetwork:
         )
         await drain(admin, response.experiment_id)
 
+    async def test_explicit_interface_pair_selects_rtt_path(
+        self, tmp_path: Path
+    ) -> None:
+        rig = make_rig(tmp_path)
+        await register_worker(rig, W1)
+        await register_worker(rig, W2, profiling_endpoint=ENDPOINT_2)
+        admin = make_admin(rig)
+        pair = NetworkPair(W1, W2, "nic-0", "nic-0")
+
+        response = await admin.start_experiment(
+            StartExperimentRequest(
+                request=network_intent(
+                    network_probe=ProbeKind.RTT,
+                    network_pairs=(pair,),
+                )
+            )
+        )
+
+        assert response.accepted
+        cases = stored_cases(rig, response.experiment_id)
+        assert len(cases) == 1
+        spec = cases[0].spec
+        assert isinstance(spec, NetworkCaseSpec)
+        assert spec.probe_kind is ProbeKind.RTT
+        assert spec.source_interface_id == "nic-0"
+        assert spec.destination_interface_id == "nic-0"
+        await drain(admin, response.experiment_id)
+
     async def test_single_worker_without_peer_is_zero_case_rejection(
         self, tmp_path: Path
     ) -> None:
@@ -247,6 +292,99 @@ class TestStartExperimentRejections:
 
 
 class TestStartExperimentModelFamily:
+    async def test_explicit_targets_preserve_worker_local_device_mapping(
+        self, tmp_path: Path
+    ) -> None:
+        rig = make_rig(tmp_path)
+        await register_worker(rig, W1)
+        second_gpu_id = "GPU-worker-two-only"
+        capability = make_rtx_capability()
+        cpu, gpu = capability.devices
+        host_pool, gpu_pool = capability.memory_pools
+        second_pool_id = f"gpu-{second_gpu_id}-vram"
+        capability = finalize(
+            dataclasses.replace(
+                capability,
+                capability_revision="",
+                devices=(
+                    cpu,
+                    dataclasses.replace(
+                        gpu,
+                        identity=dataclasses.replace(
+                            gpu.identity, device_id=second_gpu_id
+                        ),
+                        memory_pool_id=second_pool_id,
+                    ),
+                ),
+                memory_pools=(
+                    host_pool,
+                    dataclasses.replace(
+                        gpu_pool, memory_pool_id=second_pool_id
+                    ),
+                ),
+            )
+        )
+        await register_worker(
+            rig,
+            W2,
+            profiling_endpoint=ENDPOINT_2,
+            capability=capability,
+            initial_state=make_worker_state(
+                W2,
+                device_ids=(second_gpu_id,),
+                pool_ids=(second_pool_id,),
+            ),
+        )
+        script_healthy_inspection(rig)
+        assert SESSION_FACTS.environment is not None
+        transport_for(rig, ENDPOINT_2).prepare_response = (
+            PrepareProfilingSessionResponse(
+                accepted=True,
+                session_facts=dataclasses.replace(
+                    SESSION_FACTS,
+                    environment=dataclasses.replace(
+                        SESSION_FACTS.environment,
+                        worker_id=W2,
+                        device_id=second_gpu_id,
+                    ),
+                ),
+            )
+        )
+        intent = model_intent(
+            kind=ProfilingSessionKind.OPERATOR,
+            worker_device_targets=(
+                WorkerDeviceTarget(W1, RTX_GPU_DEVICE_ID),
+                WorkerDeviceTarget(W2, second_gpu_id),
+            ),
+        )
+
+        admin = make_admin(rig)
+        cases = await admin._expand(intent)
+
+        mapped = {
+            (case.worker_id, case.spec.device_ids[0])
+            for case in cases
+            if isinstance(case.spec, ModelCaseSpec)
+        }
+        assert mapped == {
+            (W1, RTX_GPU_DEVICE_ID),
+            (W2, second_gpu_id),
+        }
+        assert len(transport_for(rig).prepare_requests) == 1
+        assert len(transport_for(rig, ENDPOINT_2).prepare_requests) == 1
+
+        rejected = await admin.start_experiment(
+            StartExperimentRequest(
+                request=model_intent(
+                    worker_device_targets=(
+                        WorkerDeviceTarget(W1, second_gpu_id),
+                    )
+                )
+            )
+        )
+        assert not rejected.accepted
+        assert "does not belong to worker" in rejected.detail
+
     async def test_model_intent_inspects_plans_and_runs(self, tmp_path: Path) -> None:
         rig = make_rig(tmp_path)
         await register_worker(rig, W1)

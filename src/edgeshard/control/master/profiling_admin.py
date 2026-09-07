@@ -50,6 +50,7 @@ from edgeshard.profiling.domain.experiment import (
     ProfilingCase,
     ProfilingFailure,
     ProfilingRequest,
+    WorkerDeviceTarget,
 )
 from edgeshard.profiling.domain.network import ProbeKind
 from edgeshard.profiling.domain.session import (
@@ -274,10 +275,40 @@ class MasterProfilingAdmin:
     # -- intent expansion (§46-§47) -----------------------------------------------
 
     async def _expand(self, intent: ProfilingRequest) -> tuple[ProfilingCase, ...]:
-        workers = self._resolve_workers(intent.worker_ids)
         if intent.kind is ProfilingSessionKind.NETWORK:
+            workers = self._resolve_workers(intent.worker_ids)
             return self._expand_network(intent, workers)
-        return await self._expand_model_family(intent, workers)
+        return await self._expand_model_family(intent, self._resolve_targets(intent))
+
+    def _resolve_targets(
+        self, intent: ProfilingRequest
+    ) -> tuple[WorkerDeviceTarget, ...]:
+        targets = intent.worker_device_targets
+        if not targets:
+            # Compatibility for the old single-Worker request shape. Multiple
+            # Workers are deliberately rejected by the domain because their
+            # device-id namespaces are local.
+            targets = tuple(
+                WorkerDeviceTarget(intent.worker_ids[0], device_id)
+                for device_id in intent.device_ids
+            )
+        available_workers = set(self._controller.profiling_worker_ids())
+        for target in targets:
+            if target.worker_id not in available_workers:
+                raise _AdminRejection(
+                    f"worker {target.worker_id!r} is not registered with a "
+                    "profiling endpoint (§52.2)"
+                )
+            local_devices = set(
+                self._controller.profiling_device_ids(target.worker_id)
+            )
+            if target.device_id not in local_devices:
+                raise _AdminRejection(
+                    f"device {target.device_id!r} does not belong to worker "
+                    f"{target.worker_id!r}; available local devices: "
+                    f"{', '.join(sorted(local_devices)) or '<none>'}"
+                )
+        return targets
 
     def _resolve_workers(self, requested: tuple[str, ...]) -> tuple[str, ...]:
         """The intent's executor set, or an honest rejection (§52.2).
@@ -317,7 +348,14 @@ class MasterProfilingAdmin:
             )
         plan = self._strategy.plan_network_cases(
             facts=(all_facts[worker_id] for worker_id in workers),
-            extra_bandwidth_pairs=intent.extra_bandwidth_pairs,
+            rtt_pairs=(
+                intent.network_pairs
+                if intent.network_probe is ProbeKind.RTT and intent.network_pairs
+                else None
+            ),
+            extra_bandwidth_pairs=(
+                intent.network_pairs or intent.extra_bandwidth_pairs
+            ),
             bandwidth_path_classes=intent.bandwidth_path_classes or None,
         )
         # §47 network steps 1-2 are facts in their own right: persist the
@@ -326,7 +364,8 @@ class MasterProfilingAdmin:
             plan.endpoint_profiles, plan.classified_pairs
         )
         cases = plan.cases
-        if intent.extra_bandwidth_pairs:
+        explicit_pairs = intent.network_pairs or intent.extra_bandwidth_pairs
+        if explicit_pairs:
             explicit = {
                 (
                     pair.source_worker_id,
@@ -334,13 +373,13 @@ class MasterProfilingAdmin:
                     pair.source_interface_id,
                     pair.destination_interface_id,
                 )
-                for pair in intent.extra_bandwidth_pairs
+                for pair in explicit_pairs
             }
             cases = tuple(
                 case
                 for case in cases
                 if not isinstance(case.spec, NetworkCaseSpec)
-                or case.spec.probe_kind is not ProbeKind.BANDWIDTH
+                or case.spec.probe_kind is not intent.network_probe
                 or (
                     case.spec.source_worker_id,
                     case.spec.destination_worker_id,
@@ -359,11 +398,11 @@ class MasterProfilingAdmin:
         return cases
 
     async def _expand_model_family(
-        self, intent: ProfilingRequest, workers: tuple[str, ...]
+        self, intent: ProfilingRequest, targets: tuple[WorkerDeviceTarget, ...]
     ) -> tuple[ProfilingCase, ...]:
         model = intent.model
         dtype = intent.dtype
-        if model is None or dtype is None or not intent.device_ids:
+        if model is None or dtype is None or not targets:
             # Unreachable: ProfilingRequest validation forces all three for
             # MODEL/OPERATOR intents. Fail loudly rather than plan malformed.
             raise _AdminRejection(
@@ -375,46 +414,47 @@ class MasterProfilingAdmin:
         # the strategy plans from the reported facts — the Master never
         # loads a model itself (§40, §46).
         cases: list[ProfilingCase] = []
-        for worker_id in workers:
-            for device_id in intent.device_ids:
-                inspection = ProfilingSessionRequest(
-                    kind=ProfilingSessionKind.MODEL,
-                    device_ids=(device_id,),
-                    model=model,
-                    dtype=dtype,
+        for target in targets:
+            worker_id = target.worker_id
+            device_id = target.device_id
+            inspection = ProfilingSessionRequest(
+                kind=ProfilingSessionKind.MODEL,
+                device_ids=(device_id,),
+                model=model,
+                dtype=dtype,
+            )
+            facts = await self._controller.inspect_model(
+                worker_id=worker_id, request=inspection
+            )
+            if isinstance(facts, ProfilingFailure):
+                raise _AdminRejection(
+                    f"model inspection failed on worker {worker_id!r} "
+                    f"device {device_id!r}: "
+                    f"[{facts.category.value}] {facts.message}"
                 )
-                facts = await self._controller.inspect_model(
-                    worker_id=worker_id, request=inspection
+            self._controller.record_model_facts(facts)
+            measured: Mapping[str, AbstractSet[str]] | None = None
+            if intent.missing_only:
+                operator_environment = (
+                    dataclasses.replace(facts.environment, model_revision=None)
+                    if facts.environment is not None
+                    else None
                 )
-                if isinstance(facts, ProfilingFailure):
-                    raise _AdminRejection(
-                        f"model inspection failed on worker {worker_id!r} "
-                        f"device {device_id!r}: "
-                        f"[{facts.category.value}] {facts.message}"
+                measured_ids = (
+                    self._controller.measured_operator_signature_ids_for_environment(
+                        operator_environment
                     )
-                self._controller.record_model_facts(facts)
-                measured: Mapping[str, AbstractSet[str]] | None = None
-                if intent.missing_only:
-                    operator_environment = (
-                        dataclasses.replace(facts.environment, model_revision=None)
-                        if facts.environment is not None
-                        else None
-                    )
-                    measured_ids = (
-                        self._controller.measured_operator_signature_ids_for_environment(
-                            operator_environment
-                        )
-                        if operator_environment is not None
-                        else frozenset()
-                    )
-                    measured = {device_id: measured_ids}
-                plan = self._strategy.plan_model_cases(
-                    worker_id=worker_id,
-                    facts=facts,
-                    device_ids=(device_id,),
-                    measured_signature_ids=measured,
+                    if operator_environment is not None
+                    else frozenset()
                 )
-                cases.extend(plan.cases)
+                measured = {device_id: measured_ids}
+            plan = self._strategy.plan_model_cases(
+                worker_id=worker_id,
+                facts=facts,
+                device_ids=(device_id,),
+                measured_signature_ids=measured,
+            )
+            cases.extend(plan.cases)
         if intent.kind is ProfilingSessionKind.OPERATOR:
             cases = [
                 case

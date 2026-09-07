@@ -20,6 +20,7 @@ from edgeshard.profiling.domain.experiment import (
     ProfilingExperiment,
     ProfilingFailure,
     ProfilingRequest,
+    WorkerDeviceTarget,
     profiling_case_id,
     profiling_experiment_id,
 )
@@ -433,7 +434,7 @@ def _model_request(**overrides: object) -> ProfilingRequest:
         "kind": ProfilingSessionKind.MODEL,
         "model": MODEL_REF,
         "dtype": "fp32",
-        "device_ids": ("gpu-0",),
+        "worker_device_targets": (WorkerDeviceTarget("w-1", "gpu-0"),),
     }
     kwargs.update(overrides)
     return ProfilingRequest(**kwargs)
@@ -441,7 +442,7 @@ def _model_request(**overrides: object) -> ProfilingRequest:
 
 def test_model_request_defaults() -> None:
     request = _model_request()
-    assert request.worker_ids == ()
+    assert request.worker_device_targets == (WorkerDeviceTarget("w-1", "gpu-0"),)
     assert request.missing_only is True
     assert request.network_probe is None
     assert request.bandwidth_path_classes == ()
@@ -456,8 +457,19 @@ def test_operator_request_needs_the_same_model_context() -> None:
         _model_request(kind=ProfilingSessionKind.OPERATOR, model=None)
     with pytest.raises(ValueError, match="dtype"):
         _model_request(kind=ProfilingSessionKind.OPERATOR, dtype=None)
-    with pytest.raises(ValueError, match="device_id"):
-        _model_request(kind=ProfilingSessionKind.OPERATOR, device_ids=())
+    with pytest.raises(ValueError, match="worker_device_targets"):
+        _model_request(kind=ProfilingSessionKind.OPERATOR, worker_device_targets=())
+
+
+def test_model_request_rejects_worker_device_cartesian_shape() -> None:
+    with pytest.raises(ValueError, match="worker_device_targets"):
+        ProfilingRequest(
+            kind=ProfilingSessionKind.MODEL,
+            model=MODEL_REF,
+            dtype="fp32",
+            worker_ids=("w-1", "w-2"),
+            device_ids=("GPU-local-a", "GPU-local-b"),
+        )
 
 
 @pytest.mark.parametrize(
@@ -465,7 +477,7 @@ def test_operator_request_needs_the_same_model_context() -> None:
     [
         {"model": None},
         {"dtype": None},
-        {"device_ids": ()},
+        {"worker_device_targets": ()},
     ],
 )
 def test_model_request_requires_its_context(overrides: dict) -> None:
@@ -479,11 +491,11 @@ def test_model_request_requires_its_context(overrides: dict) -> None:
         ({"network_probe": ProbeKind.RTT}, "network probe"),
         (
             {"bandwidth_path_classes": (NetworkPathClass.WIRED_LAN,)},
-            "bandwidth knobs",
+            "network knobs",
         ),
         (
             {"extra_bandwidth_pairs": (NetworkPair("w-a", "w-b"),)},
-            "bandwidth knobs",
+            "network knobs",
         ),
     ],
 )
@@ -525,13 +537,14 @@ def test_network_request_forbids_model_knobs(
 
 def test_request_rejects_empty_and_duplicate_ids() -> None:
     with pytest.raises(ValueError, match="empty"):
-        _model_request(worker_ids=("w-a", ""))
-    with pytest.raises(ValueError, match="duplicate worker_id"):
-        _model_request(worker_ids=("w-a", "w-a"))
+        WorkerDeviceTarget("", "gpu-0")
     with pytest.raises(ValueError, match="empty"):
-        _model_request(device_ids=("gpu-0", ""))
-    with pytest.raises(ValueError, match="duplicate device_id"):
-        _model_request(device_ids=("gpu-0", "gpu-0"))
+        WorkerDeviceTarget("w-a", "")
+    target = WorkerDeviceTarget("w-a", "gpu-0")
+    with pytest.raises(ValueError, match="duplicates"):
+        _model_request(worker_device_targets=(target, target))
+    with pytest.raises(ValueError, match="cannot be combined"):
+        _model_request(worker_ids=("w-a",), device_ids=("gpu-0",))
     with pytest.raises(ValueError, match="requested_by"):
         _model_request(requested_by="")
 
@@ -546,7 +559,7 @@ def test_profiling_request_codec_round_trip() -> None:
         requested_by="operator",
     )
     assert decode_json(ProfilingRequest, encode_json(request)) == request
-    model = _model_request(worker_ids=("w-1",), requested_by="ops")
+    model = _model_request(requested_by="ops")
     assert decode_json(ProfilingRequest, encode_json(model)) == model
 
 
