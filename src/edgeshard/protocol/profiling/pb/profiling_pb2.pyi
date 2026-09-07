@@ -39,16 +39,18 @@ class PrepareProfilingSessionRequest(_message.Message):
     def __init__(self, worker_id: _Optional[str] = ..., instance_id: _Optional[str] = ..., registration_session_id: _Optional[str] = ..., profiling_session_id: _Optional[str] = ..., session_request_payload: _Optional[str] = ..., network_facts_payload: _Optional[str] = ...) -> None: ...
 
 class PrepareProfilingSessionResponse(_message.Message):
-    __slots__ = ("accepted", "detail", "reason", "session_facts_payload")
+    __slots__ = ("accepted", "detail", "reason", "session_facts_payload", "failure_payload")
     ACCEPTED_FIELD_NUMBER: _ClassVar[int]
     DETAIL_FIELD_NUMBER: _ClassVar[int]
     REASON_FIELD_NUMBER: _ClassVar[int]
     SESSION_FACTS_PAYLOAD_FIELD_NUMBER: _ClassVar[int]
+    FAILURE_PAYLOAD_FIELD_NUMBER: _ClassVar[int]
     accepted: bool
     detail: str
     reason: ProfilingRejectionReason
     session_facts_payload: str
-    def __init__(self, accepted: _Optional[bool] = ..., detail: _Optional[str] = ..., reason: _Optional[_Union[ProfilingRejectionReason, str]] = ..., session_facts_payload: _Optional[str] = ...) -> None: ...
+    failure_payload: str
+    def __init__(self, accepted: _Optional[bool] = ..., detail: _Optional[str] = ..., reason: _Optional[_Union[ProfilingRejectionReason, str]] = ..., session_facts_payload: _Optional[str] = ..., failure_payload: _Optional[str] = ...) -> None: ...
 
 class RunProfilingCaseRequest(_message.Message):
     __slots__ = ("worker_id", "instance_id", "registration_session_id", "profiling_session_id", "case_id", "case_payload")

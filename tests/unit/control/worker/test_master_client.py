@@ -639,3 +639,102 @@ def test_empty_profiling_endpoint_fails_loudly() -> None:
     )
     with pytest.raises(WorkerAgentError, match="profiling_endpoint"):
         WorkerAgent(config, profiling_endpoint="")
+
+
+# ---------------------------------------------------------------------------
+# §41 registration properties (Phase 2): the profiling plane's token source
+# ---------------------------------------------------------------------------
+
+
+def make_bare_agent(client, inspector, sleeper) -> WorkerAgent:
+    config = WorkerConfig(
+        worker=WorkerSection(
+            identity_path=Path("worker-id"),
+            master=WorkerMasterEndpoint(endpoint="master.test:51000"),
+        )
+    )
+    return WorkerAgent(config, client=client, inspector=inspector, sleeper=sleeper)
+
+
+async def test_registration_properties_track_the_live_session() -> None:
+    """worker_id/registration_session_id mirror the *current* registration.
+
+    The profiling runner refuses every RPC while these are None (§41): no
+    registration means no authority to execute or publish profiling work.
+    """
+    client = FakeClient()
+    inspector = FakeInspector([make_inspection()])
+    agent_box: list[WorkerAgent] = []
+    samples: list[tuple[str | None, str | None]] = []
+
+    async def sampler(delay: float) -> None:
+        agent = agent_box[0]
+        samples.append((agent.worker_id, agent.registration_session_id))
+        if len(samples) >= 2:
+            agent.request_stop()
+
+    agent = make_bare_agent(client, inspector, sampler)
+    agent_box.append(agent)
+    assert agent.worker_id is None  # before run: unregistered
+    assert agent.registration_session_id is None
+
+    await agent.run()
+
+    # Both heartbeat sleeps happened under the live session-1 registration…
+    assert samples == [("w-1", "session-1"), ("w-1", "session-1")]
+    # …and after run the properties are cleared again (§41: a dead
+    # registration must never keep authorizing profiling RPCs).
+    assert agent.worker_id is None
+    assert agent.registration_session_id is None
+
+
+async def test_registration_properties_clear_across_reconnect() -> None:
+    """Between session loss and re-registration the properties are None."""
+    client = FakeClient()
+    client.heartbeat_effects = deque([unavailable("reset")])
+    inspector = FakeInspector([make_inspection()])
+    agent_box: list[WorkerAgent] = []
+    samples: list[tuple[str | None, str | None]] = []
+
+    async def sampler(delay: float) -> None:
+        agent = agent_box[0]
+        samples.append((agent.worker_id, agent.registration_session_id))
+        if len(samples) >= 3:
+            agent.request_stop()
+
+    agent = make_bare_agent(client, inspector, sampler)
+    agent_box.append(agent)
+
+    await agent.run()
+
+    assert samples == [
+        ("w-1", "session-1"),  # heartbeat sleep under the first session
+        (None, None),  # backoff sleep after losing it: unregistered
+        ("w-1", "session-2"),  # heartbeat sleep under the fresh session
+    ]
+    assert len(client.registrations) == 2
+
+
+async def test_registration_properties_clear_when_superseded() -> None:
+    client = FakeClient()
+    client.heartbeat_effects = deque(
+        [
+            HeartbeatResponse(
+                accepted=False,
+                reason=RejectionReason.STALE_SESSION,
+                detail="superseded",
+            )
+        ]
+    )
+    inspector = FakeInspector([make_inspection()])
+    sleeps: list[float] = []
+
+    async def sleeper(delay: float) -> None:
+        sleeps.append(delay)
+
+    agent = make_bare_agent(client, inspector, sleeper)
+    await agent.run()
+    # The agent stopped after the rejection: no second heartbeat sleep.
+    assert len(sleeps) == 1
+    assert agent.worker_id is None
+    assert agent.registration_session_id is None

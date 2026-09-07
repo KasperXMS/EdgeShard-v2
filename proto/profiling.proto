@@ -83,7 +83,11 @@ message PrepareProfilingSessionResponse {
   bool accepted = 1;
   // Mandatory explanation whenever accepted=false (§46 observability).
   string detail = 2;
-  // Mandatory whenever accepted=false; UNSPECIFIED when accepted.
+  // Refusal classification whenever accepted=false and the refusal is a
+  // transport-level verdict (stale session, busy device, …). UNSPECIFIED
+  // when accepted, and also when the refusal carries a typed domain
+  // failure in failure_payload instead (§42: e.g. UNSUPPORTED_MODEL —
+  // a preparation failure is a profiling outcome, not a wire verdict).
   ProfilingRejectionReason reason = 3;
 
   // codec JSON: ModelSessionFacts — static characterization/layer/module/
@@ -91,6 +95,12 @@ message PrepareProfilingSessionResponse {
   // OPERATOR/NETWORK sessions. Preparation performs static work only; no
   // benchmark ever runs inside prepare (§40).
   string session_facts_payload = 4;
+
+  // codec JSON: ProfilingFailure — the typed preparation failure when
+  // accepted=false because preparation itself failed (unsupported model,
+  // export failure, …). Empty for plain refusals; never present when
+  // accepted (§42: typed categories survive the wire, no string parsing).
+  string failure_payload = 5;
 }
 
 message RunProfilingCaseRequest {

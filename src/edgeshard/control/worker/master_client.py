@@ -203,6 +203,11 @@ class WorkerAgent:
         self._profiling_endpoint = profiling_endpoint
         self._instance_id = new_instance_id()
         self._stopping = False
+        # The live registration, mirrored for the profiling plane's §41
+        # token source: set after each successful register, cleared the
+        # moment it is no longer valid (loss, invalidation, supersede, stop)
+        # so profiling RPCs are refused under a dead registration.
+        self._current_session: _Session | None = None
 
     @property
     def instance_id(self) -> str:
@@ -217,6 +222,21 @@ class WorkerAgent:
     def profiling_endpoint(self) -> str | None:
         """Advertised profiling endpoint, or ``None`` when not hosted (§41)."""
         return self._profiling_endpoint
+
+    @property
+    def worker_id(self) -> str | None:
+        """Current registration's worker id; ``None`` when unregistered (§41)."""
+        return self._current_session.worker_id if self._current_session else None
+
+    @property
+    def registration_session_id(self) -> str | None:
+        """Current Master-granted registration session id, or ``None``.
+
+        The profiling plane validates every RPC against this (§41): a
+        superseded registration session must refuse profiling work even
+        before the Agent loop notices the loss.
+        """
+        return self._current_session.session_id if self._current_session else None
 
     def request_stop(self) -> None:
         """Ask ``run`` to exit at the next checkpoint (between RPCs)."""
@@ -236,6 +256,7 @@ class WorkerAgent:
                 try:
                     session = await self._register(client)
                 except _MasterUnavailable as exc:
+                    self._current_session = None
                     logger.warning(
                         "master unreachable at %s (%s); retrying in %.1fs",
                         self._endpoint,
@@ -246,9 +267,11 @@ class WorkerAgent:
                     delay = min(delay * 2, reconnect.max_delay_s)
                     continue
                 delay = reconnect.initial_delay_s  # backoff resets on success
+                self._current_session = session
                 try:
                     await self._heartbeat_loop(client, session)
                 except _MasterUnavailable as exc:
+                    self._current_session = None
                     logger.warning(
                         "lost master connection (%s); re-registering in %.1fs",
                         exc,
@@ -258,18 +281,21 @@ class WorkerAgent:
                     delay = min(delay * 2, reconnect.max_delay_s)
                 except _SessionInvalid as exc:
                     # §27: never restore a stale session; re-register at once.
+                    self._current_session = None
                     logger.warning(
                         "session invalidated (%s); re-registering immediately", exc
                     )
                 except _Superseded as exc:
                     # A newer registration owns this worker_id; stopping is
                     # the only outcome that does not steal its session back.
+                    self._current_session = None
                     logger.error(
                         "superseded by a newer registration (%s); this agent stops",
                         exc,
                     )
                     return
         finally:
+            self._current_session = None
             await self._inspector.close()
             if owns_client:
                 await client.close()

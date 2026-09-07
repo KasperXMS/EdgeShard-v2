@@ -34,7 +34,12 @@ from enum import StrEnum
 
 from edgeshard.model.errors import EdgeShardError
 from edgeshard.profiling.codec import PayloadCodecError, decode_json, encode_json
-from edgeshard.profiling.domain.experiment import CaseOutcome, CaseState, ProfilingCase
+from edgeshard.profiling.domain.experiment import (
+    CaseOutcome,
+    CaseState,
+    ProfilingCase,
+    ProfilingFailure,
+)
 from edgeshard.profiling.domain.session import (
     ModelSessionFacts,
     ProfilingSessionKind,
@@ -223,23 +228,36 @@ class PrepareProfilingSessionResponse:
 
     Preparation performs static work only — no benchmark ever runs inside
     prepare (§40); OPERATOR/NETWORK sessions answer with ``None`` facts.
+
+    A rejection is *either* a transport-level verdict (``reason``: stale
+    session, busy device, …) *or* a typed domain preparation failure
+    (``failure``: unsupported model, export failure, …) — never both, never
+    neither. The split matters: ``reason`` keys the Master's transport
+    recovery (re-select / defer), while ``failure`` is a profiling outcome
+    the Master records with its §42 category intact (no string parsing).
     """
 
     accepted: bool
     detail: str = ""
     reason: ProfilingRejection | None = None
     session_facts: ModelSessionFacts | None = None
+    failure: ProfilingFailure | None = None
 
     def __post_init__(self) -> None:
         if not self.accepted:
             if not self.detail:
                 raise ValueError("a rejected prepare must carry a detail")
-            if self.reason is None:
-                raise ValueError("a rejected prepare must carry a reason")
+            if (self.reason is None) == (self.failure is None):
+                raise ValueError(
+                    "a rejected prepare must carry exactly one of reason or failure"
+                )
             if self.session_facts is not None:
                 raise ValueError("a rejected prepare must not carry session facts")
-        elif self.reason is not None:
-            raise ValueError("an accepted prepare must not carry a rejection reason")
+        else:
+            if self.reason is not None:
+                raise ValueError("an accepted prepare must not carry a rejection reason")
+            if self.failure is not None:
+                raise ValueError("an accepted prepare must not carry a failure")
 
 
 def prepare_request_to_wire(
@@ -290,21 +308,38 @@ def prepare_response_to_wire(
             if response.session_facts is not None
             else ""
         ),
+        failure_payload=(
+            encode_json(response.failure) if response.failure is not None else ""
+        ),
     )
 
 
 def prepare_response_from_wire(
     wire: pb.PrepareProfilingSessionResponse,
 ) -> PrepareProfilingSessionResponse:
+    failure = _decode_optional_payload(
+        ProfilingFailure, wire.failure_payload, "prepare failure"
+    )
+    # A rejected prepare carries *either* a transport reason *or* a typed
+    # failure; when the failure channel is used the reason legitimately
+    # stays UNSPECIFIED. Every other rejection is decoded strictly, and a
+    # wire message carrying both channels is caught by the DTO's
+    # exclusivity rule (§47: fail loudly, never degrade silently).
+    reason: ProfilingRejection | None = None
+    failure_only = (
+        failure is not None
+        and wire.reason == pb.PROFILING_REJECTION_REASON_UNSPECIFIED
+    )
+    if not wire.accepted and not failure_only:
+        reason = _rejection_from_wire(wire.reason, accepted=False, label="prepare")
     return PrepareProfilingSessionResponse(
         accepted=wire.accepted,
         detail=wire.detail,
-        reason=_rejection_from_wire(
-            wire.reason, accepted=wire.accepted, label="prepare"
-        ),
+        reason=reason,
         session_facts=_decode_optional_payload(
             ModelSessionFacts, wire.session_facts_payload, "session facts"
         ),
+        failure=failure,
     )
 
 

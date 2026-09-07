@@ -178,3 +178,31 @@ def test_master_serve_unsafe_thresholds_exit_nonzero(tmp_path: Path) -> None:
     )
     result = runner.invoke(app, ["master", "serve", "--config", str(path)])
     assert result.exit_code == 1
+
+
+# ---------------------------------------------------------------------------
+# Profiling-plane serve wiring (Phase 2 spec §41)
+# ---------------------------------------------------------------------------
+
+
+def test_profiling_advertise_host_normalizes_wildcards() -> None:
+    """A wildcard bind is not dialable; the Master must receive loopback."""
+    from edgeshard.cli import _profiling_advertise_host
+
+    assert _profiling_advertise_host("0.0.0.0") == "127.0.0.1"
+    assert _profiling_advertise_host("::") == "127.0.0.1"
+    assert _profiling_advertise_host("") == "127.0.0.1"
+    assert _profiling_advertise_host("10.0.0.5") == "10.0.0.5"
+
+
+def test_worker_serve_profiling_enabled_without_master_exits_nonzero(
+    tmp_path: Path,
+) -> None:
+    """The enabled path binds the profiling server *before* the Agent is
+    constructed; the missing master endpoint still fails loudly (§26/§47),
+    and the command exits instead of serving a half-wired Worker."""
+    config = write_worker_config(
+        tmp_path, extra={"profiling": {"enabled": True, "port": 0}}
+    )
+    result = runner.invoke(app, ["worker", "serve", "--config", str(config)])
+    assert result.exit_code == 1

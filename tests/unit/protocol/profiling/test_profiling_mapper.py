@@ -14,6 +14,7 @@ import dataclasses
 
 import pytest
 from wire_fixtures import (
+    FAILURE,
     FAILURE_OUTCOME,
     INSTANCE_ID,
     MODEL_CASE,
@@ -30,7 +31,11 @@ from wire_fixtures import (
     WORKER_ID,
 )
 
-from edgeshard.profiling.domain.experiment import CaseOutcome, CaseState
+from edgeshard.profiling.domain.experiment import (
+    CaseOutcome,
+    CaseState,
+    ProfilingErrorCategory,
+)
 from edgeshard.profiling.domain.session import ModelSessionFacts
 from edgeshard.protocol.profiling import mapper
 from edgeshard.protocol.profiling.mapper import (
@@ -176,6 +181,64 @@ def test_prepare_response_accepted_forbids_reason() -> None:
         PrepareProfilingSessionResponse(
             accepted=True, reason=ProfilingRejection.UNKNOWN_SESSION
         )
+
+
+def test_prepare_response_typed_failure_roundtrip() -> None:
+    """§42: a preparation failure keeps its category across the wire."""
+    response = PrepareProfilingSessionResponse(
+        accepted=False,
+        detail="no profiling adapter for model_type 'gpt2'",
+        failure=FAILURE,
+    )
+    wire = mapper.prepare_response_to_wire(response)
+    assert wire.failure_payload  # the typed failure rides its own channel
+    assert wire.reason == pb.PROFILING_REJECTION_REASON_UNSPECIFIED
+    restored = mapper.prepare_response_from_wire(wire)
+    assert restored == response
+    assert restored.failure is not None
+    assert restored.failure.category is ProfilingErrorCategory.DEVICE_BUSY
+    assert restored.reason is None
+
+
+def test_prepare_response_rejected_requires_reason_xor_failure() -> None:
+    """A rejection carries exactly one verdict channel (§47)."""
+    with pytest.raises(ValueError, match="exactly one of reason or failure"):
+        PrepareProfilingSessionResponse(accepted=False, detail="boom")
+    with pytest.raises(ValueError, match="exactly one of reason or failure"):
+        PrepareProfilingSessionResponse(
+            accepted=False,
+            detail="boom",
+            reason=ProfilingRejection.DEVICE_BUSY,
+            failure=FAILURE,
+        )
+
+
+def test_prepare_response_accepted_forbids_failure() -> None:
+    with pytest.raises(ValueError, match="failure"):
+        PrepareProfilingSessionResponse(accepted=True, failure=FAILURE)
+
+
+def test_prepare_response_wire_rejected_without_verdict_fails() -> None:
+    """A crafted rejection with neither reason nor failure fails loudly."""
+    wire = pb.PrepareProfilingSessionResponse(accepted=False, detail="boom")
+    with pytest.raises(ProfilingProtocolError, match="unknown rejection reason"):
+        mapper.prepare_response_from_wire(wire)
+
+
+def test_prepare_response_wire_both_verdicts_fails() -> None:
+    """A crafted rejection carrying both channels fails loudly (§47)."""
+    wire = mapper.prepare_response_to_wire(
+        PrepareProfilingSessionResponse(
+            accepted=False,
+            detail="boom",
+            reason=ProfilingRejection.DEVICE_BUSY,
+        )
+    )
+    wire.failure_payload = mapper.prepare_response_to_wire(
+        PrepareProfilingSessionResponse(accepted=False, detail="boom", failure=FAILURE)
+    ).failure_payload
+    with pytest.raises(ValueError, match="exactly one of reason or failure"):
+        mapper.prepare_response_from_wire(wire)
 
 
 # ---------------------------------------------------------------------------

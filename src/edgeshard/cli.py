@@ -14,8 +14,9 @@ The Phase 0 forms stay as compatibility aliases during Phase 1::
 
 ``worker inspect`` works without any Master (spec §43); it is the primary
 local validation tool for Phase 1 hardware discovery. ``worker serve``
-(spec §44) registers with the Master and heartbeats until terminated;
-``master serve`` (spec §45) runs the WorkerRegistryService, liveness
+(spec §44) registers with the Master and heartbeats until terminated, and —
+when ``profiling.enabled`` — hosts the WorkerProfilingService (Phase 2 spec
+§41). ``master serve`` (spec §45) runs the WorkerRegistryService, liveness
 tracking and debug snapshots — no REST, dashboard or scheduler yet.
 """
 
@@ -34,11 +35,21 @@ import yaml
 from edgeshard.control.master.config import MasterConfig, MasterServeConfig
 from edgeshard.control.master.service import MasterService
 from edgeshard.control.master.snapshot import format_snapshot
-from edgeshard.control.worker.agent import inspect_local_worker, to_plain_mapping
+from edgeshard.control.worker.agent import (
+    LocalWorkerInspector,
+    inspect_local_worker,
+    to_plain_mapping,
+)
 from edgeshard.control.worker.config import WorkerConfig
 from edgeshard.control.worker.master_client import WorkerAgent
+from edgeshard.control.worker.profiling_runner import WorkerProfilingRunner
+from edgeshard.control.worker.profiling_sessions import (
+    ProfilingSessionManager,
+    RegistrationTokens,
+)
 from edgeshard.model.errors import EdgeShardError
 from edgeshard.protocol.control.grpc_server import start_control_server
+from edgeshard.protocol.profiling.grpc_server import start_profiling_server
 from edgeshard.runtime.config import ShardRuntimeConfig
 from edgeshard.runtime.shard_server import ShardRuntimeServer
 
@@ -154,8 +165,9 @@ def worker_serve(config: WorkerConfigPath) -> None:
     """Run the Worker Agent until terminated (spec §44).
 
     Identity, local discovery, telemetry, inventories, registration,
-    heartbeats and reconnect/backoff — but no scheduling, profiling or
-    production runtimes yet (spec §44, §57).
+    heartbeats and reconnect/backoff. With ``profiling.enabled`` the Worker
+    also hosts WorkerProfilingService and advertises the bound endpoint at
+    registration (Phase 2 spec §41); disabled keeps exact Phase 1 behavior.
     """
     try:
         worker_config = WorkerConfig.from_yaml(config)
@@ -167,13 +179,84 @@ def worker_serve(config: WorkerConfigPath) -> None:
     try:
         # Construction itself fails loudly when worker.master is missing
         # (spec §26: serve requires an endpoint).
-        agent = WorkerAgent(worker_config)
-        asyncio.run(agent.run())
+        asyncio.run(_worker_serve(worker_config))
     except EdgeShardError as exc:
         typer.secho(f"worker failed: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1) from exc
     except KeyboardInterrupt:
         typer.echo("worker stopped")
+
+
+_WILDCARD_BIND_HOSTS = frozenset({"", "0.0.0.0", "::"})
+
+
+def _profiling_advertise_host(bind_host: str) -> str:
+    """A dialable host for the advertised endpoint (mirrors §19 inventory).
+
+    A wildcard bind accepts on every interface but is not itself dialable;
+    the Master must receive an address it can actually connect to, so
+    wildcards advertise loopback — the single-host default topology.
+    """
+    return "127.0.0.1" if bind_host in _WILDCARD_BIND_HOSTS else bind_host
+
+
+async def _worker_serve(config: WorkerConfig) -> None:
+    """Serve loop; hosts the profiling plane alongside the Agent when enabled.
+
+    Ordering is the §41 contract: the profiling server binds *before*
+    registration so the Agent advertises the resolved ``host:bound_port``
+    (port 0 → OS-chosen), and the shared inspector serves both loops (§37:
+    one long-lived process, fresh state per RPC). Shutdown closes the Agent
+    first — its ``run`` owns the inspector lifecycle — then releases every
+    profiling session and lease (§39: no reservation outlives the runner).
+    """
+    if not config.profiling.enabled:
+        plain_agent = WorkerAgent(config)  # exact Phase 1 behavior
+        await plain_agent.run()
+        return
+
+    inspector = LocalWorkerInspector(config)
+    agent: WorkerAgent | None = None
+
+    def current_tokens() -> RegistrationTokens | None:
+        """The Agent's live registration, or ``None`` between registrations.
+
+        The §41 gate: while the Agent is unregistered (startup, reconnect
+        backoff) every profiling RPC is refused STALE_SESSION rather than
+        executing under a dead registration.
+        """
+        if agent is None:
+            return None
+        worker_id = agent.worker_id
+        registration_session_id = agent.registration_session_id
+        if worker_id is None or registration_session_id is None:
+            return None
+        return RegistrationTokens(
+            worker_id=worker_id,
+            instance_id=agent.instance_id,
+            registration_session_id=registration_session_id,
+        )
+
+    runner = WorkerProfilingRunner(
+        sessions=ProfilingSessionManager(token_source=current_tokens),
+        inspector=inspector,
+        model_store_root=config.model_store.root,
+    )
+    server, port = await start_profiling_server(
+        runner, host=config.profiling.host, port=config.profiling.port
+    )
+    endpoint = f"{_profiling_advertise_host(config.profiling.host)}:{port}"
+    logger.info("profiling service listening, advertising %s", endpoint)
+    try:
+        # Constructed inside the try: a config the Agent rejects (e.g. a
+        # missing master endpoint) must still stop the bound server and
+        # release the runner (§39), never leave them dangling on a closed
+        # loop.
+        agent = WorkerAgent(config, inspector=inspector, profiling_endpoint=endpoint)
+        await agent.run()
+    finally:
+        await runner.shutdown()
+        await server.stop(grace=None)
 
 
 @master_app.command("serve")
