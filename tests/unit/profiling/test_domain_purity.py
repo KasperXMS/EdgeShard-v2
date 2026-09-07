@@ -73,12 +73,22 @@ def test_profiling_domain_module_files_exist() -> None:
 
 
 def test_frozen_phase1_packages_do_not_import_profiling() -> None:
-    """Phase 0/1 packages are frozen: profiling is additive, never inverted."""
+    """Phase 0/1 packages are frozen: profiling is additive, never inverted.
+
+    ``protocol/profiling`` is the one exception inside ``protocol``: it is
+    the Phase 2 profiling-plane subpackage (Phase 2 spec §41), whose whole
+    purpose is translating profiling wire messages to profiling domain
+    objects. The frozen Phase 1 ``protocol/control`` and ``protocol/pb``
+    surfaces stay covered by this scan.
+    """
+    profiling_protocol_root = SRC / "protocol" / "profiling"
     offenders = [
         path.relative_to(SRC).as_posix()
         for package in ("cluster", "inference", "model", "runtime", "protocol")
         for path in sorted((SRC / package).rglob("*.py"))
-        if "__pycache__" not in path.parts and _imports_profiling(path)
+        if "__pycache__" not in path.parts
+        and not path.is_relative_to(profiling_protocol_root)
+        and _imports_profiling(path)
     ]
     assert offenders == []
 
