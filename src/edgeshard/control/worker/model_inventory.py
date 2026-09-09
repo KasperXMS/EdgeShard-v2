@@ -19,9 +19,11 @@ Classification is deliberately conservative:
 * ``invalid`` - ``config.json`` missing/unparseable, or a directory name the
   ModelStore cannot address.
 
-``model_id`` is recovered opportunistically from ``config.json``'s
+``model_id`` and optional ``revision`` come from ``.edgeshard-model.json``
+when present. Older stores remain compatible: only when that sidecar is
+absent is ``model_id`` recovered opportunistically from ``config.json``'s
 ``_name_or_path`` when it looks like a model identifier rather than a host
-path; ``revision`` stays ``None`` until snapshot metadata parsing lands.
+path. A malformed sidecar invalidates the entry instead of falling back.
 """
 
 from __future__ import annotations
@@ -31,7 +33,12 @@ import logging
 from pathlib import Path
 
 from edgeshard.cluster.inventory import ModelAvailability, ModelInventoryEntry
-from edgeshard.runtime.model_store import ModelStore, ModelStoreError, validate_local_name
+from edgeshard.runtime.model_store import (
+    ModelMetadataError,
+    ModelStore,
+    ModelStoreError,
+    validate_local_name,
+)
 
 logger = logging.getLogger("worker.inventory.models")
 
@@ -57,11 +64,11 @@ def scan_model_inventory(store: ModelStore) -> tuple[ModelInventoryEntry, ...]:
     for path in sorted(root.iterdir(), key=lambda item: item.name):
         if not path.is_dir():
             continue
-        entries.append(_scan_entry(path))
+        entries.append(_scan_entry(store, path))
     return tuple(entries)
 
 
-def _scan_entry(path: Path) -> ModelInventoryEntry:
+def _scan_entry(store: ModelStore, path: Path) -> ModelInventoryEntry:
     local_name = path.name
     try:
         validate_local_name(local_name)
@@ -75,7 +82,20 @@ def _scan_entry(path: Path) -> ModelInventoryEntry:
             status=ModelAvailability.INVALID,
         )
 
-    model_id: str | None = None
+    try:
+        metadata = store.read_metadata(local_name)
+    except ModelMetadataError as exc:
+        logger.warning("model %s: invalid EdgeShard metadata: %s", local_name, exc)
+        return ModelInventoryEntry(
+            local_name=local_name,
+            model_id=None,
+            revision=None,
+            size_bytes=_directory_size(path),
+            status=ModelAvailability.INVALID,
+        )
+
+    model_id = metadata.model_id if metadata is not None else None
+    revision = metadata.revision if metadata is not None else None
     has_config = False
     config_path = path / "config.json"
     if config_path.is_file():
@@ -83,7 +103,12 @@ def _scan_entry(path: Path) -> ModelInventoryEntry:
         if isinstance(payload, dict):
             has_config = True
             candidate = payload.get("_name_or_path")
-            if isinstance(candidate, str) and candidate and not _looks_like_host_path(candidate):
+            if (
+                metadata is None
+                and isinstance(candidate, str)
+                and candidate
+                and not _looks_like_host_path(candidate)
+            ):
                 # Never let host paths cross to the Master (spec §20).
                 model_id = candidate
 
@@ -92,7 +117,7 @@ def _scan_entry(path: Path) -> ModelInventoryEntry:
     return ModelInventoryEntry(
         local_name=local_name,
         model_id=model_id,
-        revision=None,
+        revision=revision,
         size_bytes=_directory_size(path),
         status=status,
     )

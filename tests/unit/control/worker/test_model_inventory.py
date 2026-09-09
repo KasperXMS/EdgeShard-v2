@@ -7,7 +7,7 @@ from pathlib import Path
 
 from edgeshard.cluster.inventory import ModelAvailability
 from edgeshard.control.worker.model_inventory import scan_model_inventory
-from edgeshard.runtime.model_store import ModelStore
+from edgeshard.runtime.model_store import MODEL_METADATA_FILENAME, ModelStore
 
 
 def make_snapshot(
@@ -32,6 +32,11 @@ def make_snapshot(
 def write_index(directory: Path, payload: object, *, raw: str | None = None) -> None:
     text = raw if raw is not None else json.dumps(payload)
     (directory / "model.safetensors.index.json").write_text(text, encoding="utf-8")
+
+
+def write_metadata(directory: Path, payload: object, *, raw: str | None = None) -> None:
+    text = raw if raw is not None else json.dumps(payload)
+    (directory / MODEL_METADATA_FILENAME).write_text(text, encoding="utf-8")
 
 
 SHARD_1 = "model-00001-of-00002.safetensors"
@@ -136,10 +141,63 @@ def test_ready_model_reports_identity_and_size(tmp_path: Path) -> None:
     (entry,) = scan_model_inventory(ModelStore(model_root=root))
     assert entry.local_name == "tiny-llama"
     assert entry.model_id == "tiny/llama"
-    assert entry.revision is None  # snapshot metadata parsing is later-phase
+    assert entry.revision is None
     assert entry.status is ModelAvailability.READY
     expected_size = sum(p.stat().st_size for p in directory.rglob("*") if p.is_file())
     assert entry.size_bytes == expected_size
+
+
+def test_sidecar_identity_takes_precedence_over_config_fallback(tmp_path: Path) -> None:
+    root = tmp_path / "models"
+    directory = make_snapshot(
+        root,
+        "tiny-llama",
+        config_payload={"_name_or_path": "legacy/model"},
+        weight_files=("model.safetensors",),
+    )
+    write_metadata(
+        directory,
+        {"model_id": "canonical/model", "revision": "revision-1"},
+    )
+
+    (entry,) = scan_model_inventory(ModelStore(model_root=root))
+
+    assert entry.model_id == "canonical/model"
+    assert entry.revision == "revision-1"
+    assert entry.status is ModelAvailability.READY
+
+
+def test_invalid_sidecar_marks_entry_invalid_without_config_fallback(tmp_path: Path) -> None:
+    root = tmp_path / "models"
+    directory = make_snapshot(
+        root,
+        "tiny-llama",
+        config_payload={"_name_or_path": "legacy/model"},
+        weight_files=("model.safetensors",),
+    )
+    write_metadata(directory, None, raw='{ "revision": "revision-1" }')
+
+    (entry,) = scan_model_inventory(ModelStore(model_root=root))
+
+    assert entry.model_id is None
+    assert entry.revision is None
+    assert entry.status is ModelAvailability.INVALID
+
+
+def test_absent_sidecar_preserves_name_or_path_fallback(tmp_path: Path) -> None:
+    root = tmp_path / "models"
+    make_snapshot(
+        root,
+        "tiny-llama",
+        config_payload={"_name_or_path": "legacy/model"},
+        weight_files=("model.safetensors",),
+    )
+
+    (entry,) = scan_model_inventory(ModelStore(model_root=root))
+
+    assert entry.model_id == "legacy/model"
+    assert entry.revision is None
+    assert entry.status is ModelAvailability.READY
 
 
 def test_config_without_weights_is_incomplete(tmp_path: Path) -> None:

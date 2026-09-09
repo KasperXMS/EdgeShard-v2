@@ -9,13 +9,17 @@ runtimes and the inference layer unaware of host-layout differences.
 from __future__ import annotations
 
 import importlib
+import json
 from pathlib import Path
 
 import pytest
 
 from edgeshard.runtime.model_store import (
     DEFAULT_MODEL_ROOT,
+    MODEL_METADATA_FILENAME,
     MODEL_MOUNT,
+    ModelMetadata,
+    ModelMetadataError,
     ModelStore,
     ModelStoreError,
     container_model_path,
@@ -89,3 +93,61 @@ def test_model_store_imports_standalone() -> None:
     # import from edgeshard.runtime.drivers, or this import closes a cycle.
     module = importlib.import_module("edgeshard.runtime.model_store")
     assert module.MODEL_MOUNT == "/models"
+
+
+def test_read_metadata_parses_model_id_and_optional_revision(tmp_path: Path) -> None:
+    snapshot = tmp_path / "tiny-llama"
+    snapshot.mkdir()
+    (snapshot / MODEL_METADATA_FILENAME).write_text(
+        json.dumps(
+            {
+                "model_id": "meta-llama/Llama-3.2-1B",
+                "revision": "0123456789abcdef",
+                "future_field": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert ModelStore(tmp_path).read_metadata("tiny-llama") == ModelMetadata(
+        model_id="meta-llama/Llama-3.2-1B",
+        revision="0123456789abcdef",
+    )
+
+
+def test_read_metadata_allows_omitted_revision(tmp_path: Path) -> None:
+    snapshot = tmp_path / "tiny-llama"
+    snapshot.mkdir()
+    (snapshot / MODEL_METADATA_FILENAME).write_text(
+        json.dumps({"model_id": "tiny/llama"}), encoding="utf-8"
+    )
+
+    assert ModelStore(tmp_path).read_metadata("tiny-llama") == ModelMetadata(
+        model_id="tiny/llama"
+    )
+
+
+def test_read_metadata_returns_none_only_when_sidecar_is_absent(tmp_path: Path) -> None:
+    (tmp_path / "tiny-llama").mkdir()
+    assert ModelStore(tmp_path).read_metadata("tiny-llama") is None
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "{ not json",
+        "[]",
+        "{}",
+        '{"model_id": ""}',
+        '{"model_id": 7}',
+        '{"model_id": "tiny/llama", "revision": ""}',
+        '{"model_id": "tiny/llama", "revision": 7}',
+    ],
+)
+def test_read_metadata_rejects_invalid_sidecar(tmp_path: Path, payload: str) -> None:
+    snapshot = tmp_path / "tiny-llama"
+    snapshot.mkdir()
+    (snapshot / MODEL_METADATA_FILENAME).write_text(payload, encoding="utf-8")
+
+    with pytest.raises(ModelMetadataError):
+        ModelStore(tmp_path).read_metadata("tiny-llama")

@@ -21,6 +21,7 @@ import of :mod:`edgeshard.runtime.drivers` here would close a cycle.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -41,9 +42,24 @@ Workers on devices with other layouts override this per store; the default
 matches the conventional single-disk cache location.
 """
 
+MODEL_METADATA_FILENAME = ".edgeshard-model.json"
+"""Optional EdgeShard-owned identity metadata stored beside a snapshot."""
+
 
 class ModelStoreError(EdgeShardError):
     """A model store is misconfigured or a local name cannot be resolved."""
+
+
+class ModelMetadataError(ModelStoreError):
+    """A snapshot's EdgeShard sidecar metadata is present but invalid."""
+
+
+@dataclass(frozen=True)
+class ModelMetadata:
+    """Logical identity declared by a snapshot's EdgeShard sidecar."""
+
+    model_id: str
+    revision: str | None = None
 
 
 def validate_local_name(local_name: str) -> str:
@@ -104,3 +120,47 @@ class ModelStore:
     def container_path(self, local_name: str) -> Path:
         """The path of ``local_name`` inside a container (uniform form)."""
         return container_model_path(local_name)
+
+    def read_metadata(self, local_name: str) -> ModelMetadata | None:
+        """Read optional EdgeShard identity metadata for one snapshot.
+
+        Absence is intentionally distinct from invalid metadata: callers may
+        retain legacy discovery behavior only when the sidecar does not exist.
+        A present but unreadable or malformed sidecar raises
+        :class:`ModelMetadataError` so it can never be silently ignored.
+        """
+        metadata_path = self.host_path(local_name) / MODEL_METADATA_FILENAME
+        try:
+            raw = metadata_path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise ModelMetadataError(
+                f"cannot read model metadata for {local_name!r}: {exc}"
+            ) from exc
+
+        try:
+            payload = json.loads(raw)
+        except (TypeError, ValueError) as exc:
+            raise ModelMetadataError(
+                f"model metadata for {local_name!r} is not valid JSON"
+            ) from exc
+        if not isinstance(payload, dict):
+            raise ModelMetadataError(
+                f"model metadata for {local_name!r} must be a JSON object"
+            )
+
+        model_id = payload.get("model_id")
+        if not isinstance(model_id, str) or not model_id.strip():
+            raise ModelMetadataError(
+                f"model metadata for {local_name!r} requires a non-empty string model_id"
+            )
+
+        revision = payload.get("revision")
+        if revision is not None and (
+            not isinstance(revision, str) or not revision.strip()
+        ):
+            raise ModelMetadataError(
+                f"model metadata revision for {local_name!r} must be a non-empty string"
+            )
+        return ModelMetadata(model_id=model_id, revision=revision)
