@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import shutil
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -38,6 +39,10 @@ from edgeshard.cluster.state import (
 )
 from edgeshard.control.worker import profiling_model_loader as model_loader_module
 from edgeshard.control.worker.agent import LocalInspection
+from edgeshard.control.worker.compute_executor import (
+    ComputeExecutionEnvironment,
+    PreparedComputeSession,
+)
 from edgeshard.control.worker.profiling_leases import DeviceLeaseManager
 from edgeshard.control.worker.profiling_model_loader import (
     MODEL_EXTRACTION_SEQUENCE_LENGTHS,
@@ -345,6 +350,30 @@ class StubLoader:
         )
 
 
+class StubComputeExecutor:
+    def __init__(
+        self, environment: ComputeExecutionEnvironment, *, delay_s: float = 0.0
+    ) -> None:
+        self.environment = environment
+        self.delay_s = delay_s
+        self.closed = False
+
+    def prepare_session(self, session_id, worker_id, request, source, capability):
+        return PreparedComputeSession(
+            session_id=session_id,
+            target_device_id=request.device_ids[0],
+            environment=self.environment,
+        )
+
+    def profile_case(self, session, case):
+        time.sleep(self.delay_s)
+        return make_record(case)
+
+    def close_session(self, session) -> None:
+        session.closed = True
+        self.closed = True
+
+
 @dataclasses.dataclass
 class Rig:
     runner: WorkerProfilingRunner
@@ -390,6 +419,7 @@ def make_rig(
     loader: StubLoader | None = None,
     model_store_root: Path | None = None,
     real_loader: bool = False,
+    compute_executor=None,
 ) -> Rig:
     tokens: list = [TOKENS]
     sessions = ProfilingSessionManager(token_source=lambda: tokens[0])
@@ -403,6 +433,8 @@ def make_rig(
         # The real-chain test leaves the factory unset so the runner uses
         # its default TorchModelSessionLoader against the tmp ModelStore.
         kwargs["model_loader_factory"] = lambda device: rig_loader
+    if compute_executor is not None:
+        kwargs["compute_executor"] = compute_executor
     runner = WorkerProfilingRunner(
         sessions=sessions,
         inspector=inspector,
@@ -758,6 +790,127 @@ async def test_second_gpu_case_execution_and_fingerprint_agree() -> None:
     assert record.environment_fingerprint == environment_fingerprint_id(
         record.environment
     )
+
+
+async def test_compute_fingerprint_uses_container_software_environment() -> None:
+    environment = ComputeExecutionEnvironment(
+        torch_version="2.13.0+cu126-container",
+        cuda_version="12.6-container",
+        backend_revision="sha256:runtime-image",
+        target_device_id=RTX_GPU_DEVICE_ID,
+        execution_device="cuda:0",
+    )
+    executor = StubComputeExecutor(environment)
+    state = make_state(
+        devices=(
+            DeviceState(
+                device_id=RTX_GPU_DEVICE_ID,
+                utilization=0.0,
+                temperature_c=40.0,
+                power_w=None,
+                availability=DeviceAvailability.AVAILABLE,
+                running_runtime_ids=(),
+            ),
+        )
+    )
+    rig = make_rig(state, compute_executor=executor)
+    session = ProfilingSessionRequest(
+        kind=ProfilingSessionKind.OPERATOR,
+        device_ids=(RTX_GPU_DEVICE_ID,),
+    )
+    assert (await prepare(rig, session)).accepted
+    case = operator_case(device_ids=(RTX_GPU_DEVICE_ID,))
+
+    response = await rig.runner.run_profiling_case(run_request(case))
+
+    assert response.outcome is not None and response.outcome.record is not None
+    fingerprint = response.outcome.record.environment
+    assert fingerprint is not None
+    assert fingerprint.torch_version == "2.13.0+cu126-container"
+    assert fingerprint.cuda_version == "12.6-container"
+    assert fingerprint.backend_revision == "sha256:runtime-image"
+    assert fingerprint.worker_id == WORKER_ID
+    assert fingerprint.device_id == RTX_GPU_DEVICE_ID
+    assert fingerprint.driver_version == "550.90"
+    assert fingerprint.device_performance_class is not None
+    assert dict(fingerprint.device_performance_class.software_versions) == {
+        "cuda": "12.6-container",
+        "torch": "2.13.0",
+    }
+
+
+async def test_worker_merges_fresh_physical_telemetry_around_compute_executor() -> None:
+    capability = make_rtx_capability()
+    base_state = dataclasses.replace(
+        make_worker_state(WORKER_ID),
+        device_states=(
+            dataclasses.replace(
+                make_worker_state(WORKER_ID).device_states[0], utilization=0.0
+            ),
+        ),
+        runtime_instances=(),
+    )
+
+    class FreshInspector:
+        def __init__(self) -> None:
+            self.fresh_calls = 0
+
+        async def inspect(self) -> LocalInspection:
+            return LocalInspection(
+                identity=make_worker_identity(WORKER_ID),
+                capability=capability,
+                state=base_state,
+            )
+
+        def sample_fresh_state(self) -> WorkerState:
+            self.fresh_calls += 1
+            available = max(1, 20 * 2**30 - self.fresh_calls * 2**20)
+            return dataclasses.replace(
+                base_state,
+                memory_states=tuple(
+                    dataclasses.replace(item, available_bytes=available)
+                    if item.memory_pool_id == capability.devices[1].memory_pool_id
+                    else item
+                    for item in base_state.memory_states
+                ),
+            )
+
+    environment = ComputeExecutionEnvironment(
+        torch_version="2.13.0+cu126",
+        cuda_version="12.6",
+        backend_revision="sha256:runtime-image",
+        target_device_id=RTX_GPU_DEVICE_ID,
+        execution_device="cuda:0",
+    )
+    executor = StubComputeExecutor(environment, delay_s=0.12)
+    inspector = FreshInspector()
+    runner = WorkerProfilingRunner(
+        sessions=ProfilingSessionManager(token_source=lambda: TOKENS),
+        inspector=inspector,
+        model_store_root=Path("unused-model-root"),
+        compute_executor=executor,
+        clock=lambda: NOW,
+    )
+    session = ProfilingSessionRequest(
+        kind=ProfilingSessionKind.OPERATOR,
+        device_ids=(RTX_GPU_DEVICE_ID,),
+    )
+    prepared = await runner.prepare_profiling_session(prepare_request(session))
+    assert prepared.accepted
+
+    response = await runner.run_profiling_case(
+        run_request(operator_case(device_ids=(RTX_GPU_DEVICE_ID,)))
+    )
+
+    assert response.outcome is not None and response.outcome.record is not None
+    metrics = response.outcome.record.metrics
+    assert metrics.physical_memory is not None
+    assert metrics.physical_memory.pool_id == capability.devices[1].memory_pool_id
+    assert metrics.physical_memory.used_peak is not None
+    assert metrics.telemetry is not None
+    assert metrics.telemetry.initial is not None
+    assert metrics.telemetry.final is not None
+    assert inspector.fresh_calls >= 5
 
 
 def test_default_instrumentation_reuses_phase1_shared_jetson_pool() -> None:
@@ -1314,8 +1467,9 @@ async def test_real_model_session_prepare_and_layer_run(
     assert facts.characterization.num_layers == 4  # TINY_LLAMA_CONFIG
     assert len(facts.layer_entries) == 4
     handle = rig.sessions.peek(SESSION_ID).model_handle
-    assert isinstance(handle, LoadedModelSession)
-    assert len(handle.layers) == 1
+    assert isinstance(handle, PreparedComputeSession)
+    assert isinstance(handle.opaque, LoadedModelSession)
+    assert len(handle.opaque.layers) == 1
     assert facts.module_entries  # attention + mlp per layer
     assert facts.operator_signatures  # the representative export produced ops
     assert rig.leases.leased_device_ids == (CPU_DEVICE,)

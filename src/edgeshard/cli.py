@@ -173,6 +173,17 @@ def runtime_serve(config: RuntimeConfigPath) -> None:
         raise typer.Exit(code=1) from exc
 
 
+@app.command("_compute-profile-service", hidden=True)
+def compute_profile_service(
+    host: Annotated[str, typer.Option()] = "0.0.0.0",
+    port: Annotated[int, typer.Option(min=1, max=65_535)] = 51_101,
+) -> None:
+    """Internal compute service launched only inside a shard runtime image."""
+    from edgeshard.control.worker.compute_executor import serve_container_compute
+
+    serve_container_compute(host=host, port=port)
+
+
 @worker_app.command("inspect")
 def worker_inspect(
     config: Annotated[
@@ -272,6 +283,9 @@ async def _worker_serve(config: WorkerConfig) -> None:
     # benchmarks), torch is the optional inference extra, and the rest of
     # the CLI — every Master-side and `profile` command — must import
     # without it.
+    from edgeshard.control.worker.compute_executor import (
+        ContainerComputeProfilingExecutor,
+    )
     from edgeshard.control.worker.profiling_runner import WorkerProfilingRunner
 
     inspector = LocalWorkerInspector(config)
@@ -300,6 +314,10 @@ async def _worker_serve(config: WorkerConfig) -> None:
         sessions=ProfilingSessionManager(token_source=current_tokens),
         inspector=inspector,
         model_store_root=config.model_store.root,
+        compute_executor=ContainerComputeProfilingExecutor(
+            docker_client_factory=inspector.require_docker_client,
+            model_store=ModelStore(model_root=config.model_store.root),
+        ),
     )
     server, port = await start_profiling_server(
         runner, host=config.profiling.host, port=config.profiling.port

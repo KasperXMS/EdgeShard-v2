@@ -191,6 +191,12 @@ class LocalWorkerInspector:
     def started(self) -> bool:
         return self._started
 
+    def require_docker_client(self) -> Any:
+        """The inspector-owned Docker client shared with production profiling."""
+        if self._docker_client is None:
+            raise RuntimeError("Docker client unavailable on this Worker")
+        return self._docker_client
+
     def sample_fresh_state(self) -> WorkerState | None:
         """Lightweight fresh telemetry sample for profiling instrumentation.
 

@@ -39,12 +39,19 @@ import logging
 import socket
 from collections.abc import Callable, Mapping
 from datetime import datetime
+from functools import partial
 from pathlib import Path
 from typing import Protocol
 
 import torch
 
 from edgeshard.control.worker.agent import LocalInspection
+from edgeshard.control.worker.compute_executor import (
+    ComputeExecutionEnvironment,
+    ComputeProfilingExecutor,
+    HostTorchComputeProfilingExecutor,
+    PreparedComputeSession,
+)
 from edgeshard.control.worker.identity import (
     derive_cpu_device_id,
     derive_jetson_gpu_device_id,
@@ -372,6 +379,7 @@ class WorkerProfilingRunner:
         network_profiler: NetworkProfiler | None = None,
         device_resolver: DeviceResolver | None = None,
         instrumentation_factory: InstrumentationFactory | None = None,
+        compute_executor: ComputeProfilingExecutor | None = None,
         clock: Callable[[], datetime] = utc_now,
         seed: int | None = None,
     ) -> None:
@@ -398,6 +406,17 @@ class WorkerProfilingRunner:
             device_resolver if device_resolver is not None else resolve_torch_device
         )
         self._instrumentation_factory = instrumentation_factory
+        self._compute_executor = compute_executor or HostTorchComputeProfilingExecutor(
+            device_resolver=lambda device_id, worker_id: self._device_resolver(
+                device_id, worker_id
+            ),
+            model_loader_factory=lambda device: self._model_loader_factory(device),
+            layer_profiler=self._layer_profiler,
+            module_profiler=self._module_profiler,
+            operator_profiler=self._operator_profiler,
+            instrumentation_factory=self._compute_instrumentation,
+            seed=seed,
+        )
         self._clock = clock
         self._seed = seed
         self._iperf_servers: dict[
@@ -468,10 +487,10 @@ class WorkerProfilingRunner:
             except DeviceBusyError as exc:
                 return _prepare_refused(ProfilingRejection.DEVICE_BUSY, str(exc))
 
-        model_handle: LoadedModelSession | None = None
+        compute_handle: PreparedComputeSession | None = None
         try:
-            if session_request.kind is ProfilingSessionKind.MODEL:
-                model_handle = await self._load_model_session(
+            if session_request.kind is not ProfilingSessionKind.NETWORK:
+                compute_handle = await self._prepare_compute_session(
                     session_id, request, inspection, tokens
                 )
         except Exception as exc:
@@ -502,15 +521,21 @@ class WorkerProfilingRunner:
             worker_state_source=getattr(
                 self._inspector, "sample_fresh_state", None
             ),
-            session_facts=model_handle.facts if model_handle is not None else None,
+            session_facts=compute_handle.facts if compute_handle is not None else None,
             network_facts=network_facts,
-            model_handle=model_handle,
-            model_cleanup=model_handle.close if model_handle is not None else None,
+            model_handle=compute_handle,
+            model_cleanup=(
+                partial(self._compute_executor.close_session, compute_handle)
+            )
+            if compute_handle is not None
+            else None,
         )
-        if model_handle is not None:
-            characterization = model_handle.facts.characterization
+        if session_request.kind is ProfilingSessionKind.MODEL:
+            if compute_handle is None or compute_handle.facts is None:
+                raise RuntimeError("model compute executor returned no session facts")
+            characterization = compute_handle.facts.characterization
             record.session_facts = dataclasses.replace(
-                model_handle.facts,
+                compute_handle.facts,
                 environment=self._fingerprint(
                     record,
                     tokens,
@@ -519,39 +544,45 @@ class WorkerProfilingRunner:
                     dtype=session_request.dtype,
                     quantization=characterization.quantization,
                     model_revision=characterization.model.revision,
+                    execution_environment=compute_handle.environment,
                 ),
             )
         return PrepareProfilingSessionResponse(
             accepted=True, session_facts=record.session_facts
         )
 
-    async def _load_model_session(
+    async def _prepare_compute_session(
         self,
         session_id: str,
         request: PrepareProfilingSessionRequest,
         inspection: LocalInspection,
         tokens: RegistrationTokens,
-    ) -> LoadedModelSession:
-        """Resolve → load → enumerate one MODEL session (§38, load once)."""
+    ) -> PreparedComputeSession:
+        """Resolve identity and prepare the selected compute execution plane."""
         session_request = request.session_request
-        assert session_request.model is not None  # domain guarantees (§38)
-        device = self._device_resolver(
-            session_request.device_ids[0], tokens.worker_id
-        )  # v1 loads the checkpoint onto the session's first leased device
-        source = resolve_model_source(
-            session_request.model.model_id,
-            session_request.model.revision,
-            inspection.state.models,
-            ModelStore(model_root=self._model_store_root),
-        )
-        loader = self._model_loader_factory(device)
+        source = None
+        if session_request.kind is ProfilingSessionKind.MODEL:
+            assert session_request.model is not None
+            source = resolve_model_source(
+                session_request.model.model_id,
+                session_request.model.revision,
+                inspection.state.models,
+                ModelStore(model_root=self._model_store_root),
+            )
         logger.info(
-            "loading model %s for session %s on %s",
-            session_request.model.model_id,
+            "preparing %s compute session %s on physical device %s",
+            session_request.kind.value,
             session_id,
-            device,
+            session_request.device_ids[0],
         )
-        return await asyncio.to_thread(loader.load, session_request, source)
+        return await asyncio.to_thread(
+            self._compute_executor.prepare_session,
+            session_id,
+            tokens.worker_id,
+            session_request,
+            source,
+            inspection.capability,
+        )
 
     # ------------------------------------------------------------------
     # RunProfilingCase (§39, §42, §44)
@@ -671,9 +702,117 @@ class WorkerProfilingRunner:
                 iperf_server_port=iperf_server_port,
             )
         assert isinstance(spec, ModelCaseSpec)  # _kind_mismatch guarantees
+        return await self._execute_compute(record, case, spec, tokens)
+
+    async def _execute_compute(
+        self,
+        record: ProfilingSessionRecord,
+        case: ProfilingCase,
+        spec: ModelCaseSpec,
+        tokens: RegistrationTokens,
+    ) -> CaseOutcome:
+        handle = record.model_handle
+        if not isinstance(handle, PreparedComputeSession):
+            raise ProfilingError(
+                ProfilingErrorCategory.INTERNAL_ERROR,
+                f"compute session {record.session_id!r} carries no executor handle",
+            )
+        if handle.target_device_id != spec.device_ids[0]:
+            raise ProfilingError(
+                ProfilingErrorCategory.INTERNAL_ERROR,
+                f"case {case.case_id!r} targets {spec.device_ids[0]!r} but "
+                f"the compute plane targets {handle.target_device_id!r}",
+            )
+
+        if isinstance(self._compute_executor, HostTorchComputeProfilingExecutor):
+            self._compute_executor.set_profilers(
+                layer=self._layer_profiler,
+                module=self._module_profiler,
+                operator=self._operator_profiler,
+            )
+
+        # The executor owns CUDA-event timing and allocator instrumentation.
+        # Physical pool and telemetry samples stay on the Worker and reuse its
+        # long-lived Phase 1 backends while the container call is in flight.
+        context = default_instrumentation(
+            torch.device("cpu"), device_id=handle.target_device_id, record=record
+        )
+        if context.telemetry is not None:
+            context.telemetry.capture_initial()
+        if context.physical_memory is not None:
+            context.physical_memory.open()
+
+        task = asyncio.create_task(
+            asyncio.to_thread(self._compute_executor.profile_case, handle, case),
+            name=f"compute-profile-{case.case_id[:12]}",
+        )
+        try:
+            while not task.done():
+                done, _pending = await asyncio.wait({task}, timeout=0.05)
+                if not done and context.physical_memory is not None:
+                    context.physical_memory.poll()
+            result = await task
+        except BaseException:
+            if context.physical_memory is not None:
+                try:
+                    context.physical_memory.close()
+                except Exception as exc:
+                    logger.warning(
+                        "physical memory cleanup failed after compute error: %s", exc
+                    )
+            if context.telemetry is not None:
+                try:
+                    context.telemetry.capture_final()
+                except Exception as exc:
+                    logger.warning(
+                        "telemetry cleanup failed after compute error: %s", exc
+                    )
+            raise
+
+        physical = (
+            context.physical_memory.close()
+            if context.physical_memory is not None
+            else None
+        )
+        telemetry = (
+            context.telemetry.capture_final()
+            if context.telemetry is not None
+            else None
+        )
         if spec.granularity is ProfilingGranularity.OPERATOR:
-            return await self._execute_operator(record, case, spec, tokens)
-        return await self._execute_model(record, case, spec, tokens)
+            fingerprint = self._fingerprint(
+                record,
+                tokens,
+                backend=spec.backend,
+                device_id=handle.target_device_id,
+                dtype=spec.dtype,
+                execution_environment=handle.environment,
+            )
+        else:
+            if handle.facts is None:
+                raise ProfilingError(
+                    ProfilingErrorCategory.INTERNAL_ERROR,
+                    f"model compute session {record.session_id!r} has no facts",
+                )
+            fingerprint = self._model_fingerprint(
+                record,
+                tokens,
+                spec,
+                handle.facts.characterization,
+                execution_environment=handle.environment,
+            )
+        fingerprint_id = environment_fingerprint_id(fingerprint)
+        merged = dataclasses.replace(
+            result,
+            environment=fingerprint,
+            environment_fingerprint=fingerprint_id,
+            metrics=dataclasses.replace(
+                result.metrics,
+                physical_memory=physical,
+                telemetry=telemetry,
+            ),
+        )
+        return CaseOutcome.from_record(merged)
 
     async def _execute_network(
         self,
@@ -862,6 +1001,24 @@ class WorkerProfilingRunner:
             return self._instrumentation_factory(device)
         return default_instrumentation(device, device_id=device_id, record=record)
 
+    def _compute_instrumentation(
+        self, device: torch.device
+    ) -> InstrumentationBundle:
+        """Host-test instrumentation matching the container-owned metrics."""
+        if self._instrumentation_factory is not None:
+            return self._instrumentation_factory(device)
+        timer = (
+            CudaEventTimer(device.index)
+            if device.type == "cuda"
+            else WallClockTimer()
+        )
+        allocator = (
+            CudaAllocatorMemoryProbe(device.index)
+            if device.type == "cuda"
+            else None
+        )
+        return InstrumentationBundle(timer=timer, memory=allocator)
+
     # ------------------------------------------------------------------
     # Get / Cancel / Close (§41, §44)
     # ------------------------------------------------------------------
@@ -1023,6 +1180,8 @@ class WorkerProfilingRunner:
         tokens: RegistrationTokens,
         spec: ModelCaseSpec,
         characterization: ModelCharacterization,
+        *,
+        execution_environment: ComputeExecutionEnvironment | None = None,
     ) -> EnvironmentFingerprint:
         return self._fingerprint(
             record,
@@ -1032,6 +1191,7 @@ class WorkerProfilingRunner:
             dtype=spec.dtype,
             quantization=characterization.quantization,
             model_revision=characterization.model.revision,
+            execution_environment=execution_environment,
         )
 
     def _fingerprint(
@@ -1044,6 +1204,7 @@ class WorkerProfilingRunner:
         dtype: str | None = None,
         quantization: str | None = None,
         model_revision: str | None = None,
+        execution_environment: ComputeExecutionEnvironment | None = None,
     ) -> EnvironmentFingerprint:
         """The §9 compatibility identity every record of this session carries.
 
@@ -1052,7 +1213,21 @@ class WorkerProfilingRunner:
         rather than approximated (§52.2).
         """
         performance_class = self._device_performance_class(
-            record, device_id=device_id, backend=backend, dtype=dtype
+            record,
+            device_id=device_id,
+            backend=backend,
+            dtype=dtype,
+            execution_environment=execution_environment,
+        )
+        torch_version = (
+            execution_environment.torch_version
+            if execution_environment is not None
+            else str(torch.__version__)
+        )
+        cuda_version = (
+            execution_environment.cuda_version
+            if execution_environment is not None
+            else torch.version.cuda
         )
         fingerprint = EnvironmentFingerprint(
             backend=backend,
@@ -1064,9 +1239,14 @@ class WorkerProfilingRunner:
             ),
             device_performance_class=performance_class,
             capability_revision=record.capability_revision,
-            torch_version=torch.__version__,
-            cuda_version=torch.version.cuda,
+            torch_version=torch_version,
+            cuda_version=cuda_version,
             driver_version=self._driver_version(record, device_id),
+            backend_revision=(
+                execution_environment.backend_revision
+                if execution_environment is not None
+                else None
+            ),
             model_revision=model_revision,
             dtype=dtype,
             quantization=quantization,
@@ -1098,6 +1278,7 @@ class WorkerProfilingRunner:
         device_id: str | None,
         backend: str,
         dtype: str | None,
+        execution_environment: ComputeExecutionEnvironment | None = None,
     ) -> DevicePerformanceClass | None:
         """Build the candidate reuse class from device-relevant facts only.
 
@@ -1130,9 +1311,19 @@ class WorkerProfilingRunner:
         memory_model = (
             MemoryModel(pool.model.value) if pool is not None else MemoryModel.DISCRETE
         )
-        versions = {"torch": torch.__version__.split("+")[0]}
-        if torch.version.cuda is not None:
-            versions["cuda"] = torch.version.cuda
+        torch_version = (
+            execution_environment.torch_version
+            if execution_environment is not None
+            else str(torch.__version__)
+        )
+        cuda_version = (
+            execution_environment.cuda_version
+            if execution_environment is not None
+            else torch.version.cuda
+        )
+        versions = {"torch": torch_version.split("+")[0]}
+        if cuda_version is not None:
+            versions["cuda"] = cuda_version
         return DevicePerformanceClass(
             vendor=device.vendor,
             accelerator_model=device.model,
