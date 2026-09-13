@@ -689,6 +689,8 @@ class ProfilingController:
             return resolved
         session_id = self._inspection_session_id(resolved, request)
         transport = self._transport_factory(resolved.endpoint)
+        result: ModelSessionFacts | ProfilingFailure
+        close_failure: ProfilingFailure | None = None
         try:
             prepared = await self._prepare(
                 transport,
@@ -699,21 +701,32 @@ class ProfilingController:
                 (),
             )
             if isinstance(prepared, ProfilingFailure):
-                return prepared
-            if prepared.session_facts is None:
+                result = prepared
+            elif prepared.session_facts is None:
                 # The response DTO forbids this for accepted MODEL sessions;
                 # guard anyway (§47).
-                return ProfilingFailure(
+                result = ProfilingFailure(
                     category=ProfilingErrorCategory.INTERNAL_ERROR,
                     message=(
                         f"accepted model inspection on worker {worker_id!r} "
                         "carries no session facts (§47)"
                     ),
                 )
-            return prepared.session_facts
+            else:
+                result = prepared.session_facts
         finally:
-            await self._close_session(transport, resolved, session_id)
-            await transport.close()
+            try:
+                # This is a phase barrier, not ordinary best-effort cleanup:
+                # OPERATOR planning must not proceed until the MODEL session
+                # has synchronously released its Worker-side device lease.
+                close_failure = await self._close_session_uncancelled(
+                    transport, resolved, session_id
+                )
+            finally:
+                await transport.close()
+        if close_failure is not None:
+            return close_failure
+        return result
 
     def _inspection_session_id(
         self, tokens: _DispatchTokens, request: ProfilingSessionRequest
@@ -991,7 +1004,9 @@ class ProfilingController:
         finally:
             # §38: cleanup on every exit path — a failed run must not strand
             # the session's leases or model state on the Worker.
-            await self._close_session(transport, tokens, plan.session_id)
+            await self._close_session_uncancelled(
+                transport, tokens, plan.session_id
+            )
         return tuple(reports)
 
     def _resolve_network_facts(
@@ -1341,13 +1356,13 @@ class ProfilingController:
 
     async def _close_session(
         self, transport: ProfilingTransport, tokens: _DispatchTokens, session_id: str
-    ) -> None:
-        """Best-effort idempotent close (§38): never fails a decided case.
+    ) -> ProfilingFailure | None:
+        """Close one session, retrying a possibly lost idempotent response.
 
-        A refused or lost close is logged only — the Worker releases every
-        session lease on shutdown regardless (§39), and case outcomes are
-        already recorded history the Master does not rewrite for a cleanup
-        hiccup.
+        A close response can be lost after the Worker has already processed
+        it. Retrying once is safe because Worker close is idempotent, and is
+        required for MODEL inspection: its caller may only cross into the
+        measurement phase after cleanup has been acknowledged.
         """
         request = CloseProfilingSessionRequest(
             worker_id=tokens.worker_id,
@@ -1355,24 +1370,62 @@ class ProfilingController:
             registration_session_id=tokens.registration_session_id,
             profiling_session_id=session_id,
         )
-        try:
-            response = await transport.close_profiling_session(
-                request, timeout=self._rpc_timeout
-            )
-            if not response.accepted:
+        failure: ProfilingFailure | None = None
+        for attempt in range(2):
+            try:
+                response = await transport.close_profiling_session(
+                    request, timeout=self._rpc_timeout
+                )
+            except grpc.aio.AioRpcError as exc:
+                failure = _transport_failure(exc, "CloseProfilingSession")
                 logger.warning(
-                    "close of session %s on worker %s refused: %s",
+                    "close of session %s on worker %s lost (attempt %d/2): %s",
                     session_id,
                     tokens.worker_id,
+                    attempt + 1,
+                    exc,
+                )
+            except Exception as exc:
+                failure = _unexpected_failure(exc, "CloseProfilingSession")
+                logger.warning(
+                    "close of session %s on worker %s raised (attempt %d/2)",
+                    session_id,
+                    tokens.worker_id,
+                    attempt + 1,
+                    exc_info=True,
+                )
+            else:
+                if response.accepted:
+                    return None
+                failure = _rejection_failure(
+                    response.reason, response.detail, "CloseProfilingSession"
+                )
+                logger.warning(
+                    "close of session %s on worker %s refused (attempt %d/2): %s",
+                    session_id,
+                    tokens.worker_id,
+                    attempt + 1,
                     response.detail,
                 )
-        except Exception:
-            logger.warning(
-                "close of session %s on worker %s failed",
-                session_id,
-                tokens.worker_id,
-                exc_info=True,
-            )
+        assert failure is not None
+        return failure
+
+    async def _close_session_uncancelled(
+        self, transport: ProfilingTransport, tokens: _DispatchTokens, session_id: str
+    ) -> ProfilingFailure | None:
+        """Run bounded session cleanup to completion after caller cancellation."""
+        cleanup = asyncio.create_task(
+            self._close_session(transport, tokens, session_id),
+            name=f"close-profiling-session-{session_id[:12]}",
+        )
+        try:
+            return await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            # One cancellation requested the surrounding operation, not a
+            # lease leak. The close RPC remains bounded by ``rpc_timeout``;
+            # wait for it before propagating cancellation to the caller.
+            await cleanup
+            raise
 
     # -- per-worker cancellation ------------------------------------------------
 
@@ -1402,6 +1455,9 @@ class ProfilingController:
             for plan in _plan_sessions(experiment_id, worker_id, all_cases)
             for case in plan.cases
         }
+        session_ids = {
+            plans[case.case_id].session_id for case in active
+        }
         transport = self._transport_factory(resolved.endpoint)
         try:
             reports = [
@@ -1410,11 +1466,17 @@ class ProfilingController:
                 )
                 for case in active
             ]
-            for session_id in {plans[case.case_id].session_id for case in active}:
-                await self._close_session(transport, resolved, session_id)
             return tuple(reports)
         finally:
-            await transport.close()
+            try:
+                # Cancellation of one case (or of this coroutine itself)
+                # must not skip closure of sibling session plans.
+                for session_id in session_ids:
+                    await self._close_session_uncancelled(
+                        transport, resolved, session_id
+                    )
+            finally:
+                await transport.close()
 
     async def _cancel_case(
         self,

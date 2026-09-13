@@ -352,10 +352,15 @@ class StubLoader:
 
 class StubComputeExecutor:
     def __init__(
-        self, environment: ComputeExecutionEnvironment, *, delay_s: float = 0.0
+        self,
+        environment: ComputeExecutionEnvironment,
+        *,
+        delay_s: float = 0.0,
+        close_error: Exception | None = None,
     ) -> None:
         self.environment = environment
         self.delay_s = delay_s
+        self.close_error = close_error
         self.closed = False
 
     def prepare_session(self, session_id, worker_id, request, source, capability):
@@ -372,6 +377,8 @@ class StubComputeExecutor:
     def close_session(self, session) -> None:
         session.closed = True
         self.closed = True
+        if self.close_error is not None:
+            raise self.close_error
 
 
 @dataclasses.dataclass
@@ -1393,6 +1400,31 @@ async def test_close_unknown_session_is_accepted() -> None:
         CloseProfilingSessionRequest(**fields(profiling_session_id="never-prepared"))
     )
     assert response.accepted is True
+
+
+async def test_close_cleanup_failure_still_releases_physical_lease() -> None:
+    executor = StubComputeExecutor(
+        ComputeExecutionEnvironment(
+            torch_version="test",
+            cuda_version=None,
+            backend_revision="host-test",
+            target_device_id=CPU_DEVICE,
+            execution_device="cpu",
+        ),
+        close_error=RuntimeError("container cleanup exploded"),
+    )
+    rig = make_rig(compute_executor=executor)
+    assert (await prepare(rig)).accepted is True
+
+    with pytest.raises(RuntimeError, match="container cleanup exploded"):
+        await rig.runner.close_profiling_session(
+            CloseProfilingSessionRequest(
+                **fields(profiling_session_id=SESSION_ID)
+            )
+        )
+
+    assert rig.leases.leased_device_ids == ()
+    assert rig.sessions.open_session_count() == 0
 
 
 async def test_shutdown_closes_everything_and_leaks_no_lease() -> None:

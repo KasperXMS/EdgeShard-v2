@@ -419,6 +419,11 @@ class WorkerProfilingRunner:
         )
         self._clock = clock
         self._seed = seed
+        # Prepare contains an awaitable container start between the replay
+        # check and session registration. Serialize that critical section so
+        # duplicate/retried RPCs cannot both observe "missing" and create two
+        # compute sessions for one canonical session id.
+        self._prepare_lock = asyncio.Lock()
         self._iperf_servers: dict[
             str, tuple[asyncio.subprocess.Process, asyncio.Task[None], int]
         ] = {}
@@ -436,6 +441,12 @@ class WorkerProfilingRunner:
     # ------------------------------------------------------------------
 
     async def prepare_profiling_session(
+        self, request: PrepareProfilingSessionRequest
+    ) -> PrepareProfilingSessionResponse:
+        async with self._prepare_lock:
+            return await self._prepare_profiling_session_locked(request)
+
+    async def _prepare_profiling_session_locked(
         self, request: PrepareProfilingSessionRequest
     ) -> PrepareProfilingSessionResponse:
         try:
@@ -493,6 +504,12 @@ class WorkerProfilingRunner:
                 compute_handle = await self._prepare_compute_session(
                     session_id, request, inspection, tokens
                 )
+        except asyncio.CancelledError:
+            # The executor helper has already waited for and cleaned up any
+            # in-flight container preparation. Release the physical lease
+            # before allowing RPC cancellation to escape.
+            self._leases.release_session(session_id)
+            raise
         except Exception as exc:
             # Preparation failed: release the reservation (§39) and answer
             # with the typed failure — the category survives the wire (§42).
@@ -575,14 +592,31 @@ class WorkerProfilingRunner:
             session_id,
             session_request.device_ids[0],
         )
-        return await asyncio.to_thread(
-            self._compute_executor.prepare_session,
-            session_id,
-            tokens.worker_id,
-            session_request,
-            source,
-            inspection.capability,
+        preparation = asyncio.create_task(
+            asyncio.to_thread(
+                self._compute_executor.prepare_session,
+                session_id,
+                tokens.worker_id,
+                session_request,
+                source,
+                inspection.capability,
+            ),
+            name=f"prepare-compute-session-{session_id[:12]}",
         )
+        try:
+            return await asyncio.shield(preparation)
+        except asyncio.CancelledError:
+            # ``to_thread`` cannot be force-cancelled. Let preparation settle
+            # and destroy a successfully-created container handle before the
+            # gRPC cancellation is propagated; otherwise neither a session
+            # record nor a later Close RPC could own that resource.
+            try:
+                handle = await preparation
+            except Exception:
+                pass
+            else:
+                await asyncio.to_thread(self._compute_executor.close_session, handle)
+            raise
 
     # ------------------------------------------------------------------
     # RunProfilingCase (§39, §42, §44)
@@ -1134,8 +1168,13 @@ class WorkerProfilingRunner:
         # Idempotent close (§38): unknown/already-closed sessions still
         # answer accepted, and the lease release is unconditional so a close
         # can never strand a reservation (§39).
-        self._sessions.close_session(request.profiling_session_id)
-        self._leases.release_session(request.profiling_session_id)
+        try:
+            self._sessions.close_session(request.profiling_session_id)
+        finally:
+            # Model/container cleanup is deliberately allowed to fail loudly,
+            # but it must never prevent release of the independent physical
+            # device lease. A retried close remains idempotent.
+            self._leases.release_session(request.profiling_session_id)
         return CloseProfilingSessionResponse(accepted=True)
 
     async def shutdown(self) -> None:

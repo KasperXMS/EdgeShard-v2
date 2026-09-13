@@ -13,6 +13,7 @@ import asyncio
 import dataclasses
 from pathlib import Path
 
+import pytest
 from test_profiling_controller import (
     CHARACTERIZATION,
     ENDPOINT_2,
@@ -20,6 +21,7 @@ from test_profiling_controller import (
     SESSION_FACTS,
     W1,
     W2,
+    FakeTransport,
     Rig,
     make_rig,
     register_worker,
@@ -46,6 +48,7 @@ from edgeshard.protocol.profiling.mapper import (
     CancelExperimentRequest,
     GetExperimentRequest,
     PrepareProfilingSessionResponse,
+    ProfilingRejection,
     RunProfilingCaseResponse,
     StartExperimentRequest,
 )
@@ -116,6 +119,73 @@ async def drain(admin: MasterProfilingAdmin, experiment_id: str):
     report = await task
     await asyncio.sleep(0)  # flush the done-callback report cache
     return report
+
+
+class LeaseAwareTransport(FakeTransport):
+    """Fake Worker transport that enforces one physical-device lease."""
+
+    def __init__(self, endpoint: str) -> None:
+        super().__init__(endpoint)
+        self.lease_holder: str | None = None
+        self.events: list[tuple[str, str, ProfilingSessionKind | None]] = []
+        self.operator_prepare_saw_free = False
+        self.fail_model_prepare_after_acquire = False
+        self.model_prepare_entered = asyncio.Event()
+        self.model_prepare_gate: asyncio.Event | None = None
+        self.operator_run_entered = asyncio.Event()
+        self.operator_run_gate: asyncio.Event | None = None
+        self.lost_close_responses = 0
+
+    async def prepare_profiling_session(self, request, *, timeout=None):
+        kind = request.session_request.kind
+        self.events.append(("prepare", request.profiling_session_id, kind))
+        if self.lease_holder not in (None, request.profiling_session_id):
+            self.prepare_requests.append(request)
+            self.timeouts.append(timeout)
+            return PrepareProfilingSessionResponse(
+                accepted=False,
+                detail=f"device leased by {self.lease_holder}",
+                reason=ProfilingRejection.DEVICE_BUSY,
+            )
+        if kind is ProfilingSessionKind.OPERATOR:
+            self.operator_prepare_saw_free = self.lease_holder is None
+        self.lease_holder = request.profiling_session_id
+        if kind is ProfilingSessionKind.MODEL:
+            self.model_prepare_entered.set()
+            if self.model_prepare_gate is not None:
+                await self.model_prepare_gate.wait()
+            if self.fail_model_prepare_after_acquire:
+                self.prepare_requests.append(request)
+                self.timeouts.append(timeout)
+                raise RuntimeError("inspection transport failed after prepare")
+        return await super().prepare_profiling_session(request, timeout=timeout)
+
+    async def run_profiling_case(self, request, *, timeout=None):
+        self.events.append(
+            ("run", request.profiling_session_id, ProfilingSessionKind.OPERATOR)
+        )
+        self.operator_run_entered.set()
+        if self.operator_run_gate is not None:
+            await self.operator_run_gate.wait()
+        return await super().run_profiling_case(request, timeout=timeout)
+
+    async def close_profiling_session(self, request, *, timeout=None):
+        self.events.append(("close", request.profiling_session_id, None))
+        if self.lease_holder == request.profiling_session_id:
+            self.lease_holder = None
+        if self.lost_close_responses:
+            self.lost_close_responses -= 1
+            self.close_requests.append(request)
+            self.timeouts.append(timeout)
+            raise RuntimeError("close response lost after lease release")
+        return await super().close_profiling_session(request, timeout=timeout)
+
+
+def install_lease_transport(rig: Rig) -> LeaseAwareTransport:
+    transport = LeaseAwareTransport(transport_for(rig).endpoint)
+    rig.transports[transport.endpoint] = transport
+    script_healthy_inspection(rig)
+    return transport
 
 
 class TestStartExperimentNetwork:
@@ -292,6 +362,186 @@ class TestStartExperimentRejections:
 
 
 class TestStartExperimentModelFamily:
+    async def test_operator_model_inspection_closes_before_measurement_prepare(
+        self, tmp_path: Path
+    ) -> None:
+        rig = make_rig(tmp_path)
+        await register_worker(rig, W1)
+        transport = install_lease_transport(rig)
+        admin = make_admin(rig)
+
+        response = await admin.start_experiment(
+            StartExperimentRequest(
+                request=model_intent(kind=ProfilingSessionKind.OPERATOR)
+            )
+        )
+
+        assert response.accepted, response.detail
+        report = await drain(admin, response.experiment_id)
+        assert report.state is ExperimentState.COMPLETED
+        assert transport.lease_holder is None
+        assert transport.operator_prepare_saw_free
+        model_prepare_index = next(
+            index
+            for index, event in enumerate(transport.events)
+            if event[0] == "prepare" and event[2] is ProfilingSessionKind.MODEL
+        )
+        model_session_id = transport.events[model_prepare_index][1]
+        model_close_index = transport.events.index(
+            ("close", model_session_id, None)
+        )
+        operator_prepare_index = next(
+            index
+            for index, event in enumerate(transport.events)
+            if event[0] == "prepare" and event[2] is ProfilingSessionKind.OPERATOR
+        )
+        assert model_prepare_index < model_close_index < operator_prepare_index
+
+    async def test_inspection_transport_failure_closes_and_releases_lease(
+        self, tmp_path: Path
+    ) -> None:
+        rig = make_rig(tmp_path)
+        await register_worker(rig, W1)
+        transport = install_lease_transport(rig)
+        transport.fail_model_prepare_after_acquire = True
+        admin = make_admin(rig)
+
+        response = await admin.start_experiment(
+            StartExperimentRequest(
+                request=model_intent(kind=ProfilingSessionKind.OPERATOR)
+            )
+        )
+
+        assert not response.accepted
+        assert "model inspection failed" in response.detail
+        assert transport.lease_holder is None
+        assert [event[0] for event in transport.events] == ["prepare", "close"]
+        assert all(not lock.locked() for lock in admin._target_locks.values())
+
+    async def test_lost_inspection_close_response_retries_before_operator_prepare(
+        self, tmp_path: Path
+    ) -> None:
+        rig = make_rig(tmp_path)
+        await register_worker(rig, W1)
+        transport = install_lease_transport(rig)
+        transport.lost_close_responses = 1
+        admin = make_admin(rig)
+
+        response = await admin.start_experiment(
+            StartExperimentRequest(
+                request=model_intent(kind=ProfilingSessionKind.OPERATOR)
+            )
+        )
+
+        assert response.accepted, response.detail
+        await drain(admin, response.experiment_id)
+        model_session_id = next(
+            event[1]
+            for event in transport.events
+            if event[0] == "prepare" and event[2] is ProfilingSessionKind.MODEL
+        )
+        model_closes = [
+            index
+            for index, event in enumerate(transport.events)
+            if event == ("close", model_session_id, None)
+        ]
+        operator_prepare = next(
+            index
+            for index, event in enumerate(transport.events)
+            if event[0] == "prepare" and event[2] is ProfilingSessionKind.OPERATOR
+        )
+        assert len(model_closes) == 2
+        assert model_closes[-1] < operator_prepare
+        assert transport.operator_prepare_saw_free
+        assert transport.lease_holder is None
+
+    async def test_cancellation_during_inspection_releases_lease_and_target_lock(
+        self, tmp_path: Path
+    ) -> None:
+        rig = make_rig(tmp_path)
+        await register_worker(rig, W1)
+        transport = install_lease_transport(rig)
+        transport.model_prepare_gate = asyncio.Event()
+        admin = make_admin(rig)
+        start = asyncio.create_task(
+            admin.start_experiment(
+                StartExperimentRequest(
+                    request=model_intent(kind=ProfilingSessionKind.OPERATOR)
+                )
+            )
+        )
+        await transport.model_prepare_entered.wait()
+
+        start.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await start
+
+        assert transport.lease_holder is None
+        assert [event[0] for event in transport.events] == ["prepare", "close"]
+        assert all(not lock.locked() for lock in admin._target_locks.values())
+
+    async def test_duplicate_start_waits_for_same_target_run_to_close(
+        self, tmp_path: Path
+    ) -> None:
+        rig = make_rig(tmp_path)
+        await register_worker(rig, W1)
+        transport = install_lease_transport(rig)
+        transport.operator_run_gate = asyncio.Event()
+        admin = make_admin(rig)
+        intent = model_intent(kind=ProfilingSessionKind.OPERATOR)
+
+        first = await admin.start_experiment(StartExperimentRequest(request=intent))
+        assert first.accepted
+        await transport.operator_run_entered.wait()
+        second_task = asyncio.create_task(
+            admin.start_experiment(StartExperimentRequest(request=intent))
+        )
+        await asyncio.sleep(0)
+
+        assert not second_task.done()
+        assert sum(
+            event[0] == "prepare" and event[2] is ProfilingSessionKind.MODEL
+            for event in transport.events
+        ) == 1
+        transport.operator_run_gate.set()
+        await drain(admin, first.experiment_id)
+        second = await second_task
+
+        assert not second.accepted
+        assert "zero cases" in second.detail
+        assert transport.lease_holder is None
+        assert not any(
+            first_event[0] == "prepare"
+            and second_event[0] == "prepare"
+            for first_event, second_event in zip(
+                transport.events, transport.events[1:], strict=False
+            )
+        )
+
+    async def test_experiment_cancellation_closes_operator_session_and_lease(
+        self, tmp_path: Path
+    ) -> None:
+        rig = make_rig(tmp_path)
+        await register_worker(rig, W1)
+        transport = install_lease_transport(rig)
+        transport.operator_run_gate = asyncio.Event()
+        admin = make_admin(rig)
+
+        started = await admin.start_experiment(
+            StartExperimentRequest(
+                request=model_intent(kind=ProfilingSessionKind.OPERATOR)
+            )
+        )
+        assert started.accepted
+        await transport.operator_run_entered.wait()
+        cancelled = await admin.cancel_experiment(
+            CancelExperimentRequest(experiment_id=started.experiment_id)
+        )
+
+        assert cancelled.accepted
+        assert transport.lease_holder is None
+        assert all(not lock.locked() for lock in admin._target_locks.values())
+
     async def test_explicit_targets_preserve_worker_local_device_mapping(
         self, tmp_path: Path
     ) -> None:

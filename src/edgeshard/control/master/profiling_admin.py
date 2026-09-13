@@ -54,6 +54,7 @@ from edgeshard.profiling.domain.experiment import (
 )
 from edgeshard.profiling.domain.network import ProbeKind
 from edgeshard.profiling.domain.session import (
+    ModelSessionFacts,
     ProfilingSessionKind,
     ProfilingSessionRequest,
 )
@@ -92,6 +93,8 @@ class MasterProfilingAdmin:
         self._strategy = strategy if strategy is not None else DefaultProfilingStrategy()
         self._runs: dict[str, asyncio.Task[ExperimentReport]] = {}
         self._reports: dict[str, ExperimentReport] = {}
+        self._target_locks: dict[tuple[str, str], asyncio.Lock] = {}
+        self._run_target_locks: dict[str, tuple[asyncio.Lock, ...]] = {}
 
     # -- StartExperiment (§49) -------------------------------------------------
 
@@ -99,38 +102,47 @@ class MasterProfilingAdmin:
         self, request: mapper.StartExperimentRequest
     ) -> mapper.StartExperimentResponse:
         intent = request.request
+        held_target_locks = await self._acquire_target_locks(intent)
+        launched = False
         try:
-            cases = await self._expand(intent)
-        except _AdminRejection as exc:
-            logger.info("start_experiment rejected: %s", exc)
-            return mapper.StartExperimentResponse(accepted=False, detail=str(exc))
-        if not cases:
-            detail = (
-                "the request plans to zero cases — everything it targets is "
-                "already measured or no peer exists to probe (§28); nothing "
-                "was dispatched"
+            try:
+                cases = await self._expand(intent)
+            except _AdminRejection as exc:
+                logger.info("start_experiment rejected: %s", exc)
+                return mapper.StartExperimentResponse(accepted=False, detail=str(exc))
+            if not cases:
+                detail = (
+                    "the request plans to zero cases — everything it targets is "
+                    "already measured or no peer exists to probe (§28); nothing "
+                    "was dispatched"
+                )
+                logger.info("start_experiment rejected: %s", detail)
+                return mapper.StartExperimentResponse(accepted=False, detail=detail)
+
+            experiment = self._controller.create_experiment(
+                strategy_id=self._strategy.strategy_id,
+                cases=cases,
+                requested_by=intent.requested_by,
+                force_new_execution=not intent.missing_only,
             )
-            logger.info("start_experiment rejected: %s", detail)
-            return mapper.StartExperimentResponse(accepted=False, detail=detail)
+            self._launch(experiment.experiment_id, held_target_locks)
+            launched = True
+            logger.info(
+                "start_experiment accepted: %s (%d case(s), strategy=%s)",
+                experiment.experiment_id,
+                len(cases),
+                self._strategy.strategy_id,
+            )
+            return mapper.StartExperimentResponse(
+                accepted=True, experiment_id=experiment.experiment_id
+            )
+        finally:
+            if not launched:
+                self._release_target_locks(held_target_locks)
 
-        experiment = self._controller.create_experiment(
-            strategy_id=self._strategy.strategy_id,
-            cases=cases,
-            requested_by=intent.requested_by,
-            force_new_execution=not intent.missing_only,
-        )
-        self._launch(experiment.experiment_id)
-        logger.info(
-            "start_experiment accepted: %s (%d case(s), strategy=%s)",
-            experiment.experiment_id,
-            len(cases),
-            self._strategy.strategy_id,
-        )
-        return mapper.StartExperimentResponse(
-            accepted=True, experiment_id=experiment.experiment_id
-        )
-
-    def _launch(self, experiment_id: str) -> None:
+    def _launch(
+        self, experiment_id: str, target_locks: tuple[asyncio.Lock, ...] = ()
+    ) -> None:
         """Run the experiment in the background unless a run is in flight.
 
         ``StartExperiment`` answers at creation time; the CLI polls
@@ -140,12 +152,14 @@ class MasterProfilingAdmin:
         """
         existing = self._runs.get(experiment_id)
         if existing is not None and not existing.done():
+            self._release_target_locks(target_locks)
             return
         task = asyncio.create_task(
             self._controller.run_experiment(experiment_id),
             name=f"profiling-experiment-{experiment_id[:12]}",
         )
         self._runs[experiment_id] = task
+        self._run_target_locks[experiment_id] = target_locks
         task.add_done_callback(
             lambda finished: self._finish_run(experiment_id, finished)
         )
@@ -154,6 +168,9 @@ class MasterProfilingAdmin:
         self, experiment_id: str, task: asyncio.Task[ExperimentReport]
     ) -> None:
         self._runs.pop(experiment_id, None)
+        self._release_target_locks(
+            self._run_target_locks.pop(experiment_id, ())
+        )
         if task.cancelled():
             return
         exc = task.exception()
@@ -167,6 +184,41 @@ class MasterProfilingAdmin:
         # Keep the terminal report for callers already attached to this
         # process. The durable store remains authoritative after restart.
         self._reports[experiment_id] = task.result()
+
+    async def _acquire_target_locks(
+        self, intent: ProfilingRequest
+    ) -> tuple[asyncio.Lock, ...]:
+        """Serialize inspection through measurement for each physical target."""
+        if intent.kind is ProfilingSessionKind.NETWORK:
+            return ()
+        keys = sorted(
+            {
+                (target.worker_id, target.device_id)
+                for target in intent.worker_device_targets
+            }
+        )
+        # The compatibility request shape is validated as single-Worker by
+        # the domain; preserve it for callers not yet emitting explicit pairs.
+        if not keys and intent.worker_ids:
+            keys = sorted(
+                {(intent.worker_ids[0], device_id) for device_id in intent.device_ids}
+            )
+        locks = tuple(self._target_locks.setdefault(key, asyncio.Lock()) for key in keys)
+        acquired: list[asyncio.Lock] = []
+        try:
+            for lock in locks:
+                await lock.acquire()
+                acquired.append(lock)
+        except BaseException:
+            self._release_target_locks(tuple(acquired))
+            raise
+        return locks
+
+    @staticmethod
+    def _release_target_locks(locks: tuple[asyncio.Lock, ...]) -> None:
+        for lock in reversed(locks):
+            if lock.locked():
+                lock.release()
 
     # -- GetExperiment (§49) ----------------------------------------------------
 
@@ -413,7 +465,7 @@ class MasterProfilingAdmin:
         # (a MODEL prepare loads and characterizes the checkpoint, §38), and
         # the strategy plans from the reported facts — the Master never
         # loads a model itself (§40, §46).
-        cases: list[ProfilingCase] = []
+        inspected: list[tuple[WorkerDeviceTarget, ModelSessionFacts]] = []
         for target in targets:
             worker_id = target.worker_id
             device_id = target.device_id
@@ -433,6 +485,16 @@ class MasterProfilingAdmin:
                     f"[{facts.category.value}] {facts.message}"
                 )
             self._controller.record_model_facts(facts)
+            inspected.append((target, facts))
+
+        # Phase B starts only after every Phase-A ``inspect_model`` call has
+        # crossed its acknowledged CloseProfilingSession barrier. Planning is
+        # pure, and experiment dispatch below can therefore never overlap a
+        # temporary MODEL lease on any target.
+        cases: list[ProfilingCase] = []
+        for target, facts in inspected:
+            worker_id = target.worker_id
+            device_id = target.device_id
             measured: Mapping[str, AbstractSet[str]] | None = None
             if intent.missing_only:
                 operator_environment = (
