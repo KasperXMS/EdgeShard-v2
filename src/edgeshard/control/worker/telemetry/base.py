@@ -20,6 +20,23 @@ class StateFragment:
     memory_states: tuple[MemoryPoolState, ...] = ()
 
 
+@dataclass(frozen=True)
+class FreshDeviceTelemetry:
+    """Profiling-only detail from an existing physical telemetry backend.
+
+    These fields do not alter the Phase 1 wire contract.  They let Phase 2
+    retain accelerator and EMC clocks that are present in tegrastats but are
+    intentionally not part of ``DeviceState``.
+    """
+
+    device_id: str
+    utilization: float | None = None
+    temperature_c: float | None = None
+    power_w: float | None = None
+    clock_mhz: float | None = None
+    emc_clock_mhz: float | None = None
+
+
 class TelemetryProbe(Protocol):
     """Dynamic telemetry backend (spec §25): sampled per heartbeat."""
 

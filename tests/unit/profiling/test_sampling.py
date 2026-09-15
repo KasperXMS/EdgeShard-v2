@@ -14,11 +14,39 @@ from edgeshard.profiling.benchmark.sampling import (
 def test_default_policy_matches_spec_v1() -> None:
     """§12: >=3 warmups, 5-20 measured runs, ~1 s target duration."""
     policy = DurationSamplingPolicy()
-    assert policy.warmup_runs == 3
-    assert policy.min_runs == 5
+    assert policy.warmup_runs == 5
+    assert policy.max_warmup_runs == 50
+    assert policy.adaptive_warmup is True
+    assert policy.min_runs == 20
     assert policy.max_runs == 20
     assert policy.target_duration_ms == 1000.0
     assert isinstance(policy, SamplingPolicy)
+
+
+def test_adaptive_warmup_waits_through_jetson_dvfs_transition() -> None:
+    policy = DurationSamplingPolicy()
+    samples = [3.5] * 5 + [
+        3.4,
+        1.85,
+        1.84,
+        1.83,
+        1.84,
+        1.85,
+        1.84,
+        1.83,
+        1.84,
+        1.85,
+    ]
+    assert policy.should_continue_warmup(tuple(samples[:3])) is True
+    assert policy.warmup_converged(tuple(samples[:10])) is False
+    assert policy.warmup_converged(tuple(samples)) is True
+
+
+def test_adaptive_warmup_alternation_reaches_cap_without_convergence() -> None:
+    policy = DurationSamplingPolicy(max_warmup_runs=50)
+    samples = tuple(1.0 if index % 2 == 0 else 2.0 for index in range(50))
+    assert policy.warmup_converged(samples) is False
+    assert policy.should_continue_warmup(samples) is False
 
 
 def test_minimum_runs_take_precedence_over_duration() -> None:

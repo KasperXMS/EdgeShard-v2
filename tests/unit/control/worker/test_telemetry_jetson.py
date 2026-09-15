@@ -107,9 +107,7 @@ def test_parser_maps_jetpack5_r35_mw_pair_and_prefers_gpu_rail() -> None:
 
 def test_parser_never_maps_vdd_in_to_gpu_power() -> None:
     """VDD_IN is whole-module input power, not a GPU rail (spec §23)."""
-    sample = TegrastatsParser().parse(
-        "RAM 1/2MB GR3D_FREQ 0% VDD_IN 18792mW/5552mW VDD_SOC 1234mW"
-    )
+    sample = TegrastatsParser().parse("RAM 1/2MB GR3D_FREQ 0% VDD_IN 18792mW/5552mW VDD_SOC 1234mW")
     assert sample is not None
     assert sample.gpu_power_w is None
 
@@ -140,9 +138,40 @@ def test_parser_rejects_non_tegrastats_lines() -> None:
 
 
 def test_parser_handles_gr3d_with_clock_suffix() -> None:
-    sample = TegrastatsParser().parse("GR3D_FREQ 99%@306 RAM 1/2MB")
+    sample = TegrastatsParser().parse("RAM 1/2MB EMC_FREQ 12%@[3199] GR3D_FREQ 99%@[612] gpu@45C")
     assert sample is not None
     assert sample.gpu_utilization == 99.0
+    assert sample.gpu_clock_mhz == 612.0
+    assert sample.emc_clock_mhz == 3199.0
+    assert sample.gpu_temperature_c == 45.0
+
+
+def test_cached_profiling_sample_does_not_start_tegrastats() -> None:
+    class CachedTegrastats:
+        def __init__(self) -> None:
+            self.latest = TegrastatsParser().parse(
+                "RAM 1/2MB EMC_FREQ 5%@204 GR3D_FREQ 7%@306 GPU@44C"
+            )
+            self.starts = 0
+
+        async def start(self) -> None:
+            self.starts += 1
+
+        async def wait_first(self, timeout_s: float) -> object | None:
+            del timeout_s
+            return self.latest
+
+        async def stop(self) -> None:
+            return None
+
+    cached = CachedTegrastats()
+    backend = JetsonTelemetryBackend(WORKER_ID, tegrastats=cached)  # type: ignore[arg-type]
+    sample = backend.sample_fresh_device(derive_jetson_gpu_device_id(WORKER_ID))
+    assert sample is not None
+    assert sample.clock_mhz == 306.0
+    assert sample.emc_clock_mhz == 204.0
+    assert sample.temperature_c == 44.0
+    assert cached.starts == 0
 
 
 def _tegrastats_script(tmp_path: Path) -> Path:

@@ -37,6 +37,54 @@ class MemoryModel(StrEnum):
 
 
 @dataclass(frozen=True)
+class PerformanceState:
+    """Stable operating policy in force while a benchmark is executed.
+
+    This is distinct from ``DevicePerformanceClass`` (what the accelerator
+    is) and instantaneous telemetry (what its clocks happened to be at one
+    sample). Only configured ranges and derived lock state affect reuse.
+    """
+
+    power_mode: str | None = None
+    cpu_min_mhz: int | None = None
+    cpu_max_mhz: int | None = None
+    gpu_min_mhz: int | None = None
+    gpu_max_mhz: int | None = None
+    emc_min_mhz: int | None = None
+    emc_max_mhz: int | None = None
+    cpu_locked: bool | None = None
+    gpu_locked: bool | None = None
+    emc_locked: bool | None = None
+
+    def __post_init__(self) -> None:
+        if self.power_mode is not None and not self.power_mode:
+            raise ValueError("power_mode must not be empty when present")
+        for prefix in ("cpu", "gpu", "emc"):
+            minimum = getattr(self, f"{prefix}_min_mhz")
+            maximum = getattr(self, f"{prefix}_max_mhz")
+            locked = getattr(self, f"{prefix}_locked")
+            if (minimum is None) != (maximum is None):
+                raise ValueError(
+                    f"{prefix} min/max frequency must both be present or absent"
+                )
+            if minimum is not None:
+                if minimum <= 0 or maximum <= 0:
+                    raise ValueError(f"{prefix} frequencies must be positive")
+                if minimum > maximum:
+                    raise ValueError(
+                        f"{prefix}_min_mhz must not exceed {prefix}_max_mhz"
+                    )
+                if locked is not (minimum == maximum):
+                    raise ValueError(
+                        f"{prefix}_locked must be derived from min_mhz == max_mhz"
+                    )
+            elif locked is not None:
+                raise ValueError(
+                    f"{prefix}_locked must be None when its range is absent"
+                )
+
+
+@dataclass(frozen=True)
 class DevicePerformanceClass:
     """Compatibility class of physically distinct devices (spec §10).
 
@@ -102,6 +150,8 @@ class EnvironmentFingerprint:
     driver_version: str | None = None
     backend_revision: str | None = None
 
+    performance_state: PerformanceState | None = None
+
     model_revision: str | None = None
     dtype: str | None = None
     quantization: str | None = None
@@ -151,20 +201,24 @@ def environment_fingerprint_id(fingerprint: EnvironmentFingerprint) -> str:
     the performance class and compatibility fields, never on volatile
     telemetry, which is not recorded here at all.
     """
+    compatibility = (
+        "environment_fingerprint",
+        fingerprint.device_performance_class_id,
+        fingerprint.torch_version,
+        fingerprint.cuda_version,
+        fingerprint.driver_version,
+        fingerprint.backend,
+        fingerprint.backend_revision,
+        fingerprint.model_revision,
+        fingerprint.dtype,
+        fingerprint.quantization,
+        fingerprint.profiling_implementation_revision,
+    )
+    # Preserve the established identity where no policy can be observed.
+    if fingerprint.performance_state is None:
+        return canonical_sha256(compatibility)
     return canonical_sha256(
-        (
-            "environment_fingerprint",
-            fingerprint.device_performance_class_id,
-            fingerprint.torch_version,
-            fingerprint.cuda_version,
-            fingerprint.driver_version,
-            fingerprint.backend,
-            fingerprint.backend_revision,
-            fingerprint.model_revision,
-            fingerprint.dtype,
-            fingerprint.quantization,
-            fingerprint.profiling_implementation_revision,
-        )
+        (*compatibility, "performance_state", fingerprint.performance_state)
     )
 
 

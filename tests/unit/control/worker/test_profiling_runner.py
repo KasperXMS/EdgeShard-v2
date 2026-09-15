@@ -57,8 +57,12 @@ from edgeshard.control.worker.profiling_sessions import (
     ProfilingSessionRecord,
     RegistrationTokens,
 )
+from edgeshard.control.worker.telemetry.base import FreshDeviceTelemetry
 from edgeshard.profiling.benchmark.harness import InstrumentationBundle
-from edgeshard.profiling.domain.environment import environment_fingerprint_id
+from edgeshard.profiling.domain.environment import (
+    PerformanceState,
+    environment_fingerprint_id,
+)
 from edgeshard.profiling.domain.experiment import (
     CaseState,
     ModelCaseSpec,
@@ -261,9 +265,7 @@ def make_record(case: ProfilingCase) -> MeasurementRecord:
         sample_count=len(samples),
         samples=samples,
         metrics=MeasurementMetrics(
-            latency=LatencyMetrics(
-                summary=summarize_samples(samples), unit=TimeUnit.MILLISECONDS
-            )
+            latency=LatencyMetrics(summary=summarize_samples(samples), unit=TimeUnit.MILLISECONDS)
         ),
     )
 
@@ -357,10 +359,12 @@ class StubComputeExecutor:
         *,
         delay_s: float = 0.0,
         close_error: Exception | None = None,
+        profile_error: ProfilingError | None = None,
     ) -> None:
         self.environment = environment
         self.delay_s = delay_s
         self.close_error = close_error
+        self.profile_error = profile_error
         self.closed = False
 
     def prepare_session(self, session_id, worker_id, request, source, capability):
@@ -372,6 +376,8 @@ class StubComputeExecutor:
 
     def profile_case(self, session, case):
         time.sleep(self.delay_s)
+        if self.profile_error is not None:
+            raise self.profile_error
         return make_record(case)
 
     def close_session(self, session) -> None:
@@ -427,6 +433,7 @@ def make_rig(
     model_store_root: Path | None = None,
     real_loader: bool = False,
     compute_executor=None,
+    performance_state_reader=None,
 ) -> Rig:
     tokens: list = [TOKENS]
     sessions = ProfilingSessionManager(token_source=lambda: tokens[0])
@@ -442,6 +449,8 @@ def make_rig(
         kwargs["model_loader_factory"] = lambda device: rig_loader
     if compute_executor is not None:
         kwargs["compute_executor"] = compute_executor
+    if performance_state_reader is not None:
+        kwargs["performance_state_reader"] = performance_state_reader
     runner = WorkerProfilingRunner(
         sessions=sessions,
         inspector=inspector,
@@ -555,9 +564,7 @@ def run_request(case: ProfilingCase, session_id: str = SESSION_ID) -> RunProfili
 
 
 async def prepare(rig: Rig, request=OPERATOR_SESSION, **kwargs):
-    return await rig.runner.prepare_profiling_session(
-        prepare_request(request, **kwargs)
-    )
+    return await rig.runner.prepare_profiling_session(prepare_request(request, **kwargs))
 
 
 # ---------------------------------------------------------------------------
@@ -575,9 +582,7 @@ async def test_every_rpc_refuses_without_active_registration() -> None:
         GetProfilingCaseRequest(**fields(profiling_session_id=SESSION_ID, case_id=case.case_id))
     )
     cancelled = await rig.runner.cancel_profiling_case(
-        CancelProfilingCaseRequest(
-            **fields(profiling_session_id=SESSION_ID, case_id=case.case_id)
-        )
+        CancelProfilingCaseRequest(**fields(profiling_session_id=SESSION_ID, case_id=case.case_id))
     )
     closed = await rig.runner.close_profiling_session(
         CloseProfilingSessionRequest(**fields(profiling_session_id=SESSION_ID))
@@ -686,9 +691,7 @@ async def test_prepare_unsupported_model_keeps_typed_failure() -> None:
 
 
 async def test_prepare_loader_error_becomes_typed_failure() -> None:
-    boom = ProfilingError(
-        ProfilingErrorCategory.EXPORT_FAILED, "operator export exploded"
-    )
+    boom = ProfilingError(ProfilingErrorCategory.EXPORT_FAILED, "operator export exploded")
     rig = make_rig(make_state(models=(MODEL_ENTRY,)), loader=StubLoader(error=boom))
     response = await prepare(rig, MODEL_SESSION)
     assert response.accepted is False
@@ -780,9 +783,7 @@ async def test_second_gpu_case_execution_and_fingerprint_agree() -> None:
     rig.runner._instrumentation_factory = lambda device: InstrumentationBundle(
         timer=WallClockTimer()
     )
-    session = ProfilingSessionRequest(
-        kind=ProfilingSessionKind.OPERATOR, device_ids=("gpu-1",)
-    )
+    session = ProfilingSessionRequest(kind=ProfilingSessionKind.OPERATOR, device_ids=("gpu-1",))
     assert (await prepare(rig, session)).accepted
     case = operator_case(device_ids=("gpu-1",))
 
@@ -794,9 +795,7 @@ async def test_second_gpu_case_execution_and_fingerprint_agree() -> None:
     assert rig.operator.kwargs[0]["device"] == torch.device("cuda", 1)
     assert case.spec.device_ids == ("gpu-1",)
     assert record.environment.device_id == "gpu-1"
-    assert record.environment_fingerprint == environment_fingerprint_id(
-        record.environment
-    )
+    assert record.environment_fingerprint == environment_fingerprint_id(record.environment)
 
 
 async def test_compute_fingerprint_uses_container_software_environment() -> None:
@@ -846,14 +845,121 @@ async def test_compute_fingerprint_uses_container_software_environment() -> None
     }
 
 
+async def test_jetson_fingerprint_uses_worker_observed_performance_state() -> None:
+    state = PerformanceState(
+        power_mode="MODE_30W",
+        cpu_min_mhz=729,
+        cpu_max_mhz=1728,
+        gpu_min_mhz=306,
+        gpu_max_mhz=612,
+        emc_min_mhz=204,
+        emc_max_mhz=3199,
+        cpu_locked=False,
+        gpu_locked=False,
+        emc_locked=False,
+    )
+    execution = ComputeExecutionEnvironment(
+        torch_version="2.8.0-container",
+        cuda_version="12.6-container",
+        backend_revision="sha256:jetson-runtime",
+        target_device_id="gpu-system",
+        execution_device="cuda:0",
+    )
+    worker_state = make_state(
+        devices=(
+            DeviceState(
+                device_id="gpu-system",
+                utilization=0.0,
+                temperature_c=45.0,
+                power_w=10.0,
+                availability=DeviceAvailability.AVAILABLE,
+                running_runtime_ids=(),
+            ),
+        )
+    )
+    rig = make_rig(
+        worker_state,
+        compute_executor=StubComputeExecutor(execution),
+        performance_state_reader=lambda: state,
+    )
+    rig.inspector._inspection = dataclasses.replace(
+        rig.inspector._inspection, capability=make_jetson_capability()
+    )
+    session = ProfilingSessionRequest(
+        kind=ProfilingSessionKind.OPERATOR, device_ids=("gpu-system",)
+    )
+    assert (await prepare(rig, session)).accepted
+    response = await rig.runner.run_profiling_case(
+        run_request(operator_case(device_ids=("gpu-system",)))
+    )
+    assert response.outcome is not None and response.outcome.record is not None
+    fingerprint = response.outcome.record.environment
+    assert fingerprint is not None
+    assert fingerprint.performance_state == state
+    assert fingerprint.torch_version == "2.8.0-container"
+
+
+async def test_unstable_failure_keeps_environment_and_performance_state() -> None:
+    state = PerformanceState(
+        power_mode="MODE_30W",
+        gpu_min_mhz=306,
+        gpu_max_mhz=612,
+        gpu_locked=False,
+    )
+    execution = ComputeExecutionEnvironment(
+        torch_version="2.8.0-container",
+        cuda_version="12.6-container",
+        backend_revision="sha256:jetson-runtime",
+        target_device_id="gpu-system",
+        execution_device="cuda:0",
+    )
+    error = ProfilingError(
+        ProfilingErrorCategory.UNSTABLE_PERFORMANCE_STATE,
+        "warmup did not converge",
+        {"actual_warmup_runs": 50, "warmup_converged": False},
+    )
+    worker_state = make_state(
+        devices=(
+            DeviceState(
+                device_id="gpu-system",
+                utilization=0.0,
+                temperature_c=45.0,
+                power_w=10.0,
+                availability=DeviceAvailability.AVAILABLE,
+                running_runtime_ids=(),
+            ),
+        )
+    )
+    rig = make_rig(
+        worker_state,
+        compute_executor=StubComputeExecutor(execution, profile_error=error),
+        performance_state_reader=lambda: state,
+    )
+    rig.inspector._inspection = dataclasses.replace(
+        rig.inspector._inspection, capability=make_jetson_capability()
+    )
+    session = ProfilingSessionRequest(
+        kind=ProfilingSessionKind.OPERATOR, device_ids=("gpu-system",)
+    )
+    assert (await prepare(rig, session)).accepted
+    response = await rig.runner.run_profiling_case(
+        run_request(operator_case(device_ids=("gpu-system",)))
+    )
+    assert response.outcome is not None and response.outcome.failure is not None
+    assert response.outcome.failure.category is ProfilingErrorCategory.UNSTABLE_PERFORMANCE_STATE
+    details = dict(response.outcome.failure.details)
+    assert details["actual_warmup_runs"] == 50
+    assert details["device_id"] == "gpu-system"
+    assert details["environment_fingerprint"]
+    assert "MODE_30W" in str(details["performance_state_json"])
+
+
 async def test_worker_merges_fresh_physical_telemetry_around_compute_executor() -> None:
     capability = make_rtx_capability()
     base_state = dataclasses.replace(
         make_worker_state(WORKER_ID),
         device_states=(
-            dataclasses.replace(
-                make_worker_state(WORKER_ID).device_states[0], utilization=0.0
-            ),
+            dataclasses.replace(make_worker_state(WORKER_ID).device_states[0], utilization=0.0),
         ),
         runtime_instances=(),
     )
@@ -922,9 +1028,7 @@ async def test_worker_merges_fresh_physical_telemetry_around_compute_executor() 
 
 def test_default_instrumentation_reuses_phase1_shared_jetson_pool() -> None:
     capability = make_jetson_capability()
-    state = make_worker_state(
-        WORKER_ID, device_ids=("gpu-system",), pool_ids=("system-memory",)
-    )
+    state = make_worker_state(WORKER_ID, device_ids=("gpu-system",), pool_ids=("system-memory",))
     state_holder = [state]
     fresh_calls = 0
 
@@ -943,44 +1047,42 @@ def test_default_instrumentation_reuses_phase1_shared_jetson_pool() -> None:
         capability=capability,
         worker_state=state,
         worker_state_source=fresh_state,
+        device_telemetry_source=lambda device_id: FreshDeviceTelemetry(
+            device_id=device_id,
+            utilization=77.0,
+            temperature_c=45.0,
+            power_w=10.0,
+            clock_mhz=612.0,
+            emc_clock_mhz=3199.0,
+        ),
     )
 
-    bundle = default_instrumentation(
-        torch.device("cpu"), device_id="gpu-system", record=record
-    )
+    bundle = default_instrumentation(torch.device("cpu"), device_id="gpu-system", record=record)
 
     assert bundle.physical_memory is not None
     assert bundle.telemetry is not None
-    assert {device.memory_pool_id for device in capability.devices} == {
-        "system-memory"
-    }
+    assert {device.memory_pool_id for device in capability.devices} == {"system-memory"}
     assert len(capability.memory_pools) == 1
     bundle.physical_memory.open()
     state_holder[0] = dataclasses.replace(
         state,
         device_states=(dataclasses.replace(state.device_states[0], utilization=77.0),),
         memory_states=(
-            MemoryPoolState(
-                memory_pool_id="system-memory", available_bytes=12 * 2**30
-            ),
+            MemoryPoolState(memory_pool_id="system-memory", available_bytes=12 * 2**30),
         ),
     )
     bundle.physical_memory.poll()
     state_holder[0] = dataclasses.replace(
         state_holder[0],
         memory_states=(
-            MemoryPoolState(
-                memory_pool_id="system-memory", available_bytes=17 * 2**30
-            ),
+            MemoryPoolState(memory_pool_id="system-memory", available_bytes=17 * 2**30),
         ),
     )
     physical = bundle.physical_memory.close()
     bundle.telemetry.capture_initial()
     state_holder[0] = dataclasses.replace(
         state_holder[0],
-        device_states=(
-            dataclasses.replace(state_holder[0].device_states[0], utilization=77.0),
-        ),
+        device_states=(dataclasses.replace(state_holder[0].device_states[0], utilization=77.0),),
     )
     telemetry = bundle.telemetry.capture_final()
     assert physical.pool_id == "system-memory"
@@ -992,6 +1094,9 @@ def test_default_instrumentation_reuses_phase1_shared_jetson_pool() -> None:
     assert telemetry is not None
     assert telemetry.initial is not None
     assert telemetry.initial.device_id == "gpu-system"
+    assert telemetry.initial.temperature_c == 45.0
+    assert telemetry.initial.clock_mhz == 612.0
+    assert telemetry.initial.emc_clock_mhz == 3199.0
     assert telemetry.final is not None and telemetry.final.utilization == 77.0
 
 
@@ -1138,9 +1243,7 @@ async def test_cancel_before_run_replays_cancelled_outcome() -> None:
     assert (await prepare(rig)).accepted is True
     case = operator_case()
     cancel_fields = fields(profiling_session_id=SESSION_ID, case_id=case.case_id)
-    cancelled = await rig.runner.cancel_profiling_case(
-        CancelProfilingCaseRequest(**cancel_fields)
-    )
+    cancelled = await rig.runner.cancel_profiling_case(CancelProfilingCaseRequest(**cancel_fields))
     assert cancelled.accepted is True
     assert cancelled.case_state is CaseState.CANCELLED
     # The later duplicate run replays the cancellation (§50) and never
@@ -1248,14 +1351,9 @@ async def test_layer_case_without_index_fails_typed() -> None:
     """§22/§52.2: the runner never defaults to 'some' layer."""
     rig = make_rig(make_state(models=(MODEL_ENTRY,)))
     assert (await prepare(rig, MODEL_SESSION)).accepted is True
-    response = await rig.runner.run_profiling_case(
-        run_request(layer_case(layer_index=None))
-    )
+    response = await rig.runner.run_profiling_case(run_request(layer_case(layer_index=None)))
     assert response.accepted is True
-    assert (
-        response.outcome.failure.category
-        is ProfilingErrorCategory.UNSUPPORTED_GRANULARITY
-    )
+    assert response.outcome.failure.category is ProfilingErrorCategory.UNSUPPORTED_GRANULARITY
     assert rig.layer.calls == []
 
 
@@ -1264,10 +1362,7 @@ async def test_layer_case_out_of_range_index_fails_typed() -> None:
     assert (await prepare(rig, MODEL_SESSION)).accepted is True
     response = await rig.runner.run_profiling_case(run_request(layer_case(layer_index=7)))
     assert response.accepted is True
-    assert (
-        response.outcome.failure.category
-        is ProfilingErrorCategory.UNSUPPORTED_GRANULARITY
-    )
+    assert response.outcome.failure.category is ProfilingErrorCategory.UNSUPPORTED_GRANULARITY
 
 
 async def test_layer_case_contradicting_session_facts_fails() -> None:
@@ -1304,10 +1399,7 @@ async def test_module_case_without_matching_module_fails_typed() -> None:
     )
     response = await rig.runner.run_profiling_case(run_request(case))
     assert response.accepted is True
-    assert (
-        response.outcome.failure.category
-        is ProfilingErrorCategory.UNSUPPORTED_GRANULARITY
-    )
+    assert response.outcome.failure.category is ProfilingErrorCategory.UNSUPPORTED_GRANULARITY
 
 
 # ---------------------------------------------------------------------------
@@ -1317,9 +1409,7 @@ async def test_module_case_without_matching_module_fails_typed() -> None:
 
 async def test_network_case_completes_with_master_facts() -> None:
     rig = make_rig()
-    assert (
-        await prepare(rig, NETWORK_SESSION, network_facts=NETWORK_FACTS)
-    ).accepted is True
+    assert (await prepare(rig, NETWORK_SESSION, network_facts=NETWORK_FACTS)).accepted is True
     response = await rig.runner.run_profiling_case(run_request(network_case()))
     assert response.accepted is True
     assert response.outcome.succeeded
@@ -1329,16 +1419,10 @@ async def test_network_case_completes_with_master_facts() -> None:
 
 async def test_network_case_unknown_destination_fails_typed() -> None:
     rig = make_rig()
-    assert (
-        await prepare(rig, NETWORK_SESSION, network_facts=NETWORK_FACTS)
-    ).accepted is True
-    response = await rig.runner.run_profiling_case(
-        run_request(network_case(destination="w-ghost"))
-    )
+    assert (await prepare(rig, NETWORK_SESSION, network_facts=NETWORK_FACTS)).accepted is True
+    response = await rig.runner.run_profiling_case(run_request(network_case(destination="w-ghost")))
     assert response.accepted is True
-    assert (
-        response.outcome.failure.category is ProfilingErrorCategory.NETWORK_UNREACHABLE
-    )
+    assert response.outcome.failure.category is ProfilingErrorCategory.NETWORK_UNREACHABLE
     assert rig.network.calls == []
 
 
@@ -1418,9 +1502,7 @@ async def test_close_cleanup_failure_still_releases_physical_lease() -> None:
 
     with pytest.raises(RuntimeError, match="container cleanup exploded"):
         await rig.runner.close_profiling_session(
-            CloseProfilingSessionRequest(
-                **fields(profiling_session_id=SESSION_ID)
-            )
+            CloseProfilingSessionRequest(**fields(profiling_session_id=SESSION_ID))
         )
 
     assert rig.leases.leased_device_ids == ()
@@ -1431,9 +1513,7 @@ async def test_shutdown_closes_everything_and_leaks_no_lease() -> None:
     rig = make_rig()
     assert (await prepare(rig, OPERATOR_SESSION, session_id="ps-a")).accepted is True
     assert (
-        await prepare(
-            rig, NETWORK_SESSION, session_id="ps-b", network_facts=NETWORK_FACTS
-        )
+        await prepare(rig, NETWORK_SESSION, session_id="ps-b", network_facts=NETWORK_FACTS)
     ).accepted is True
     assert rig.leases.leased_device_ids == (CPU_DEVICE,)
     await rig.runner.shutdown()
@@ -1447,9 +1527,7 @@ async def test_shutdown_closes_everything_and_leaks_no_lease() -> None:
 
 
 @pytest.fixture
-def model_store_with_tiny_llama(
-    tmp_path: Path, tiny_llama_dir: Path
-) -> tuple[Path, WorkerState]:
+def model_store_with_tiny_llama(tmp_path: Path, tiny_llama_dir: Path) -> tuple[Path, WorkerState]:
     root = tmp_path / "models"
     shutil.copytree(tiny_llama_dir, root / "tiny-llama")
     state = make_state(
@@ -1539,9 +1617,7 @@ async def test_model_loader_export_failure_uses_structural_profiler_fallback(
     def fail_export(self, target, args, kwargs):
         nonlocal export_calls
         export_calls += 1
-        raise ProfilingError(
-            ProfilingErrorCategory.EXPORT_FAILED, "synthetic export rejection"
-        )
+        raise ProfilingError(ProfilingErrorCategory.EXPORT_FAILED, "synthetic export rejection")
 
     def structural_only(self, target, args, kwargs):
         nonlocal profiler_calls
@@ -1549,9 +1625,7 @@ async def test_model_loader_export_failure_uses_structural_profiler_fallback(
         return RawOperatorGraph(extractor="torch_profiler", operations=())
 
     monkeypatch.setattr(model_loader_module.TorchExportExtractor, "extract", fail_export)
-    monkeypatch.setattr(
-        model_loader_module.TorchProfilerExtractor, "extract", structural_only
-    )
+    monkeypatch.setattr(model_loader_module.TorchProfilerExtractor, "extract", structural_only)
     rig = make_rig(state, model_store_root=root, real_loader=True)
     request = ProfilingSessionRequest(
         kind=ProfilingSessionKind.MODEL,

@@ -45,6 +45,7 @@ from typing import Protocol
 
 import torch
 
+from edgeshard.cluster.capability import WorkerCapability
 from edgeshard.control.worker.agent import LocalInspection
 from edgeshard.control.worker.compute_executor import (
     ComputeExecutionEnvironment,
@@ -56,6 +57,7 @@ from edgeshard.control.worker.identity import (
     derive_cpu_device_id,
     derive_jetson_gpu_device_id,
 )
+from edgeshard.control.worker.performance_state import JetsonPerformanceStateReader
 from edgeshard.control.worker.profiling_leases import (
     DeviceBusyError,
     DeviceLeaseManager,
@@ -73,11 +75,14 @@ from edgeshard.control.worker.profiling_sessions import (
     SessionRefused,
     utc_now,
 )
+from edgeshard.control.worker.telemetry.base import FreshDeviceTelemetry
 from edgeshard.profiling.benchmark.harness import InstrumentationBundle
+from edgeshard.profiling.codec import encode_json
 from edgeshard.profiling.domain.environment import (
     DevicePerformanceClass,
     EnvironmentFingerprint,
     MemoryModel,
+    PerformanceState,
     device_performance_class_id,
     environment_fingerprint_id,
 )
@@ -131,7 +136,7 @@ from edgeshard.runtime.model_store import ModelStore
 
 logger = logging.getLogger("worker.profiling.runner")
 
-PROFILING_IMPLEMENTATION_REVISION = "0.1.0"
+PROFILING_IMPLEMENTATION_REVISION = "0.2.0"
 """Versions the profiling code itself inside every environment fingerprint
 (§9): measurements produced by different runner generations never mix."""
 
@@ -140,6 +145,10 @@ class StateInspector(Protocol):
     """The fresh-state source the runner shares with the Worker Agent (§37)."""
 
     async def inspect(self) -> LocalInspection: ...
+
+    def sample_fresh_device_telemetry(
+        self, device_id: str
+    ) -> FreshDeviceTelemetry | None: ...
 
 
 DeviceResolver = Callable[[str, str], torch.device]
@@ -219,8 +228,22 @@ class _StateTelemetryInstrumentation:
         self._record = record
 
     def capture(self) -> DeviceObservation | None:
+        detailed = (
+            self._record.device_telemetry_source(self._device_id)
+            if self._record.device_telemetry_source is not None
+            else None
+        )
         if self._record.worker_state_source is None:
-            return None
+            if detailed is None:
+                return None
+            return DeviceObservation(
+                device_id=self._device_id,
+                utilization=detailed.utilization,
+                temperature_c=detailed.temperature_c,
+                power_w=detailed.power_w,
+                clock_mhz=detailed.clock_mhz,
+                emc_clock_mhz=detailed.emc_clock_mhz,
+            )
         state = self._record.worker_state_source()
         if state is None:
             return None
@@ -267,9 +290,17 @@ class _StateTelemetryInstrumentation:
                 memory_used = pool.total_bytes - pool_state.available_bytes
         return DeviceObservation(
             device_id=self._device_id,
-            utilization=device_state.utilization,
-            temperature_c=device_state.temperature_c,
-            power_w=device_state.power_w,
+            utilization=(
+                detailed.utilization if detailed is not None else device_state.utilization
+            ),
+            temperature_c=(
+                detailed.temperature_c
+                if detailed is not None
+                else device_state.temperature_c
+            ),
+            power_w=detailed.power_w if detailed is not None else device_state.power_w,
+            clock_mhz=detailed.clock_mhz if detailed is not None else None,
+            emc_clock_mhz=(detailed.emc_clock_mhz if detailed is not None else None),
             memory_used_bytes=memory_used,
         )
 
@@ -380,6 +411,7 @@ class WorkerProfilingRunner:
         device_resolver: DeviceResolver | None = None,
         instrumentation_factory: InstrumentationFactory | None = None,
         compute_executor: ComputeProfilingExecutor | None = None,
+        performance_state_reader: Callable[[], PerformanceState] | None = None,
         clock: Callable[[], datetime] = utc_now,
         seed: int | None = None,
     ) -> None:
@@ -387,6 +419,11 @@ class WorkerProfilingRunner:
         self._inspector = inspector
         self._model_store_root = model_store_root
         self._leases = leases if leases is not None else DeviceLeaseManager()
+        self._performance_state_reader = (
+            performance_state_reader
+            if performance_state_reader is not None
+            else JetsonPerformanceStateReader().read
+        )
         self._model_loader_factory = (
             model_loader_factory if model_loader_factory is not None else default_model_loader
         )
@@ -498,6 +535,12 @@ class WorkerProfilingRunner:
             except DeviceBusyError as exc:
                 return _prepare_refused(ProfilingRejection.DEVICE_BUSY, str(exc))
 
+        performance_state = self._performance_state(
+            inspection.capability,
+            session_request.device_ids[0]
+            if session_request.kind is not ProfilingSessionKind.NETWORK
+            else None,
+        )
         compute_handle: PreparedComputeSession | None = None
         try:
             if session_request.kind is not ProfilingSessionKind.NETWORK:
@@ -538,6 +581,10 @@ class WorkerProfilingRunner:
             worker_state_source=getattr(
                 self._inspector, "sample_fresh_state", None
             ),
+            device_telemetry_source=getattr(
+                self._inspector, "sample_fresh_device_telemetry", None
+            ),
+            performance_state=performance_state,
             session_facts=compute_handle.facts if compute_handle is not None else None,
             network_facts=network_facts,
             model_handle=compute_handle,
@@ -765,54 +812,6 @@ class WorkerProfilingRunner:
                 operator=self._operator_profiler,
             )
 
-        # The executor owns CUDA-event timing and allocator instrumentation.
-        # Physical pool and telemetry samples stay on the Worker and reuse its
-        # long-lived Phase 1 backends while the container call is in flight.
-        context = default_instrumentation(
-            torch.device("cpu"), device_id=handle.target_device_id, record=record
-        )
-        if context.telemetry is not None:
-            context.telemetry.capture_initial()
-        if context.physical_memory is not None:
-            context.physical_memory.open()
-
-        task = asyncio.create_task(
-            asyncio.to_thread(self._compute_executor.profile_case, handle, case),
-            name=f"compute-profile-{case.case_id[:12]}",
-        )
-        try:
-            while not task.done():
-                done, _pending = await asyncio.wait({task}, timeout=0.05)
-                if not done and context.physical_memory is not None:
-                    context.physical_memory.poll()
-            result = await task
-        except BaseException:
-            if context.physical_memory is not None:
-                try:
-                    context.physical_memory.close()
-                except Exception as exc:
-                    logger.warning(
-                        "physical memory cleanup failed after compute error: %s", exc
-                    )
-            if context.telemetry is not None:
-                try:
-                    context.telemetry.capture_final()
-                except Exception as exc:
-                    logger.warning(
-                        "telemetry cleanup failed after compute error: %s", exc
-                    )
-            raise
-
-        physical = (
-            context.physical_memory.close()
-            if context.physical_memory is not None
-            else None
-        )
-        telemetry = (
-            context.telemetry.capture_final()
-            if context.telemetry is not None
-            else None
-        )
         if spec.granularity is ProfilingGranularity.OPERATOR:
             fingerprint = self._fingerprint(
                 record,
@@ -836,6 +835,76 @@ class WorkerProfilingRunner:
                 execution_environment=handle.environment,
             )
         fingerprint_id = environment_fingerprint_id(fingerprint)
+
+        # The executor owns CUDA-event timing and allocator instrumentation.
+        # Physical pool and telemetry samples stay on the Worker and reuse its
+        # long-lived Phase 1 backends while the container call is in flight.
+        context = default_instrumentation(
+            torch.device("cpu"), device_id=handle.target_device_id, record=record
+        )
+        if context.telemetry is not None:
+            context.telemetry.capture_initial()
+        if context.physical_memory is not None:
+            context.physical_memory.open()
+
+        task = asyncio.create_task(
+            asyncio.to_thread(self._compute_executor.profile_case, handle, case),
+            name=f"compute-profile-{case.case_id[:12]}",
+        )
+        try:
+            while not task.done():
+                done, _pending = await asyncio.wait({task}, timeout=0.05)
+                if not done and context.physical_memory is not None:
+                    context.physical_memory.poll()
+            result = await task
+        except BaseException as error:
+            if context.physical_memory is not None:
+                try:
+                    context.physical_memory.close()
+                except Exception as exc:
+                    logger.warning(
+                        "physical memory cleanup failed after compute error: %s", exc
+                    )
+            if context.telemetry is not None:
+                try:
+                    context.telemetry.capture_final()
+                except Exception as exc:
+                    logger.warning(
+                        "telemetry cleanup failed after compute error: %s", exc
+                    )
+            if (
+                isinstance(error, ProfilingError)
+                and error.category
+                is ProfilingErrorCategory.UNSTABLE_PERFORMANCE_STATE
+            ):
+                details = dict(error.details)
+                details.update(
+                    {
+                        "environment_fingerprint": fingerprint_id,
+                        "worker_id": tokens.worker_id,
+                        "device_id": handle.target_device_id,
+                        "performance_state_json": (
+                            encode_json(record.performance_state)
+                            if record.performance_state is not None
+                            else None
+                        ),
+                    }
+                )
+                raise ProfilingError(
+                    error.category, str(error), details
+                ) from error
+            raise
+
+        physical = (
+            context.physical_memory.close()
+            if context.physical_memory is not None
+            else None
+        )
+        telemetry = (
+            context.telemetry.capture_final()
+            if context.telemetry is not None
+            else None
+        )
         merged = dataclasses.replace(
             result,
             environment=fingerprint,
@@ -1286,6 +1355,7 @@ class WorkerProfilingRunner:
                 if execution_environment is not None
                 else None
             ),
+            performance_state=record.performance_state,
             model_revision=model_revision,
             dtype=dtype,
             quantization=quantization,
@@ -1293,6 +1363,28 @@ class WorkerProfilingRunner:
             device_id=device_id,
         )
         return fingerprint
+
+    def _performance_state(
+        self, capability: WorkerCapability, device_id: str | None
+    ) -> PerformanceState | None:
+        """Capture Jetson policy once per session; never mutate host policy."""
+        if device_id is None:
+            return None
+        device = next(
+            (
+                candidate
+                for candidate in capability.devices
+                if candidate.identity.device_id == device_id
+            ),
+            None,
+        )
+        if device is None or "tegra" not in device.platform_tags:
+            return None
+        try:
+            return self._performance_state_reader()
+        except Exception as exc:
+            logger.warning("Jetson performance-state observation failed: %s", exc)
+            return None
 
     @staticmethod
     def _driver_version(

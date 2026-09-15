@@ -41,6 +41,7 @@ class DeviceObservation:
     temperature_c: float | None = None
     power_w: float | None = None
     clock_mhz: float | None = None
+    emc_clock_mhz: float | None = None
     memory_used_bytes: int | None = None
 
     def to_sample(self) -> TelemetrySample:
@@ -51,6 +52,7 @@ class DeviceObservation:
             temperature_c=self.temperature_c,
             power_w=self.power_w,
             clock_mhz=self.clock_mhz,
+            emc_clock_mhz=self.emc_clock_mhz,
             memory_used_bytes=self.memory_used_bytes,
         )
 

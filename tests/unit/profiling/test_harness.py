@@ -53,6 +53,17 @@ class ScriptedTimer:
         return self._elapsed_ms
 
 
+class SequenceTimer:
+    def __init__(self, samples_ms: list[float]) -> None:
+        self._samples = list(samples_ms)
+
+    def start(self) -> None:
+        return None
+
+    def stop(self) -> float:
+        return self._samples.pop(0)
+
+
 class RecordingWorkload:
     """Records lifecycle calls; optionally fails on a specific run_once."""
 
@@ -135,18 +146,22 @@ def test_lifecycle_order_and_minimum_runs() -> None:
     workload = RecordingWorkload(events)
     memory = FakeMemory(events, ALLOCATOR_METRICS)
     bundle = InstrumentationBundle(timer=ScriptedTimer(events, 10.0), memory=memory)
-    result = BenchmarkHarness().run(
-        workload, sampling_policy=_policy(), instrumentation=bundle
-    )
+    result = BenchmarkHarness().run(workload, sampling_policy=_policy(), instrumentation=bundle)
     assert events == [
         "prepare",
         "run_once",  # warmup 1
         "run_once",  # warmup 2
         "reset",
         "memory_open",  # peaks reset after warmup, before measuring (§14.1)
-        "timer_start", "run_once", "timer_stop",
-        "timer_start", "run_once", "timer_stop",
-        "timer_start", "run_once", "timer_stop",
+        "timer_start",
+        "run_once",
+        "timer_stop",
+        "timer_start",
+        "run_once",
+        "timer_stop",
+        "timer_start",
+        "run_once",
+        "timer_stop",
         "memory_close",
         "cleanup",
     ]
@@ -198,9 +213,7 @@ def test_workload_failure_is_typed_and_cleanup_still_runs() -> None:
     workload = RecordingWorkload(events, fail_on_run=4)
     bundle = InstrumentationBundle(timer=ScriptedTimer(events, 10.0))
     with pytest.raises(ProfilingError) as excinfo:
-        BenchmarkHarness().run(
-            workload, sampling_policy=_policy(), instrumentation=bundle
-        )
+        BenchmarkHarness().run(workload, sampling_policy=_policy(), instrumentation=bundle)
     assert excinfo.value.category is ProfilingErrorCategory.BENCHMARK_FAILED
     assert isinstance(excinfo.value.__cause__, RuntimeError)
     assert events[-1] == "cleanup"
@@ -231,9 +244,7 @@ def test_typed_environment_errors_pass_through() -> None:
             ProfilingErrorCategory.INSUFFICIENT_MEMORY, "free VRAM below model footprint"
         )
 
-    bundle = InstrumentationBundle(
-        timer=ScriptedTimer(events, 10.0), environment_check=check
-    )
+    bundle = InstrumentationBundle(timer=ScriptedTimer(events, 10.0), environment_check=check)
     with pytest.raises(ProfilingError) as excinfo:
         BenchmarkHarness().run(
             RecordingWorkload(events), sampling_policy=_policy(), instrumentation=bundle
@@ -287,9 +298,7 @@ def test_physical_memory_probe_polls_each_measured_run() -> None:
         total_bytes=1_000,
         read_available_bytes=lambda: queue.pop(0),
     )
-    bundle = InstrumentationBundle(
-        timer=ScriptedTimer(events, 10.0), physical_memory=probe
-    )
+    bundle = InstrumentationBundle(timer=ScriptedTimer(events, 10.0), physical_memory=probe)
     result = BenchmarkHarness().run(
         RecordingWorkload(events), sampling_policy=_policy(), instrumentation=bundle
     )
@@ -369,10 +378,74 @@ def test_cleanup_failure_does_not_mask_benchmark_failure() -> None:
     workload = DoublyBroken(events, fail_on_run=1)  # fails in warmup
     bundle = InstrumentationBundle(timer=ScriptedTimer(events, 10.0))
     with pytest.raises(ProfilingError) as excinfo:
-        BenchmarkHarness().run(
-            workload, sampling_policy=_policy(), instrumentation=bundle
-        )
+        BenchmarkHarness().run(workload, sampling_policy=_policy(), instrumentation=bundle)
     # The original failure stays primary; the cleanup failure is logged.
     assert "warmup" in str(excinfo.value)
     assert isinstance(excinfo.value.__cause__, RuntimeError)
     assert str(excinfo.value.__cause__) == "workload exploded"
+
+
+def test_adaptive_warmup_excludes_jetson_transition_from_measurement() -> None:
+    warmup = [3.5] * 5 + [3.4, 1.85, 1.84, 1.83, 1.84, 1.85, 1.84, 1.83, 1.84, 1.85]
+    measured = [1.84] * 20
+    workload = RecordingWorkload([])
+    result = BenchmarkHarness().run(
+        workload,
+        sampling_policy=DurationSamplingPolicy(),
+        instrumentation=InstrumentationBundle(timer=SequenceTimer(warmup + measured)),
+    )
+    assert result.warmup_runs == len(warmup)
+    assert result.warmup_converged is True
+    assert result.measured_runs == 20
+    assert result.samples_ms == tuple(measured)
+    assert result.quality is not None
+    assert result.quality.stationary is True
+
+
+def test_nonconverging_warmup_is_typed_unstable_failure() -> None:
+    alternating = [1.0 if index % 2 == 0 else 2.0 for index in range(50)]
+    workload = RecordingWorkload([])
+    with pytest.raises(ProfilingError) as excinfo:
+        BenchmarkHarness().run(
+            workload,
+            sampling_policy=DurationSamplingPolicy(),
+            instrumentation=InstrumentationBundle(timer=SequenceTimer(alternating)),
+        )
+    assert excinfo.value.category is ProfilingErrorCategory.UNSTABLE_PERFORMANCE_STATE
+    assert dict(excinfo.value.details)["actual_warmup_runs"] == 50
+    assert workload.run_calls == 50
+
+
+def test_post_measurement_half_drift_is_nonstationary() -> None:
+    samples = [2.0] * 10 + [1.0] * 10
+    with pytest.raises(ProfilingError) as excinfo:
+        BenchmarkHarness().run(
+            RecordingWorkload([]),
+            sampling_policy=DurationSamplingPolicy(
+                min_warmups=1,
+                min_runs=20,
+                max_runs=20,
+                enforce_stationarity=True,
+            ),
+            instrumentation=InstrumentationBundle(timer=SequenceTimer(samples)),
+        )
+    assert excinfo.value.category is ProfilingErrorCategory.UNSTABLE_PERFORMANCE_STATE
+    details = dict(excinfo.value.details)
+    assert details["stationary"] is False
+    assert details["drift_ratio"] == 0.5
+
+
+def test_stable_rtx_like_measurement_is_calibration_eligible() -> None:
+    result = BenchmarkHarness().run(
+        RecordingWorkload([]),
+        sampling_policy=DurationSamplingPolicy(
+            min_warmups=1,
+            min_runs=3,
+            max_runs=3,
+            target_duration_ms=1_000_000.0,
+        ),
+        instrumentation=InstrumentationBundle(timer=SequenceTimer([1.00, 1.01, 0.99])),
+    )
+    assert result.quality is not None
+    assert result.quality.stationary is True
+    assert result.quality.eligible_for_calibration is True

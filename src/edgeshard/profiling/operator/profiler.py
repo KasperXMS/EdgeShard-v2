@@ -173,6 +173,9 @@ class OperatorProfiler:
             "phase": spec.phase.value,
             "timing_unit": TimeUnit.MILLISECONDS.value,
             "warmup_runs": result.warmup_runs,
+            "requested_min_warmup_runs": result.requested_min_warmup_runs,
+            "actual_warmup_runs": result.warmup_runs,
+            "warmup_converged": result.warmup_converged,
             "measured_runs": result.measured_runs,
         }
         record = measurement_record_from_result(

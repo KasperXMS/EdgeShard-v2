@@ -41,7 +41,11 @@ from edgeshard.control.worker.discovery.nvidia import NvidiaCapabilityProbe
 from edgeshard.control.worker.identity import IdentityManager, build_worker_identity
 from edgeshard.control.worker.model_inventory import scan_model_inventory
 from edgeshard.control.worker.runtime_inventory import scan_runtime_inventory
-from edgeshard.control.worker.telemetry.base import StateFragment, TelemetryProbe
+from edgeshard.control.worker.telemetry.base import (
+    FreshDeviceTelemetry,
+    StateFragment,
+    TelemetryProbe,
+)
 from edgeshard.control.worker.telemetry.host import HostTelemetryProbe
 from edgeshard.control.worker.telemetry.jetson import JetsonTelemetryBackend
 from edgeshard.control.worker.telemetry.nvidia import NvidiaTelemetryProbe
@@ -234,6 +238,18 @@ class LocalWorkerInspector:
         )
         self._latest_state = state
         return state
+
+    def sample_fresh_device_telemetry(
+        self, device_id: str
+    ) -> FreshDeviceTelemetry | None:
+        """Profiling detail from a long-lived backend, when it exposes one."""
+        for probe in self._telemetry_probes:
+            sample_device = getattr(probe, "sample_fresh_device", None)
+            if callable(sample_device):
+                sample = sample_device(device_id)
+                if isinstance(sample, FreshDeviceTelemetry):
+                    return sample
+        return None
 
     async def start(self) -> None:
         """One-time static discovery; idempotent."""

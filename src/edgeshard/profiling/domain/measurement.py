@@ -197,6 +197,7 @@ class TelemetrySample:
     temperature_c: float | None = None
     power_w: float | None = None
     clock_mhz: float | None = None
+    emc_clock_mhz: float | None = None
     memory_used_bytes: int | None = None
 
     def __post_init__(self) -> None:
@@ -210,6 +211,10 @@ class TelemetrySample:
             raise ValueError(f"power_w must not be negative, got {self.power_w}")
         if self.clock_mhz is not None and self.clock_mhz <= 0:
             raise ValueError(f"clock_mhz must be positive, got {self.clock_mhz}")
+        if self.emc_clock_mhz is not None and self.emc_clock_mhz <= 0:
+            raise ValueError(
+                f"emc_clock_mhz must be positive, got {self.emc_clock_mhz}"
+            )
         if self.memory_used_bytes is not None and self.memory_used_bytes < 0:
             raise ValueError(
                 f"memory_used_bytes must not be negative, got {self.memory_used_bytes}"
@@ -318,6 +323,26 @@ class MeasurementMetrics:
 
 
 @dataclass(frozen=True)
+class MeasurementQuality:
+    """Stationarity verdict for latency samples used as calibration data."""
+
+    stationary: bool
+    drift_ratio: float
+    coefficient_of_variation: float
+    eligible_for_calibration: bool
+
+    def __post_init__(self) -> None:
+        for name in ("drift_ratio", "coefficient_of_variation"):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be finite and non-negative")
+        if self.eligible_for_calibration and not self.stationary:
+            raise ValueError(
+                "non-stationary measurements cannot be calibration data"
+            )
+
+
+@dataclass(frozen=True)
 class MeasurementRecord:
     """One persisted empirical observation set (spec §8.3).
 
@@ -347,6 +372,7 @@ class MeasurementRecord:
 
     metadata: tuple[tuple[str, JsonScalar], ...] = ()
     environment: EnvironmentFingerprint | None = None
+    quality: MeasurementQuality | None = None
 
     def __post_init__(self) -> None:
         if not self.measurement_id:

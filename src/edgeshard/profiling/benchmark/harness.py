@@ -23,8 +23,10 @@ Guarantees:
 
 from __future__ import annotations
 
+import json
 import logging
 import math
+import statistics
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -34,6 +36,7 @@ from edgeshard.profiling.benchmark.sampling import SamplingPolicy, SamplingState
 from edgeshard.profiling.domain.experiment import ProfilingErrorCategory
 from edgeshard.profiling.domain.measurement import (
     AllocatorMemoryMetrics,
+    MeasurementQuality,
     PhysicalMemoryMetrics,
     SampleSummary,
     TelemetryContextMetrics,
@@ -99,6 +102,9 @@ class BenchmarkResult:
     allocator_memory: AllocatorMemoryMetrics | None = None
     physical_memory: PhysicalMemoryMetrics | None = None
     telemetry: TelemetryContextMetrics | None = None
+    requested_min_warmup_runs: int = 0
+    warmup_converged: bool = True
+    quality: MeasurementQuality | None = None
 
 
 class BenchmarkHarness:
@@ -116,7 +122,14 @@ class BenchmarkHarness:
         completed = False
         try:
             self._validate_environment(instrumentation)
-            self._warmup(workload, sampling_policy)
+            warmup_samples, warmup_converged = self._warmup(
+                workload, sampling_policy, instrumentation.timer
+            )
+            actual_warmup_runs = (
+                len(warmup_samples) if warmup_samples else sampling_policy.warmup_runs
+            )
+            if not warmup_converged:
+                self._raise_unstable_warmup(warmup_samples, sampling_policy)
             self._guard(workload.reset, "workload reset failed")
             if instrumentation.memory is not None:
                 self._guard(instrumentation.memory.open, "memory instrumentation open failed")
@@ -139,12 +152,23 @@ class BenchmarkHarness:
                 else None
             )
             telemetry = (
-                self._guard(
-                    instrumentation.telemetry.capture_final, "telemetry capture failed"
-                )
+                self._guard(instrumentation.telemetry.capture_final, "telemetry capture failed")
                 if instrumentation.telemetry is not None
                 else None
             )
+            stationarity_reliable = getattr(
+                instrumentation.timer, "stationarity_reliable", True
+            )
+            quality = (
+                self._quality(samples_ms)
+                if samples_ms and stationarity_reliable
+                else None
+            )
+            enforce_stationarity = getattr(sampling_policy, "enforce_stationarity", True)
+            if quality is not None and not quality.stationary and enforce_stationarity:
+                self._raise_unstable_measurement(
+                    samples_ms, quality, actual_warmup_runs, warmup_converged
+                )
             completed = True
         finally:
             self._cleanup(workload, completed)
@@ -157,13 +181,16 @@ class BenchmarkHarness:
         return BenchmarkResult(
             started_at=started_at,
             finished_at=finished_at,
-            warmup_runs=sampling_policy.warmup_runs,
+            warmup_runs=actual_warmup_runs,
+            requested_min_warmup_runs=sampling_policy.warmup_runs,
+            warmup_converged=warmup_converged,
             measured_runs=len(samples_ms),
             samples_ms=tuple(samples_ms),
             summary=summarize_samples(samples_ms),
             allocator_memory=allocator,
             physical_memory=physical,
             telemetry=telemetry,
+            quality=quality,
         )
 
     def _cleanup(self, workload: BenchmarkWorkload, completed: bool) -> None:
@@ -186,9 +213,24 @@ class BenchmarkHarness:
             # typed errors pass through the guard untouched.
             self._guard(instrumentation.telemetry.capture_initial, "telemetry capture failed")
 
-    def _warmup(self, workload: BenchmarkWorkload, policy: SamplingPolicy) -> None:
-        for _ in range(policy.warmup_runs):
-            self._guard(workload.run_once, "workload warmup run failed")
+    def _warmup(
+        self, workload: BenchmarkWorkload, policy: SamplingPolicy, timer: Timer
+    ) -> tuple[tuple[float, ...], bool]:
+        adaptive = getattr(policy, "should_continue_warmup", None)
+        converged = getattr(policy, "warmup_converged", None)
+        adaptive_enabled = getattr(policy, "adaptive_warmup", True) and getattr(
+            timer, "stationarity_reliable", True
+        )
+        if not adaptive_enabled or not callable(adaptive) or not callable(converged):
+            for _ in range(policy.warmup_runs):
+                self._guard(workload.run_once, "workload warmup run failed")
+            return (), True
+
+        samples: list[float] = []
+        while adaptive(tuple(samples)):
+            samples.append(self._timed_iteration(workload, timer, warmup=True))
+        frozen = tuple(samples)
+        return frozen, bool(converged(frozen))
 
     def _measure(
         self,
@@ -200,14 +242,7 @@ class BenchmarkHarness:
         samples: list[float] = []
         state = SamplingState(warmup_runs=policy.warmup_runs)
         while policy.should_continue(state):
-            self._guard(timer.start, "timer start failed")
-            self._guard(workload.run_once, "workload measured run failed")
-            elapsed_ms = self._guard(timer.stop, "timer stop failed")
-            if not math.isfinite(elapsed_ms) or elapsed_ms < 0.0:
-                raise ProfilingError(
-                    ProfilingErrorCategory.BENCHMARK_FAILED,
-                    f"timer returned an invalid elapsed duration: {elapsed_ms!r}",
-                )
+            elapsed_ms = self._timed_iteration(workload, timer, warmup=False)
             samples.append(elapsed_ms)
             if instrumentation.physical_memory is not None:
                 self._guard(
@@ -219,6 +254,73 @@ class BenchmarkHarness:
                 accumulated_measurement_ms=state.accumulated_measurement_ms + elapsed_ms,
             )
         return samples
+
+    def _timed_iteration(self, workload: BenchmarkWorkload, timer: Timer, *, warmup: bool) -> float:
+        phase = "warmup" if warmup else "measured"
+        self._guard(timer.start, f"timer start failed during {phase}")
+        self._guard(workload.run_once, f"workload {phase} run failed")
+        elapsed_ms = self._guard(timer.stop, f"timer stop failed during {phase}")
+        if not math.isfinite(elapsed_ms) or elapsed_ms < 0.0:
+            raise ProfilingError(
+                ProfilingErrorCategory.BENCHMARK_FAILED,
+                f"timer returned an invalid elapsed duration: {elapsed_ms!r}",
+            )
+        return elapsed_ms
+
+    @staticmethod
+    def _quality(samples_ms: list[float]) -> MeasurementQuality:
+        summary = summarize_samples(samples_ms)
+        coefficient = summary.stddev / max(abs(summary.mean), 1e-12)
+        split = len(samples_ms) // 2
+        if split == 0:
+            drift = 0.0
+        else:
+            first = statistics.median(samples_ms[:split])
+            second = statistics.median(samples_ms[split:])
+            drift = abs(second - first) / max(abs(first), abs(second), 1e-12)
+        stationary = drift <= 0.05
+        return MeasurementQuality(
+            stationary=stationary,
+            drift_ratio=drift,
+            coefficient_of_variation=coefficient,
+            eligible_for_calibration=stationary,
+        )
+
+    @staticmethod
+    def _raise_unstable_warmup(samples_ms: tuple[float, ...], policy: SamplingPolicy) -> None:
+        summary = summarize_samples(samples_ms) if samples_ms else None
+        raise ProfilingError(
+            ProfilingErrorCategory.UNSTABLE_PERFORMANCE_STATE,
+            "benchmark warmup did not converge before its run limit",
+            {
+                "actual_warmup_runs": len(samples_ms),
+                "requested_min_warmup_runs": policy.warmup_runs,
+                "warmup_converged": False,
+                "warmup_median_ms": summary.median if summary else None,
+                "warmup_samples_ms_json": json.dumps(samples_ms),
+            },
+        )
+
+    @staticmethod
+    def _raise_unstable_measurement(
+        samples_ms: list[float],
+        quality: MeasurementQuality,
+        actual_warmup_runs: int,
+        warmup_converged: bool,
+    ) -> None:
+        raise ProfilingError(
+            ProfilingErrorCategory.UNSTABLE_PERFORMANCE_STATE,
+            "measured latency samples changed performance state during the run",
+            {
+                "actual_warmup_runs": actual_warmup_runs,
+                "warmup_converged": warmup_converged,
+                "measured_runs": len(samples_ms),
+                "stationary": quality.stationary,
+                "drift_ratio": quality.drift_ratio,
+                "coefficient_of_variation": quality.coefficient_of_variation,
+                "samples_ms_json": json.dumps(samples_ms),
+            },
+        )
 
     @staticmethod
     def _guard[T](action: Callable[[], T], failure_message: str) -> T:

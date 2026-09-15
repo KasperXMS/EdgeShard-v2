@@ -25,6 +25,7 @@ from edgeshard.profiling.domain.environment import (
     DevicePerformanceClassMembership,
     EnvironmentFingerprint,
     MemoryModel,
+    PerformanceState,
     device_performance_class_id,
     environment_fingerprint_id,
 )
@@ -42,6 +43,7 @@ from edgeshard.profiling.domain.measurement import (
     BandwidthMetrics,
     LatencyMetrics,
     MeasurementMetrics,
+    MeasurementQuality,
     MeasurementRecord,
     RttMetrics,
     TimeUnit,
@@ -340,9 +342,7 @@ class TestMeasurements:
         assert store.append_measurement(record) is False
         assert len(_rows(store, "SELECT * FROM measurements")) == 1
 
-    def test_same_id_different_content_fails_loud(
-        self, store: SqliteProfileStore
-    ) -> None:
+    def test_same_id_different_content_fails_loud(self, store: SqliteProfileStore) -> None:
         """§7: a canonical id mapping to different content is a contract break."""
         case = _operator_case()
         store.append_case(case)
@@ -390,18 +390,16 @@ class TestMeasurements:
             module_record,  # NOW, then LATER — ordered by (started_at, id)
             layer_record,
         )
-        assert store.query_measurements(
-            model_id=MODEL.model_id, revision="other"
-        ) == ()
+        assert store.query_measurements(model_id=MODEL.model_id, revision="other") == ()
         assert store.query_measurements(
             layer_signature_id=transformer_layer_signature_id(LAYER_SIG)
         ) == (layer_record,)
-        assert store.query_measurements(
-            module_signature_id=module_signature_id(MODULE_SIG)
-        ) == (module_record,)
-        assert store.query_measurements(
-            operator_signature_id=operator_signature_id(OP_SIG)
-        ) == (op_record,)
+        assert store.query_measurements(module_signature_id=module_signature_id(MODULE_SIG)) == (
+            module_record,
+        )
+        assert store.query_measurements(operator_signature_id=operator_signature_id(OP_SIG)) == (
+            op_record,
+        )
         pair_id = network_pair_signature_id(
             NetworkPair(source_worker_id="w-1", destination_worker_id="w-2")
         )
@@ -455,12 +453,8 @@ class TestRegistries:
         assert store.store_characterization(CHARACTERIZATION) == model_signature_id(
             CHARACTERIZATION
         )
-        assert store.store_layer_signature(LAYER_SIG) == (
-            transformer_layer_signature_id(LAYER_SIG)
-        )
-        assert store.store_module_signature(MODULE_SIG) == module_signature_id(
-            MODULE_SIG
-        )
+        assert store.store_layer_signature(LAYER_SIG) == (transformer_layer_signature_id(LAYER_SIG))
+        assert store.store_module_signature(MODULE_SIG) == module_signature_id(MODULE_SIG)
         assert store.store_operator_signature(OP_SIG) == operator_signature_id(OP_SIG)
         fp = _fingerprint()
         assert store.store_environment_fingerprint(fp) == environment_fingerprint_id(fp)
@@ -473,60 +467,53 @@ class TestRegistries:
         assert len(_rows(store, "SELECT * FROM model_characterizations")) == 1
         assert len(_rows(store, "SELECT * FROM operator_signatures")) == 1
 
-    def test_same_id_different_content_fails_loud(
-        self, store: SqliteProfileStore
-    ) -> None:
+    def test_same_id_different_content_fails_loud(self, store: SqliteProfileStore) -> None:
         """Simulated §7 hash collision: the store refuses to paper over it."""
         signature_id = store.store_operator_signature(OP_SIG)
         store._conn.execute(
-            "UPDATE operator_signatures SET payload = '{}' "
-            "WHERE operator_signature_id = ?",
+            "UPDATE operator_signatures SET payload = '{}' WHERE operator_signature_id = ?",
             (signature_id,),
         )
         with pytest.raises(ProfileStoreError, match="different content"):
             store.store_operator_signature(OP_SIG)
 
-    def test_endpoint_facts_are_last_write_wins(
-        self, store: SqliteProfileStore
-    ) -> None:
+    def test_endpoint_facts_are_last_write_wins(self, store: SqliteProfileStore) -> None:
         """Endpoints reference rediscoverable Phase 1 facts, not hashed content."""
         key = ("w-1", "if-eth0")
-        assert store.store_network_endpoint(
-            NetworkEndpointProfile(worker_id="w-1", interface_id="if-eth0", mtu=1500)
-        ) == key
-        assert store.store_network_endpoint(
-            NetworkEndpointProfile(
-                worker_id="w-1", interface_id="if-eth0", mtu=9000, link_speed_mbps=1e4
+        assert (
+            store.store_network_endpoint(
+                NetworkEndpointProfile(worker_id="w-1", interface_id="if-eth0", mtu=1500)
             )
-        ) == key
+            == key
+        )
+        assert (
+            store.store_network_endpoint(
+                NetworkEndpointProfile(
+                    worker_id="w-1", interface_id="if-eth0", mtu=9000, link_speed_mbps=1e4
+                )
+            )
+            == key
+        )
         rows = _rows(store, "SELECT mtu, link_speed_mbps FROM network_endpoints")
         assert len(rows) == 1
         assert rows[0]["mtu"] == 9000
         assert rows[0]["link_speed_mbps"] == 1e4
 
-    def test_pair_classification_evolves_identity_does_not(
-        self, store: SqliteProfileStore
-    ) -> None:
+    def test_pair_classification_evolves_identity_does_not(self, store: SqliteProfileStore) -> None:
         """§32: reclassification must not change which pair measurements belong to."""
         pair = NetworkPair(source_worker_id="w-1", destination_worker_id="w-2")
         pair_id = store.store_path_classification(pair, NetworkPathClass.WIRED_LAN)
         assert pair_id == network_pair_signature_id(pair)
         assert store.store_path_classification(pair, NetworkPathClass.OVERLAY) == pair_id
-        rows = _rows(
-            store, "SELECT path_class, payload FROM network_pairs"
-        )
+        rows = _rows(store, "SELECT path_class, payload FROM network_pairs")
         assert len(rows) == 1
         assert rows[0]["path_class"] == "overlay"
-        classes = {
-            row["path_class"] for row in _rows(store, "SELECT * FROM network_path_classes")
-        }
+        classes = {row["path_class"] for row in _rows(store, "SELECT * FROM network_path_classes")}
         assert classes == {"wired_lan", "overlay"}
 
 
 class TestReuseIndex:
-    def test_same_physical_environment_reuses_measurement(
-        self, store: SqliteProfileStore
-    ) -> None:
+    def test_same_physical_environment_reuses_measurement(self, store: SqliteProfileStore) -> None:
         environment = _fingerprint(dtype="fp32")
         op_case = _operator_case(OP_SIG)
         store.append_case(op_case)
@@ -540,13 +527,11 @@ class TestReuseIndex:
         )
 
         op_id = operator_signature_id(OP_SIG)
-        assert store.measured_operator_signature_ids_for_environment(
-            environment
-        ) == frozenset({op_id})
+        assert store.measured_operator_signature_ids_for_environment(environment) == frozenset(
+            {op_id}
+        )
 
-    def test_index_adapter_feeds_incremental_planning(
-        self, store: SqliteProfileStore
-    ) -> None:
+    def test_index_adapter_feeds_incremental_planning(self, store: SqliteProfileStore) -> None:
         """P2E seam: the scoped index drives missing-only planning (§28)."""
         environment = _fingerprint(dtype="fp32")
         op_case = _operator_case(OP_SIG)
@@ -570,12 +555,19 @@ class TestReuseIndex:
         self, store: SqliteProfileStore
     ) -> None:
         class_id = device_performance_class_id(PERFORMANCE_CLASS)
+        performance_state = PerformanceState(
+            power_mode="P0",
+            gpu_min_mhz=2520,
+            gpu_max_mhz=2520,
+            gpu_locked=True,
+        )
         reference = _fingerprint(
             "rtx-a",
             worker_id="worker-a",
             device_performance_class_id=class_id,
             device_performance_class=PERFORMANCE_CLASS,
             dtype="fp32",
+            performance_state=performance_state,
         )
         candidate = _fingerprint(
             "rtx-b",
@@ -583,6 +575,7 @@ class TestReuseIndex:
             device_performance_class_id=class_id,
             device_performance_class=PERFORMANCE_CLASS,
             dtype="fp32",
+            performance_state=performance_state,
         )
         orin_class = DevicePerformanceClass(
             vendor="nvidia",
@@ -626,6 +619,57 @@ class TestReuseIndex:
         assert store.measured_operator_signature_ids_for_environment(candidate) == {
             operator_signature_id(OP_SIG)
         }
+
+    def test_reuse_requires_the_same_performance_state(self, store: SqliteProfileStore) -> None:
+        dynamic_state = PerformanceState(
+            power_mode="MODE_30W",
+            gpu_min_mhz=306,
+            gpu_max_mhz=612,
+            gpu_locked=False,
+        )
+        locked_state = PerformanceState(
+            power_mode="MODE_30W",
+            gpu_min_mhz=612,
+            gpu_max_mhz=612,
+            gpu_locked=True,
+        )
+        dynamic = _fingerprint(dtype="fp32", performance_state=dynamic_state)
+        locked = _fingerprint(dtype="fp32", performance_state=locked_state)
+        case = _operator_case()
+        store.append_case(case)
+        store.append_measurement(
+            _latency_record(
+                case,
+                "m-dynamic",
+                environment_fingerprint_id(dynamic),
+                environment=dynamic,
+            )
+        )
+        assert store.measured_operator_signature_ids_for_environment(dynamic) == {
+            operator_signature_id(OP_SIG)
+        }
+        assert store.measured_operator_signature_ids_for_environment(locked) == frozenset()
+
+    def test_nonstationary_record_is_not_reusable(self, store: SqliteProfileStore) -> None:
+        environment = _fingerprint(dtype="fp32")
+        case = _operator_case()
+        store.append_case(case)
+        record = replace(
+            _latency_record(
+                case,
+                "m-unstable",
+                environment_fingerprint_id(environment),
+                environment=environment,
+            ),
+            quality=MeasurementQuality(
+                stationary=False,
+                drift_ratio=0.5,
+                coefficient_of_variation=0.4,
+                eligible_for_calibration=False,
+            ),
+        )
+        store.append_measurement(record)
+        assert store.measured_operator_signature_ids_for_environment(environment) == frozenset()
 
 
 class TestSnapshot:
@@ -683,15 +727,19 @@ class TestSnapshot:
         assert snapshot.measurements == ()
         assert snapshot.network_measurements == ()
 
-    def test_snapshot_is_self_contained_after_store_is_closed(
-        self, tmp_path: Path
-    ) -> None:
+    def test_snapshot_is_self_contained_after_store_is_closed(self, tmp_path: Path) -> None:
         path = tmp_path / "self-contained.db"
         class_id = device_performance_class_id(PERFORMANCE_CLASS)
         environment = _fingerprint(
             device_performance_class_id=class_id,
             device_performance_class=PERFORMANCE_CLASS,
             dtype="fp32",
+            performance_state=PerformanceState(
+                power_mode="MODE_30W",
+                gpu_min_mhz=612,
+                gpu_max_mhz=612,
+                gpu_locked=True,
+            ),
         )
         case = _operator_case()
         endpoint = NetworkEndpointProfile(
@@ -717,6 +765,15 @@ class TestSnapshot:
                 environment_fingerprint_id(environment),
                 environment=environment,
             )
+            record = replace(
+                record,
+                quality=MeasurementQuality(
+                    stationary=True,
+                    drift_ratio=0.01,
+                    coefficient_of_variation=0.02,
+                    eligible_for_calibration=True,
+                ),
+            )
             open_store.append_measurement(record)
             snapshot = open_store.build_snapshot("snap-contained", created_at=NOW)
 
@@ -729,6 +786,10 @@ class TestSnapshot:
         assert snapshot.network_endpoints == (endpoint,)
         assert snapshot.network_paths[0].pair == pair
         assert snapshot.measurements == (record,)
+        assert snapshot.measurements[0].environment is not None
+        assert snapshot.measurements[0].environment.performance_state is not None
+        assert snapshot.measurements[0].quality is not None
+        assert snapshot.measurements[0].quality.stationary is True
 
 
 class TestDurability:
@@ -758,9 +819,9 @@ class TestDurability:
             assert stored_experiment is not None
             assert stored_experiment.state is ExperimentState.RUNNING
             assert second.get_measurement("m-1") is not None
-            assert second.measured_operator_signature_ids_for_environment(
-                environment
-            ) == frozenset({operator_signature_id(OP_SIG)})
+            assert second.measured_operator_signature_ids_for_environment(environment) == frozenset(
+                {operator_signature_id(OP_SIG)}
+            )
 
     def test_typed_case_failure_survives_master_restart(self, tmp_path: Path) -> None:
         path = tmp_path / "failure.db"

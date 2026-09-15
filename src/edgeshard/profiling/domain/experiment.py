@@ -63,6 +63,7 @@ class ProfilingErrorCategory(StrEnum):
     IPERF_UNAVAILABLE = "iperf_unavailable"
     TIMEOUT = "timeout"
     CANCELLED = "cancelled"
+    UNSTABLE_PERFORMANCE_STATE = "unstable_performance_state"
     INTERNAL_ERROR = "internal_error"
 
 

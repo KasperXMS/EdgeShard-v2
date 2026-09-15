@@ -34,7 +34,7 @@ from edgeshard.control.worker.identity import (
     derive_cpu_device_id,
     derive_jetson_gpu_device_id,
 )
-from edgeshard.control.worker.telemetry.base import StateFragment
+from edgeshard.control.worker.telemetry.base import FreshDeviceTelemetry, StateFragment
 
 logger = logging.getLogger("worker.telemetry.jetson")
 
@@ -42,6 +42,12 @@ logger = logging.getLogger("worker.telemetry.jetson")
 _TEGRAMARKERS = ("RAM ", "GR3D_FREQ", "CPU [")
 
 _GR3D_RE = re.compile(r"GR3D_FREQ\s+(\d+(?:\.\d+)?)\s*%")
+_GR3D_CLOCK_RE = re.compile(
+    r"GR3D_FREQ\s+\d+(?:\.\d+)?\s*%\s*@(?:\[(\d+(?:\.\d+)?)\]|(\d+(?:\.\d+)?))"
+)
+_EMC_CLOCK_RE = re.compile(
+    r"EMC_FREQ\s+\d+(?:\.\d+)?\s*%\s*@(?:\[(\d+(?:\.\d+)?)\]|(\d+(?:\.\d+)?))"
+)
 _ZONE_RE = re.compile(r"\b([A-Za-z][A-Za-z0-9_]*)@(\d+(?:\.\d+)?)C\b")
 _RAM_RE = re.compile(r"RAM\s+(\d+)/(\d+)MB")
 _POWER_RAIL_RE = re.compile(
@@ -62,6 +68,8 @@ class TegrastatsSample:
     gpu_utilization: float | None = None
     gpu_temperature_c: float | None = None
     gpu_power_w: float | None = None
+    gpu_clock_mhz: float | None = None
+    emc_clock_mhz: float | None = None
     cpu_temperature_c: float | None = None
     ram_used_bytes: int | None = None
     ram_total_bytes: int | None = None
@@ -82,16 +90,27 @@ class TegrastatsParser:
             zones.setdefault(name.upper(), float(value))
 
         gr3d = _GR3D_RE.search(stripped)
+        gr3d_clock = _GR3D_CLOCK_RE.search(stripped)
+        emc_clock = _EMC_CLOCK_RE.search(stripped)
         ram = _RAM_RE.search(stripped)
 
         return TegrastatsSample(
             gpu_utilization=float(gr3d.group(1)) if gr3d else None,
             gpu_temperature_c=zones.get("GPU"),
             gpu_power_w=self._gpu_power(stripped),
+            gpu_clock_mhz=self._clock(gr3d_clock),
+            emc_clock_mhz=self._clock(emc_clock),
             cpu_temperature_c=self._cpu_temperature(zones),
             ram_used_bytes=int(ram.group(1)) * 1024 * 1024 if ram else None,
             ram_total_bytes=int(ram.group(2)) * 1024 * 1024 if ram else None,
         )
+
+    @staticmethod
+    def _clock(match: re.Match[str] | None) -> float | None:
+        if match is None:
+            return None
+        value = match.group(1) or match.group(2)
+        return float(value)
 
     @staticmethod
     def _gpu_power(line: str) -> float | None:
@@ -236,13 +255,28 @@ class JetsonTelemetryBackend:
         sample = self._tegrastats.latest
         if sample is None:
             await self._tegrastats.wait_first(self._first_sample_timeout_s)
-        return await asyncio.to_thread(
-            self._sample_blocking, self._cpu_sample_interval_s
-        )
+        return await asyncio.to_thread(self._sample_blocking, self._cpu_sample_interval_s)
 
     def sample_fresh(self) -> StateFragment:
         """Read fresh physical state without restarting ``tegrastats``."""
         return self._sample_blocking(None)
+
+    def sample_fresh_device(self, device_id: str) -> FreshDeviceTelemetry | None:
+        """Latest cached tegrastats GPU sample; never starts a subprocess."""
+        if device_id != self._gpu_device_id:
+            return None
+        with self._sample_lock:
+            sample = self._tegrastats.latest
+        if sample is None:
+            return None
+        return FreshDeviceTelemetry(
+            device_id=device_id,
+            utilization=sample.gpu_utilization,
+            temperature_c=sample.gpu_temperature_c,
+            power_w=sample.gpu_power_w,
+            clock_mhz=sample.gpu_clock_mhz,
+            emc_clock_mhz=sample.emc_clock_mhz,
+        )
 
     def _sample_blocking(self, cpu_interval_s: float | None) -> StateFragment:
         with self._sample_lock:

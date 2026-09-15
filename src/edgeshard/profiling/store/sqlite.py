@@ -778,6 +778,11 @@ class SqliteProfileStore:
         for record in self.query_measurements(
             environment_fingerprint_id=compatibility_id
         ):
+            if (
+                record.quality is not None
+                and not record.quality.eligible_for_calibration
+            ):
+                continue
             environment = record.environment
             if environment is None:
                 continue

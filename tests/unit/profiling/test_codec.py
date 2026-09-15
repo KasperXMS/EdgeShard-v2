@@ -472,6 +472,22 @@ class TestRoundTrips:
             == performance_class
         )
 
+    def test_additive_defaults_decode_legacy_payloads(self) -> None:
+        fingerprint = EnvironmentFingerprint(
+            backend="torch", profiling_implementation_revision="r1"
+        )
+        fingerprint_payload = json.loads(encode_json(fingerprint))
+        del fingerprint_payload["performance_state"]
+        assert decode_json(
+            EnvironmentFingerprint, json.dumps(fingerprint_payload)
+        ) == fingerprint
+
+        record_payload = json.loads(encode_json(LATENCY_RECORD))
+        del record_payload["quality"]
+        assert decode_json(
+            MeasurementRecord, json.dumps(record_payload)
+        ) == LATENCY_RECORD
+
     def test_session_types(self) -> None:
         request = ProfilingSessionRequest(
             kind=ProfilingSessionKind.MODEL,

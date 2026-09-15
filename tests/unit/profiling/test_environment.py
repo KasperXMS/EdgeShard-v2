@@ -8,10 +8,12 @@ from edgeshard.profiling.domain.environment import (
     DevicePerformanceClass,
     EnvironmentFingerprint,
     MemoryModel,
+    PerformanceState,
     device_performance_class_id,
     environment_fingerprint_id,
 )
 from edgeshard.profiling.domain.hashing import normalized_items
+from edgeshard.profiling.domain.measurement import TelemetrySample
 
 GOLDEN_CLASS_ID = "7ed7b70ac1723246b6d1f0f07e0373ff2a206d7452ae6de0b6234750db8468dd"
 GOLDEN_FINGERPRINT_ID = "b16df46175f42d2c72c008f211820be0cc36082dc29df2791abf4b0fdb64ce49"
@@ -98,13 +100,75 @@ def test_fingerprint_id_includes_compatibility_context() -> None:
     assert baseline != environment_fingerprint_id(_fingerprint(torch_version="2.7.0"))
     # Host-wide discovery revisions include unrelated NIC/container facts and
     # are provenance, not device performance compatibility.
-    assert baseline == environment_fingerprint_id(
-        _fingerprint(capability_revision="rev-2")
-    )
+    assert baseline == environment_fingerprint_id(_fingerprint(capability_revision="rev-2"))
     assert baseline != environment_fingerprint_id(
         _fingerprint(profiling_implementation_revision="0.2.0")
     )
     assert baseline != environment_fingerprint_id(_fingerprint(dtype="fp16"))
+
+
+def test_operating_policy_changes_environment_but_not_performance_class() -> None:
+    dynamic = PerformanceState(
+        power_mode="MODE_30W",
+        cpu_min_mhz=729,
+        cpu_max_mhz=1728,
+        gpu_min_mhz=306,
+        gpu_max_mhz=612,
+        emc_min_mhz=204,
+        emc_max_mhz=3199,
+        cpu_locked=False,
+        gpu_locked=False,
+        emc_locked=False,
+    )
+    locked = PerformanceState(
+        power_mode="MODE_30W",
+        cpu_min_mhz=1728,
+        cpu_max_mhz=1728,
+        gpu_min_mhz=612,
+        gpu_max_mhz=612,
+        emc_min_mhz=3199,
+        emc_max_mhz=3199,
+        cpu_locked=True,
+        gpu_locked=True,
+        emc_locked=True,
+    )
+    performance_class = _rtx4090_class(
+        accelerator_model="agx-orin-64gb",
+        memory_model=MemoryModel.SHARED,
+        architecture="8.7",
+    )
+    class_id = device_performance_class_id(performance_class)
+    dynamic_environment = _fingerprint(
+        device_performance_class_id=class_id,
+        device_performance_class=performance_class,
+        performance_state=dynamic,
+    )
+    locked_environment = _fingerprint(
+        device_performance_class_id=class_id,
+        device_performance_class=performance_class,
+        performance_state=locked,
+    )
+    assert dynamic_environment.device_performance_class_id == (
+        locked_environment.device_performance_class_id
+    )
+    assert environment_fingerprint_id(dynamic_environment) != environment_fingerprint_id(
+        locked_environment
+    )
+
+
+def test_instantaneous_clock_is_not_part_of_environment_identity() -> None:
+    state = PerformanceState(
+        power_mode="MODE_30W",
+        gpu_min_mhz=306,
+        gpu_max_mhz=612,
+        gpu_locked=False,
+    )
+    slow = TelemetrySample(device_id="gpu-system", clock_mhz=306.0)
+    fast = TelemetrySample(device_id="gpu-system", clock_mhz=612.0)
+    assert slow != fast
+    first = _fingerprint(performance_state=state)
+    second = _fingerprint(performance_state=state)
+    assert environment_fingerprint_id(first) == environment_fingerprint_id(second)
 
 
 def test_fingerprint_validation() -> None:

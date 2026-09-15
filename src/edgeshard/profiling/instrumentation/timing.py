@@ -51,6 +51,8 @@ class WallClockTimer:
     primary GPU latency mechanism.
     """
 
+    stationarity_reliable = False
+
     def __init__(self) -> None:
         self._start_ns: int | None = None
 
@@ -86,6 +88,8 @@ class CudaEventTimer:
     unavailable — a GPU benchmark on a CPU-only host is a configuration
     error, not a silently degraded measurement.
     """
+
+    stationarity_reliable = True
 
     def __init__(
         self,

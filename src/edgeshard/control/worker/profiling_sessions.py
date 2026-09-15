@@ -35,6 +35,8 @@ from datetime import UTC, datetime
 
 from edgeshard.cluster.capability import WorkerCapability
 from edgeshard.cluster.state import WorkerState
+from edgeshard.control.worker.telemetry.base import FreshDeviceTelemetry
+from edgeshard.profiling.domain.environment import PerformanceState
 from edgeshard.profiling.domain.experiment import (
     CaseOutcome,
     CaseState,
@@ -115,6 +117,10 @@ class ProfilingSessionRecord:
     capability: WorkerCapability | None = None
     worker_state: WorkerState | None = None
     worker_state_source: Callable[[], WorkerState | None] | None = None
+    device_telemetry_source: (
+        Callable[[str], FreshDeviceTelemetry | None] | None
+    ) = None
+    performance_state: PerformanceState | None = None
     session_facts: ModelSessionFacts | None = None
     network_facts: Mapping[str, WorkerNetworkFacts] = field(default_factory=dict)
     model_handle: object | None = None
@@ -218,6 +224,10 @@ class ProfilingSessionManager:
         capability: WorkerCapability | None = None,
         worker_state: WorkerState | None = None,
         worker_state_source: Callable[[], WorkerState | None] | None = None,
+        device_telemetry_source: (
+            Callable[[str], FreshDeviceTelemetry | None] | None
+        ) = None,
+        performance_state: PerformanceState | None = None,
         session_facts: ModelSessionFacts | None = None,
         network_facts: Mapping[str, WorkerNetworkFacts] | None = None,
         model_handle: object | None = None,
@@ -234,6 +244,8 @@ class ProfilingSessionManager:
             capability=capability,
             worker_state=worker_state,
             worker_state_source=worker_state_source,
+            device_telemetry_source=device_telemetry_source,
+            performance_state=performance_state,
             session_facts=session_facts,
             network_facts=dict(network_facts or {}),
             model_handle=model_handle,

@@ -119,6 +119,7 @@ def test_error_category_vocabulary_matches_spec() -> None:
         "iperf_unavailable",
         "timeout",
         "cancelled",
+        "unstable_performance_state",
         "internal_error",
     }
 

@@ -119,5 +119,6 @@ def measurement_record_from_result(
             physical_memory=result.physical_memory,
             telemetry=result.telemetry,
         ),
+        quality=result.quality,
         metadata=MeasurementRecord.normalize_metadata(dict(metadata) if metadata else None),
     )

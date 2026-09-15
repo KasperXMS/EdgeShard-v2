@@ -229,6 +229,13 @@ def _decode_dataclass(hint: type, payload: object, path: str) -> Any:
     kwargs: dict[str, Any] = {}
     for field in dataclasses.fields(hint):
         if field.name not in payload:
+            # Additive defaulted fields keep append-only SQLite payloads
+            # readable while required fields remain strict.
+            if (
+                field.default is not dataclasses.MISSING
+                or field.default_factory is not dataclasses.MISSING
+            ):
+                continue
             raise PayloadCodecError(f"{path}: missing field {field.name!r} for {hint.__name__}")
         kwargs[field.name] = _decode(
             hints[field.name], payload[field.name], f"{path}.{field.name}"
