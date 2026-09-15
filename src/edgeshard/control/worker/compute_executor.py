@@ -66,6 +66,7 @@ _PENDING_FINGERPRINT = "compute-executor-pending"
 _TARGET_DEVICE_ENV = "EDGESHARD_PROFILING_TARGET_DEVICE_ID"
 _EXECUTION_DEVICE_ENV = "EDGESHARD_PROFILING_EXECUTION_DEVICE"
 _BACKEND_REVISION_ENV = "EDGESHARD_PROFILING_BACKEND_REVISION"
+_MAX_CONTAINER_FAILURE_LOG_CHARS = 4_096
 
 
 @dataclass(frozen=True)
@@ -529,7 +530,7 @@ class ContainerComputeProfilingExecutor:
             container = docker_client.containers.run(image_revision, **kwargs)
             endpoint = _published_endpoint(container)
             client = self._client_factory(endpoint, self._request_timeout_s)
-            self._wait_ready(client)
+            self._wait_ready(client, container)
             container_source = self._container_source(source)
             facts, observed = client.prepare(
                 session_id, worker_id, request, container_source
@@ -588,7 +589,7 @@ class ContainerComputeProfilingExecutor:
         if isinstance(state, _ContainerSessionState):
             _cleanup_container(state.container, state.client, request_close=True)
 
-    def _wait_ready(self, client: ComputeServiceClient) -> None:
+    def _wait_ready(self, client: ComputeServiceClient, container: Any) -> None:
         deadline = time.monotonic() + self._ready_timeout_s
         last_error: Exception | None = None
         while time.monotonic() <= deadline:
@@ -597,6 +598,9 @@ class ContainerComputeProfilingExecutor:
                 return
             except Exception as exc:
                 last_error = exc
+                exited = _container_exit_failure(container)
+                if exited is not None:
+                    raise exited from exc
                 time.sleep(self._poll_interval_s)
         raise ProfilingError(
             ProfilingErrorCategory.TIMEOUT,
@@ -721,6 +725,52 @@ def _published_endpoint(container: Any) -> str:
     if not bindings:
         raise RuntimeError("container compute port was not published")
     return f"127.0.0.1:{int(bindings[0]['HostPort'])}"
+
+
+def _container_exit_failure(container: Any) -> ProfilingError | None:
+    """Return a diagnostic failure when Docker reports a dead service."""
+    try:
+        container.reload()
+    except Exception:
+        # A transient status-read failure is not evidence that the container
+        # died; preserve the normal readiness timeout and its health error.
+        return None
+    raw_state = container.attrs.get("State", {})
+    state = raw_state if isinstance(raw_state, Mapping) else {}
+    status = str(state.get("Status") or getattr(container, "status", ""))
+    if status not in {"dead", "exited"}:
+        return None
+    raw_exit_code = state.get("ExitCode")
+    exit_code = raw_exit_code if isinstance(raw_exit_code, int) else "unknown"
+    logs = _bounded_container_logs(container)
+    details: dict[str, str | int] = {
+        "container_status": status,
+        "exit_code": exit_code,
+        "container_logs": logs,
+    }
+    return ProfilingError(
+        ProfilingErrorCategory.INTERNAL_ERROR,
+        "container compute service exited before readiness "
+        f"(status={status}, exit_code={exit_code}); logs: {logs or '<empty>'}",
+        details,
+    )
+
+
+def _bounded_container_logs(container: Any) -> str:
+    try:
+        raw = container.logs(stdout=True, stderr=True, tail=100)
+    except Exception as exc:
+        raw = f"<unavailable: {exc}>"
+    rendered = (
+        raw.decode("utf-8", errors="replace")
+        if isinstance(raw, bytes)
+        else str(raw)
+    )
+    rendered = rendered.strip()
+    if len(rendered) <= _MAX_CONTAINER_FAILURE_LOG_CHARS:
+        return rendered
+    suffix = "... <truncated>"
+    return rendered[: _MAX_CONTAINER_FAILURE_LOG_CHARS - len(suffix)] + suffix
 
 
 def _cleanup_container(

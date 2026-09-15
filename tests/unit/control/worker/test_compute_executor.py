@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -129,7 +130,9 @@ class FakeImages:
 class FakeContainer:
     def __init__(self) -> None:
         self.id = "container-1"
+        self.status = "running"
         self.attrs = {
+            "State": {"Status": "running", "ExitCode": 0},
             "NetworkSettings": {
                 "Ports": {
                     f"{CONTAINER_COMPUTE_PORT}/tcp": [
@@ -141,6 +144,8 @@ class FakeContainer:
         self.reloaded = False
         self.stop_timeout: int | None = None
         self.removed = False
+        self.logs_payload = b""
+        self.logs_calls = 0
 
     def reload(self) -> None:
         self.reloaded = True
@@ -150,6 +155,10 @@ class FakeContainer:
 
     def remove(self) -> None:
         self.removed = True
+
+    def logs(self, **kwargs: object) -> bytes:
+        self.logs_calls += 1
+        return self.logs_payload
 
 
 class FakeContainers:
@@ -174,6 +183,7 @@ class FakeServiceClient:
         self,
         environment: ComputeExecutionEnvironment | None = None,
         error: ProfilingError | None = None,
+        health_error: Exception | None = None,
     ) -> None:
         self.environment = environment or ComputeExecutionEnvironment(
             torch_version="2.13.0+cu126",
@@ -183,6 +193,7 @@ class FakeServiceClient:
             execution_device="cuda:0",
         )
         self.error = error
+        self.health_error = health_error
         self.health_calls = 0
         self.prepare_calls: list[tuple[object, ...]] = []
         self.profile_calls: list[ProfilingCase] = []
@@ -191,6 +202,8 @@ class FakeServiceClient:
 
     def health(self) -> None:
         self.health_calls += 1
+        if self.health_error is not None:
+            raise self.health_error
 
     def prepare(self, *args: object):
         self.prepare_calls.append(args)
@@ -215,11 +228,13 @@ def make_executor(
     tmp_path: Path,
     docker_client: FakeDockerClient,
     service_client: FakeServiceClient,
+    *,
+    ready_timeout_s: float = 0.1,
 ) -> ContainerComputeProfilingExecutor:
     return ContainerComputeProfilingExecutor(
         docker_client_factory=lambda: docker_client,
         model_store=ModelStore(tmp_path / "models"),
-        ready_timeout_s=0.1,
+        ready_timeout_s=ready_timeout_s,
         poll_interval_s=0.001,
         client_factory=lambda endpoint, timeout: service_client,
     )
@@ -309,6 +324,54 @@ def test_prepare_failure_propagates_typed_error_and_cleans_up(tmp_path: Path) ->
     assert str(raised.value) == "container export failed"
     assert service_client.client_closed
     assert docker_client.container.removed
+
+
+def test_container_exit_before_readiness_fails_fast_with_logs_and_cleanup(
+    tmp_path: Path,
+) -> None:
+    docker_client = FakeDockerClient()
+    container = docker_client.container
+    container.status = "exited"
+    container.attrs["State"] = {"Status": "exited", "ExitCode": 1}
+    container.logs_payload = (
+        b"Traceback (most recent call last):\n"
+        b"ModuleNotFoundError: No module named 'accelerate'\n"
+        + b"x" * 10_000
+    )
+    service_client = FakeServiceClient(
+        health_error=ConnectionRefusedError("connection refused")
+    )
+    executor = make_executor(
+        tmp_path,
+        docker_client,
+        service_client,
+        ready_timeout_s=120.0,
+    )
+
+    started = time.monotonic()
+    with pytest.raises(ProfilingError) as raised:
+        executor.prepare_session(
+            "session-1", WORKER_ID, SESSION_REQUEST, None, gpu_capability()
+        )
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 1.0
+    assert raised.value.category is ProfilingErrorCategory.INTERNAL_ERROR
+    assert "status=exited" in str(raised.value)
+    assert "exit_code=1" in str(raised.value)
+    assert "No module named 'accelerate'" in str(raised.value)
+    details = dict(raised.value.details)
+    assert details["container_status"] == "exited"
+    assert details["exit_code"] == 1
+    captured_logs = details["container_logs"]
+    assert isinstance(captured_logs, str)
+    assert len(captured_logs) == 4_096
+    assert captured_logs.endswith("... <truncated>")
+    assert service_client.health_calls == 1
+    assert service_client.client_closed
+    assert container.logs_calls == 1
+    assert container.stop_timeout == 10
+    assert container.removed
 
 
 def test_profile_failure_propagates_without_premature_session_cleanup(
