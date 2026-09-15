@@ -14,6 +14,7 @@ import yaml
 from typer.testing import CliRunner
 
 from edgeshard.cli import app
+from edgeshard.control.worker.config import WorkerConfig
 
 runner = CliRunner()
 
@@ -185,14 +186,146 @@ def test_master_serve_unsafe_thresholds_exit_nonzero(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_profiling_advertise_host_normalizes_wildcards() -> None:
-    """A wildcard bind is not dialable; the Master must receive loopback."""
+def test_profiling_advertise_host_uses_concrete_bind_host() -> None:
     from edgeshard.cli import _profiling_advertise_host
 
-    assert _profiling_advertise_host("0.0.0.0") == "127.0.0.1"
-    assert _profiling_advertise_host("::") == "127.0.0.1"
-    assert _profiling_advertise_host("") == "127.0.0.1"
-    assert _profiling_advertise_host("10.0.0.5") == "10.0.0.5"
+    assert _profiling_advertise_host("192.168.0.12") == "192.168.0.12"
+
+
+def test_profiling_advertise_host_overrides_wildcard_bind() -> None:
+    from edgeshard.cli import _profiling_advertise_host
+
+    assert (
+        _profiling_advertise_host("0.0.0.0", "192.168.0.12")
+        == "192.168.0.12"
+    )
+
+
+@pytest.mark.parametrize("wildcard", ["0.0.0.0", "::", ""])
+def test_profiling_wildcard_without_advertise_host_fails(wildcard: str) -> None:
+    from edgeshard.cli import _profiling_advertise_host
+
+    with pytest.raises(ValueError, match="advertise_host is required"):
+        _profiling_advertise_host(wildcard)
+
+
+def test_profiling_endpoint_uses_actual_bound_port() -> None:
+    from edgeshard.cli import _worker_profiling_endpoint
+
+    assert (
+        _worker_profiling_endpoint("0.0.0.0", "192.168.0.12", 49_321)
+        == "192.168.0.12:49321"
+    )
+
+
+async def test_profiling_disabled_keeps_plain_phase1_agent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from edgeshard.cli import _worker_serve
+
+    calls: list[WorkerConfig] = []
+
+    class FakeWorkerAgent:
+        def __init__(self, config: WorkerConfig) -> None:
+            calls.append(config)
+
+        async def run(self) -> None:
+            pass
+
+    monkeypatch.setattr("edgeshard.cli.WorkerAgent", FakeWorkerAgent)
+    config = WorkerConfig()
+
+    await _worker_serve(config)
+
+    assert calls == [config]
+
+
+async def test_worker_serve_binds_wildcard_and_advertises_dialable_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from edgeshard.cli import _worker_serve
+
+    events: dict[str, object] = {}
+
+    class FakeInspector:
+        def __init__(self, config: WorkerConfig) -> None:
+            events["inspector_config"] = config
+
+        def require_docker_client(self) -> object:
+            return object()
+
+    class FakeExecutor:
+        def __init__(self, **kwargs: object) -> None:
+            events["executor_kwargs"] = kwargs
+
+    class FakeRunner:
+        def __init__(self, **kwargs: object) -> None:
+            events["runner_kwargs"] = kwargs
+
+        async def shutdown(self) -> None:
+            events["runner_stopped"] = True
+
+    class FakeServer:
+        async def stop(self, grace: object) -> None:
+            events["server_stopped"] = grace
+
+    class FakeWorkerAgent:
+        worker_id = "worker-12"
+        instance_id = "instance-12"
+        registration_session_id = "registration-12"
+
+        def __init__(
+            self,
+            config: WorkerConfig,
+            *,
+            inspector: object,
+            profiling_endpoint: str,
+        ) -> None:
+            events["agent_config"] = config
+            events["agent_inspector"] = inspector
+            events["profiling_endpoint"] = profiling_endpoint
+
+        async def run(self) -> None:
+            events["agent_ran"] = True
+
+    async def fake_start_profiling_server(
+        runner: object, *, host: str, port: int
+    ) -> tuple[FakeServer, int]:
+        events["server_runner"] = runner
+        events["bind"] = (host, port)
+        return FakeServer(), 49_321
+
+    monkeypatch.setattr("edgeshard.cli.LocalWorkerInspector", FakeInspector)
+    monkeypatch.setattr("edgeshard.cli.WorkerAgent", FakeWorkerAgent)
+    monkeypatch.setattr(
+        "edgeshard.cli.start_profiling_server", fake_start_profiling_server
+    )
+    monkeypatch.setattr(
+        "edgeshard.control.worker.compute_executor.ContainerComputeProfilingExecutor",
+        FakeExecutor,
+    )
+    monkeypatch.setattr(
+        "edgeshard.control.worker.profiling_runner.WorkerProfilingRunner",
+        FakeRunner,
+    )
+    config = WorkerConfig.model_validate(
+        {
+            "profiling": {
+                "enabled": True,
+                "host": "0.0.0.0",
+                "port": 0,
+                "advertise_host": "192.168.0.12",
+            }
+        }
+    )
+
+    await _worker_serve(config)
+
+    assert events["bind"] == ("0.0.0.0", 0)
+    assert events["profiling_endpoint"] == "192.168.0.12:49321"
+    assert events["agent_ran"] is True
+    assert events["runner_stopped"] is True
+    assert "server_stopped" in events
 
 
 def test_worker_serve_profiling_enabled_without_master_exits_nonzero(
@@ -202,7 +335,14 @@ def test_worker_serve_profiling_enabled_without_master_exits_nonzero(
     constructed; the missing master endpoint still fails loudly (§26/§47),
     and the command exits instead of serving a half-wired Worker."""
     config = write_worker_config(
-        tmp_path, extra={"profiling": {"enabled": True, "port": 0}}
+        tmp_path,
+        extra={
+            "profiling": {
+                "enabled": True,
+                "host": "127.0.0.1",
+                "port": 0,
+            }
+        },
     )
     result = runner.invoke(app, ["worker", "serve", "--config", str(config)])
     assert result.exit_code == 1

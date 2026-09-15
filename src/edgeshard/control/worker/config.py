@@ -144,6 +144,7 @@ class RuntimeSection(BaseModel):
 
 DEFAULT_PROFILING_HOST = "0.0.0.0"
 DEFAULT_PROFILING_PORT = 51_100
+WILDCARD_PROFILING_HOSTS = frozenset({"0.0.0.0", "::"})
 """Listen defaults for the Worker-hosted ``WorkerProfilingService`` (Phase 2
 spec §41). Port 0 (OS-chosen) is allowed: ``worker serve`` advertises the
 *bound* endpoint at registration, so tests and busy hosts never collide."""
@@ -154,9 +155,9 @@ class ProfilingSection(BaseModel):
 
     Additive: ``enabled=false`` (the default) keeps exact Phase 1 behavior —
     no profiling server is started and registration advertises no endpoint.
-    This section declares *intent* (listen host/port); the endpoint actually
-    advertised to the Master is the resolved ``host:bound_port`` computed by
-    ``worker serve`` after the server starts.
+    ``host``/``port`` are listen settings. ``advertise_host`` is the dialable
+    address registered with the Master; it is required when an enabled
+    service listens on a wildcard address.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -164,6 +165,7 @@ class ProfilingSection(BaseModel):
     enabled: bool = False
     host: str = DEFAULT_PROFILING_HOST
     port: int = DEFAULT_PROFILING_PORT
+    advertise_host: str | None = None
 
     @model_validator(mode="after")
     def _check_listen(self) -> ProfilingSection:
@@ -171,6 +173,24 @@ class ProfilingSection(BaseModel):
             raise ValueError("profiling host must be non-empty")
         if not 0 <= self.port <= 65_535:
             raise ValueError(f"profiling port out of range: {self.port}")
+        if self.advertise_host is not None:
+            if not self.advertise_host.strip():
+                raise ValueError("profiling advertise_host must be non-empty")
+            if self.advertise_host in WILDCARD_PROFILING_HOSTS:
+                raise ValueError(
+                    "profiling advertise_host must be a dialable IP address "
+                    "or hostname, not a wildcard"
+                )
+        if (
+            self.enabled
+            and self.host in WILDCARD_PROFILING_HOSTS
+            and self.advertise_host is None
+        ):
+            raise ValueError(
+                "profiling.advertise_host is required when profiling is enabled "
+                "with wildcard host; set the Worker IP/hostname reachable by "
+                "the Master"
+            )
         return self
 
 

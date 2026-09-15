@@ -26,12 +26,13 @@ runtime:
 
 # Phase 2 (additive): host the WorkerProfilingService and advertise its
 # *bound* endpoint at registration. `enabled: false` keeps exact Phase 1
-# behavior. `port: 0` lets the OS choose; `worker serve` reports the bound
-# port in its READY line and registers `host:bound_port` with the Master.
+# behavior. `port: 0` lets the OS choose. A wildcard listener requires an
+# explicit address or hostname that the Master can dial.
 profiling:
   enabled: false
   host: 0.0.0.0
   port: 51100
+  # advertise_host: 192.168.0.12
 
 tls:
   enabled: false

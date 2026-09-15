@@ -254,13 +254,32 @@ def worker_serve(config: WorkerConfigPath) -> None:
 _WILDCARD_BIND_HOSTS = frozenset({"", "0.0.0.0", "::"})
 
 
-def _profiling_advertise_host(bind_host: str) -> str:
-    """A dialable host for the advertised endpoint (mirrors §19 inventory).
+def _profiling_advertise_host(
+    bind_host: str, advertise_host: str | None = None
+) -> str:
+    """Resolve the Worker's dialable host independently of its bind host.
 
     A wildcard bind accepts on every interface but is not itself dialable;
-    the Master must receive an address it can actually connect to, so
-    wildcards advertise loopback — the single-host default topology.
+    without an explicit address reachable by the Master, advertising either
+    the wildcard or this process's loopback would misroute a multi-host RPC.
     """
+    resolved = advertise_host if advertise_host is not None else bind_host
+    if resolved in _WILDCARD_BIND_HOSTS:
+        raise ValueError(
+            "profiling.advertise_host is required for a wildcard profiling host"
+        )
+    return resolved
+
+
+def _worker_profiling_endpoint(
+    bind_host: str, advertise_host: str | None, bound_port: int
+) -> str:
+    """Build the registered endpoint with the server's actual bound port."""
+    return f"{_profiling_advertise_host(bind_host, advertise_host)}:{bound_port}"
+
+
+def _local_advertise_host(bind_host: str) -> str:
+    """Preserve the existing single-host display for the Master admin plane."""
     return "127.0.0.1" if bind_host in _WILDCARD_BIND_HOSTS else bind_host
 
 
@@ -322,8 +341,15 @@ async def _worker_serve(config: WorkerConfig) -> None:
     server, port = await start_profiling_server(
         runner, host=config.profiling.host, port=config.profiling.port
     )
-    endpoint = f"{_profiling_advertise_host(config.profiling.host)}:{port}"
-    logger.info("profiling service listening, advertising %s", endpoint)
+    endpoint = _worker_profiling_endpoint(
+        config.profiling.host, config.profiling.advertise_host, port
+    )
+    logger.info(
+        "profiling service listening, advertising %s (bound on %s:%d)",
+        endpoint,
+        config.profiling.host,
+        port,
+    )
     try:
         # Constructed inside the try: a config the Agent rejects (e.g. a
         # missing master endpoint) must still stop the bound server and
@@ -416,7 +442,7 @@ async def _master_serve(
             host=serve_config.profiling.admin_host,
             port=serve_config.profiling.admin_port,
         )
-        advertise = _profiling_advertise_host(serve_config.profiling.admin_host)
+        advertise = _local_advertise_host(serve_config.profiling.admin_host)
         print(f"READY profiling-admin endpoint={advertise}:{admin_port}", flush=True)
     try:
         await server.wait_for_termination()

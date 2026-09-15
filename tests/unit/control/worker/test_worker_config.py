@@ -206,6 +206,7 @@ def test_profiling_defaults_disabled_with_listen_defaults() -> None:
     assert config.profiling.enabled is False
     assert config.profiling.host == DEFAULT_PROFILING_HOST
     assert config.profiling.port == DEFAULT_PROFILING_PORT
+    assert config.profiling.advertise_host is None
     # The spec example carries no profiling section and still parses.
     assert WorkerConfig.model_validate(yaml.safe_load(SPEC_EXAMPLE)).profiling.enabled is False
 
@@ -217,6 +218,43 @@ def test_profiling_section_parses() -> None:
     assert config.profiling.enabled is True
     assert config.profiling.host == "127.0.0.1"
     assert config.profiling.port == 0
+    assert config.profiling.advertise_host is None
+
+
+def test_profiling_wildcard_bind_parses_with_dialable_advertise_host() -> None:
+    config = WorkerConfig.model_validate(
+        {
+            "profiling": {
+                "enabled": True,
+                "host": "0.0.0.0",
+                "port": 0,
+                "advertise_host": "192.168.0.12",
+            }
+        }
+    )
+    assert config.profiling.host == "0.0.0.0"
+    assert config.profiling.advertise_host == "192.168.0.12"
+
+
+def test_enabled_profiling_wildcard_requires_advertise_host() -> None:
+    with pytest.raises(ValidationError, match="advertise_host is required"):
+        WorkerConfig.model_validate(
+            {"profiling": {"enabled": True, "host": "0.0.0.0"}}
+        )
+
+
+@pytest.mark.parametrize("advertise_host", ["", " ", "0.0.0.0", "::"])
+def test_profiling_advertise_host_must_be_dialable(advertise_host: str) -> None:
+    with pytest.raises(ValidationError, match="advertise_host"):
+        WorkerConfig.model_validate(
+            {
+                "profiling": {
+                    "enabled": True,
+                    "host": "127.0.0.1",
+                    "advertise_host": advertise_host,
+                }
+            }
+        )
 
 
 def test_profiling_port_zero_allowed_for_os_chosen_bind() -> None:
