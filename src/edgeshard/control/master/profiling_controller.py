@@ -70,7 +70,10 @@ from edgeshard.profiling.domain.session import (
     ProfilingSessionRequest,
     profiling_session_id,
 )
-from edgeshard.profiling.domain.signature import ProfilingGranularity
+from edgeshard.profiling.domain.signature import (
+    ProfilingGranularity,
+    operator_signature_id,
+)
 from edgeshard.profiling.domain.snapshot import ProfileSnapshot
 from edgeshard.profiling.network.classifier import (
     ClassifiedPair,
@@ -979,16 +982,25 @@ class ProfilingController:
             logger.warning(
                 "cannot dispatch to worker %s: %s", worker_id, resolved.message
             )
-            return tuple(
+            failure_reports = tuple(
                 self._record_failure(case, resolved, "not dispatched")
                 for case in cases
             )
+            for case, report in zip(cases, failure_reports, strict=True):
+                self._log_case_outcome(experiment.experiment_id, case, report)
+            return failure_reports
         transport = self._transport_factory(resolved.endpoint)
         try:
             reports: list[CaseReport] = []
             for plan in _plan_sessions(experiment.experiment_id, worker_id, cases):
                 reports.extend(
-                    await self._run_session(transport, resolved, plan, network_facts)
+                    await self._run_session(
+                        experiment.experiment_id,
+                        transport,
+                        resolved,
+                        plan,
+                        network_facts,
+                    )
                 )
             return tuple(reports)
         finally:
@@ -996,6 +1008,7 @@ class ProfilingController:
 
     async def _run_session(
         self,
+        experiment_id: str,
         transport: ProfilingTransport,
         tokens: _DispatchTokens,
         plan: _SessionPlan,
@@ -1009,21 +1022,31 @@ class ProfilingController:
                 cases, network_facts
             )
             reports.extend(fact_failures)
+            failed_cases = {case.case_id: case for case in plan.cases}
+            for report in fact_failures:
+                self._log_case_outcome(
+                    experiment_id, failed_cases[report.case_id], report
+                )
             if not cases:
                 return tuple(reports)
 
         try:
             prepared = await self._prepare(transport, tokens, plan, facts)
             if isinstance(prepared, ProfilingFailure):
-                reports.extend(
+                prepare_failures = tuple(
                     self._record_failure(case, prepared, "session prepare failed")
                     for case in cases
                 )
+                reports.extend(prepare_failures)
+                for case, report in zip(cases, prepare_failures, strict=True):
+                    self._log_case_outcome(experiment_id, case, report)
                 return tuple(reports)
             for case in cases:
-                reports.append(
-                    await self._run_case(transport, tokens, plan.session_id, case)
+                report = await self._run_case(
+                    transport, tokens, plan.session_id, case
                 )
+                reports.append(report)
+                self._log_case_outcome(experiment_id, case, report)
         finally:
             # §38: cleanup on every exit path — a failed run must not strand
             # the session's leases or model state on the Worker.
@@ -1674,6 +1697,58 @@ class ProfilingController:
             state=CaseState.CANCELLED,
             outcome=CaseOutcome.from_failure(failure),
             detail=detail,
+        )
+
+    @staticmethod
+    def _log_case_outcome(
+        experiment_id: str, case: ProfilingCase, report: CaseReport
+    ) -> None:
+        """Expose one transport-independent application outcome per case."""
+        outcome = report.outcome
+        record = outcome.record if outcome is not None else None
+        failure = outcome.failure if outcome is not None else None
+        metadata = record.metadata_mapping if record is not None else {}
+        details = dict(failure.details) if failure is not None else {}
+        quality = record.quality if record is not None else None
+        spec = case.spec
+        signature_id = (
+            operator_signature_id(spec.operator_signature)
+            if isinstance(spec, ModelCaseSpec)
+            and spec.operator_signature is not None
+            else None
+        )
+        actual_warmups = metadata.get(
+            "actual_warmup_runs", details.get("actual_warmup_runs")
+        )
+        warmup_converged = metadata.get(
+            "warmup_converged", details.get("warmup_converged")
+        )
+        stationary = (
+            quality.stationary
+            if quality is not None
+            else details.get("stationary")
+        )
+        drift_ratio = (
+            quality.drift_ratio
+            if quality is not None
+            else details.get("drift_ratio")
+        )
+        completed = report.state is CaseState.COMPLETED
+        logger.log(
+            logging.INFO if completed else logging.WARNING,
+            "profiling_case_outcome experiment_id=%s case_id=%s "
+            "operator_signature_id=%s outcome=%s failure_code=%s "
+            "actual_warmup_runs=%s warmup_converged=%s stationary=%s "
+            "drift_ratio=%s",
+            experiment_id,
+            case.case_id,
+            signature_id,
+            "completed" if completed else "failed",
+            failure.category.value if failure is not None else None,
+            actual_warmups,
+            warmup_converged,
+            stationary,
+            drift_ratio,
         )
 
     def _report_from_store(self, stored: StoredExperiment) -> ExperimentReport:

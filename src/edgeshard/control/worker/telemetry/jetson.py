@@ -25,6 +25,7 @@ import logging
 import re
 import threading
 from dataclasses import dataclass
+from pathlib import Path
 
 import psutil
 
@@ -59,6 +60,17 @@ current/average pair ``VDD_X 18792mW/5552mW`` (first value = current)."""
 _GPU_POWER_RAILS = ("VDD_GPU_SOC", "VDD_GPU", "VDD_CPU_GPU_CV")
 """GPU power rail preference across JetPack releases. ``VDD_IN`` is the
 whole-module input power and is deliberately *not* a GPU rail."""
+
+_GPU_CURRENT_FREQUENCY_PATTERNS = (
+    "sys/class/devfreq/*gpu*/cur_freq",
+    "sys/devices/platform/*gpu*/devfreq/*/cur_freq",
+    "sys/devices/platform/*/*gpu*/devfreq/*/cur_freq",
+)
+_EMC_CURRENT_FREQUENCY_PATTERNS = (
+    "sys/kernel/debug/bpmp/debug/clk/emc/rate",
+    "sys/class/devfreq/*memory-controller*/cur_freq",
+    "sys/class/devfreq/*emc*/cur_freq",
+)
 
 
 @dataclass(frozen=True)
@@ -139,6 +151,54 @@ class TegrastatsParser:
             return zones["CPU"]
         cluster_temps = [zones[name] for name in ("BCPU", "MCPU") if name in zones]
         return max(cluster_temps) if cluster_temps else None
+
+
+class JetsonSysfsTelemetryReader:
+    """Read unprivileged instantaneous Jetson GPU facts from sysfs.
+
+    Permission errors and unsupported sensors are normal unknown values. The
+    reader never invokes a privileged helper and never substitutes a SoC or
+    junction temperature for the explicitly named ``gpu-thermal`` zone.
+    """
+
+    def __init__(self, root: Path = Path("/")) -> None:
+        self._root = root
+
+    def gpu_clock_mhz(self) -> float | None:
+        return self._first_frequency_mhz(_GPU_CURRENT_FREQUENCY_PATTERNS)
+
+    def emc_clock_mhz(self) -> float | None:
+        return self._first_frequency_mhz(_EMC_CURRENT_FREQUENCY_PATTERNS)
+
+    def gpu_temperature_c(self) -> float | None:
+        for type_path in sorted(
+            self._root.glob("sys/class/thermal/thermal_zone*/type")
+        ):
+            try:
+                zone_type = type_path.read_text(encoding="ascii").strip()
+            except (OSError, UnicodeError):
+                continue
+            if zone_type.casefold() != "gpu-thermal":
+                continue
+            try:
+                millidegrees = int(
+                    type_path.with_name("temp").read_text(encoding="ascii").strip()
+                )
+            except (OSError, ValueError):
+                return None
+            return millidegrees / 1000.0
+        return None
+
+    def _first_frequency_mhz(self, patterns: tuple[str, ...]) -> float | None:
+        for pattern in patterns:
+            for path in sorted(self._root.glob(pattern)):
+                try:
+                    hz = int(path.read_text(encoding="ascii").strip())
+                except (OSError, ValueError):
+                    continue
+                if hz > 0:
+                    return hz / 1_000_000.0
+        return None
 
 
 class TegrastatsProcess:
@@ -240,12 +300,14 @@ class JetsonTelemetryBackend:
         worker_id: str,
         *,
         tegrastats: TegrastatsProcess | None = None,
+        sysfs_root: Path = Path("/"),
         cpu_sample_interval_s: float | None = None,
         first_sample_timeout_s: float = 3.0,
     ) -> None:
         self._cpu_device_id = derive_cpu_device_id(worker_id)
         self._gpu_device_id = derive_jetson_gpu_device_id(worker_id)
         self._tegrastats = tegrastats or TegrastatsProcess()
+        self._sysfs = JetsonSysfsTelemetryReader(sysfs_root)
         self._cpu_sample_interval_s = cpu_sample_interval_s
         self._first_sample_timeout_s = first_sample_timeout_s
         self._sample_lock = threading.Lock()
@@ -262,20 +324,18 @@ class JetsonTelemetryBackend:
         return self._sample_blocking(None)
 
     def sample_fresh_device(self, device_id: str) -> FreshDeviceTelemetry | None:
-        """Latest cached tegrastats GPU sample; never starts a subprocess."""
+        """Fresh unprivileged sysfs facts plus cached long-lived tegrastats."""
         if device_id != self._gpu_device_id:
             return None
         with self._sample_lock:
             sample = self._tegrastats.latest
-        if sample is None:
-            return None
         return FreshDeviceTelemetry(
             device_id=device_id,
-            utilization=sample.gpu_utilization,
-            temperature_c=sample.gpu_temperature_c,
-            power_w=sample.gpu_power_w,
-            clock_mhz=sample.gpu_clock_mhz,
-            emc_clock_mhz=sample.emc_clock_mhz,
+            utilization=sample.gpu_utilization if sample else None,
+            temperature_c=self._sysfs.gpu_temperature_c(),
+            power_w=sample.gpu_power_w if sample else None,
+            clock_mhz=self._sysfs.gpu_clock_mhz(),
+            emc_clock_mhz=self._sysfs.emc_clock_mhz(),
         )
 
     def _sample_blocking(self, cpu_interval_s: float | None) -> StateFragment:
@@ -283,6 +343,8 @@ class JetsonTelemetryBackend:
             sample = self._tegrastats.latest
             memory = psutil.virtual_memory()
             utilization = psutil.cpu_percent(interval=cpu_interval_s)
+        gpu_temperature = self._sysfs.gpu_temperature_c()
+        gpu_clock = self._sysfs.gpu_clock_mhz()
         utilization = max(0.0, min(100.0, float(utilization)))
 
         return StateFragment(
@@ -298,14 +360,13 @@ class JetsonTelemetryBackend:
                 DeviceState(
                     device_id=self._gpu_device_id,
                     utilization=sample.gpu_utilization if sample else None,
-                    temperature_c=sample.gpu_temperature_c if sample else None,
+                    temperature_c=gpu_temperature,
                     power_w=sample.gpu_power_w if sample else None,
-                    # A live tegrastats sample proves the device answers;
-                    # None metrics then mean "unsupported", not unavailable
-                    # (spec §17). Without any sample the state is UNKNOWN.
+                    # A live tegrastats sample or readable GPU devfreq clock
+                    # proves the device answers. Otherwise state is UNKNOWN.
                     availability=(
                         DeviceAvailability.AVAILABLE
-                        if sample is not None
+                        if sample is not None or gpu_clock is not None
                         else DeviceAvailability.UNKNOWN
                     ),
                     running_runtime_ids=(),

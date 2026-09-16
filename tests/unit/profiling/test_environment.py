@@ -114,11 +114,8 @@ def test_operating_policy_changes_environment_but_not_performance_class() -> Non
         cpu_max_mhz=1728,
         gpu_min_mhz=306,
         gpu_max_mhz=612,
-        emc_min_mhz=204,
-        emc_max_mhz=3199,
         cpu_locked=False,
         gpu_locked=False,
-        emc_locked=False,
     )
     locked = PerformanceState(
         power_mode="MODE_30W",
@@ -126,11 +123,8 @@ def test_operating_policy_changes_environment_but_not_performance_class() -> Non
         cpu_max_mhz=1728,
         gpu_min_mhz=612,
         gpu_max_mhz=612,
-        emc_min_mhz=3199,
-        emc_max_mhz=3199,
         cpu_locked=True,
         gpu_locked=True,
-        emc_locked=True,
     )
     performance_class = _rtx4090_class(
         accelerator_model="agx-orin-64gb",

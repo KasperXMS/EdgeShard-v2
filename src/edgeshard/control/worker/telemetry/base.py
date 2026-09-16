@@ -25,7 +25,7 @@ class FreshDeviceTelemetry:
     """Profiling-only detail from an existing physical telemetry backend.
 
     These fields do not alter the Phase 1 wire contract.  They let Phase 2
-    retain accelerator and EMC clocks that are present in tegrastats but are
+    retain accelerator and EMC clocks available from the physical backend but
     intentionally not part of ``DeviceState``.
     """
 

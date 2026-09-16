@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from edgeshard.control.worker.performance_state import (
     JetsonPerformanceStateReader,
     normalize_performance_state,
@@ -85,52 +87,55 @@ def test_reader_observes_nvpmodel_and_policy_ranges(tmp_path: Path) -> None:
     )
 
 
-def _reader_for_jetson_clocks(
-    tmp_path: Path, jetson_clocks_output: str
-) -> JetsonPerformanceStateReader:
-    def run(command: tuple[str, ...]) -> str:
-        if command == ("nvpmodel", "-q"):
-            return "NV Power Mode: MODE_30W\n8\n"
-        assert command == ("jetson_clocks", "--show")
-        return jetson_clocks_output
+def test_reader_derives_locked_gpu_from_nested_devfreq_policy(tmp_path: Path) -> None:
+    gpu = "sys/devices/platform/bus@0/17000000.gpu/devfreq/17000000.gpu"
+    _write(tmp_path, f"{gpu}/min_freq", 612_000_000)
+    _write(tmp_path, f"{gpu}/max_freq", 612_000_000)
 
-    return JetsonPerformanceStateReader(root=tmp_path, command_runner=run)
-
-
-def test_reader_parses_dynamic_emc_range_from_jetson_clocks(tmp_path: Path) -> None:
-    state = _reader_for_jetson_clocks(
-        tmp_path,
-        "GPU MinFreq=306000000 MaxFreq=612000000 CurrentFreq=408000000\n"
-        "EMC MinFreq=204000000 MaxFreq=3199000000 CurrentFreq=2133000000\n",
+    state = JetsonPerformanceStateReader(
+        root=tmp_path,
+        command_runner=lambda command: (
+            "NV Power Mode: MODE_30W\n8\n"
+            if command == ("nvpmodel", "-q")
+            else pytest.fail(f"unexpected privileged query: {command!r}")
+        ),
     ).read()
 
-    assert (state.emc_min_mhz, state.emc_max_mhz, state.emc_locked) == (
-        204,
-        3199,
-        False,
-    )
-
-
-def test_reader_parses_locked_emc_range_from_jetson_clocks(tmp_path: Path) -> None:
-    state = _reader_for_jetson_clocks(
-        tmp_path,
-        "EMC MinFreq=3199000000 MaxFreq=3199000000 CurrentFreq=3199000000\n",
-    ).read()
-
-    assert (state.emc_min_mhz, state.emc_max_mhz, state.emc_locked) == (
-        3199,
-        3199,
+    assert (state.gpu_min_mhz, state.gpu_max_mhz, state.gpu_locked) == (
+        612,
+        612,
         True,
     )
 
 
-def test_reader_leaves_emc_unknown_when_jetson_clocks_has_no_range(
-    tmp_path: Path,
+def test_inaccessible_emc_is_supported_unknown_without_fallback_or_warning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    state = _reader_for_jetson_clocks(tmp_path, "GPU MinFreq=306000000 MaxFreq=612000000\n").read()
+    emc = "sys/kernel/debug/bpmp/debug/clk/emc"
+    _write(tmp_path, f"{emc}/min_rate", 204_000_000)
+    _write(tmp_path, f"{emc}/max_rate", 3_199_000_000)
+    original_read_text = Path.read_text
+
+    def read_text(path: Path, *args: object, **kwargs: object) -> str:
+        if "clk/emc" in path.as_posix():
+            raise PermissionError("permission denied")
+        return original_read_text(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+    commands: list[tuple[str, ...]] = []
+
+    def run(command: tuple[str, ...]) -> str:
+        commands.append(command)
+        return "NV Power Mode: MODE_30W\n8\n"
+
+    state = JetsonPerformanceStateReader(
+        root=tmp_path, command_runner=run
+    ).read()
 
     assert (state.emc_min_mhz, state.emc_max_mhz, state.emc_locked) == (
         None,
         None,
         None,
     )
+    assert commands == [("nvpmodel", "-q")]
+    assert not caplog.records

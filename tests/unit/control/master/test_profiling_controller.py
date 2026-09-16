@@ -13,6 +13,7 @@ gRPC wire is covered by the P2G integration tests.
 from __future__ import annotations
 
 import dataclasses
+import logging
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -48,6 +49,7 @@ from edgeshard.profiling.domain.experiment import (
 from edgeshard.profiling.domain.measurement import (
     LatencyMetrics,
     MeasurementMetrics,
+    MeasurementQuality,
     MeasurementRecord,
     TimeUnit,
     summarize_samples,
@@ -583,6 +585,93 @@ async def test_operator_case_completes_end_to_end(tmp_path: Path) -> None:
     ]
 
 
+async def test_completed_case_logs_structured_profiling_quality(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    rig = make_rig(tmp_path)
+    await register_worker(rig, W1)
+    case = operator_case()
+    experiment = rig.controller.create_experiment(
+        strategy_id="default", cases=[case]
+    )
+    record = dataclasses.replace(
+        make_record(case.case_id),
+        metadata=MeasurementRecord.normalize_metadata(
+            {"actual_warmup_runs": 12, "warmup_converged": True}
+        ),
+        quality=MeasurementQuality(
+            stationary=True,
+            drift_ratio=0.0125,
+            coefficient_of_variation=0.02,
+            eligible_for_calibration=True,
+        ),
+    )
+    rig.transports.setdefault(ENDPOINT_1, FakeTransport(ENDPOINT_1)).script_run(
+        case.case_id,
+        RunProfilingCaseResponse(
+            accepted=True, outcome=CaseOutcome.from_record(record)
+        ),
+    )
+
+    with caplog.at_level(
+        logging.INFO, logger="edgeshard.control.master.profiling"
+    ):
+        await rig.controller.run_experiment(experiment.experiment_id)
+
+    message = next(
+        item.message
+        for item in caplog.records
+        if item.message.startswith("profiling_case_outcome ")
+    )
+    assert f"experiment_id={experiment.experiment_id}" in message
+    assert f"case_id={case.case_id}" in message
+    assert f"operator_signature_id={operator_signature_id(OPERATOR_SIG)}" in message
+    assert "outcome=completed failure_code=None" in message
+    assert "actual_warmup_runs=12 warmup_converged=True" in message
+    assert "stationary=True drift_ratio=0.0125" in message
+
+
+async def test_typed_quality_failure_logs_application_failure_code(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    rig = make_rig(tmp_path)
+    await register_worker(rig, W1)
+    case = operator_case()
+    experiment = rig.controller.create_experiment(
+        strategy_id="default", cases=[case]
+    )
+    failure = ProfilingFailure(
+        category=ProfilingErrorCategory.UNSTABLE_PERFORMANCE_STATE,
+        message="measured samples drifted",
+        details=(
+            ("actual_warmup_runs", 50),
+            ("drift_ratio", 0.2),
+            ("stationary", False),
+            ("warmup_converged", True),
+        ),
+    )
+    rig.transports.setdefault(ENDPOINT_1, FakeTransport(ENDPOINT_1)).script_run(
+        case.case_id,
+        RunProfilingCaseResponse(
+            accepted=True, outcome=CaseOutcome.from_failure(failure)
+        ),
+    )
+
+    with caplog.at_level(
+        logging.WARNING, logger="edgeshard.control.master.profiling"
+    ):
+        await rig.controller.run_experiment(experiment.experiment_id)
+
+    message = next(
+        item.message
+        for item in caplog.records
+        if item.message.startswith("profiling_case_outcome ")
+    )
+    assert "outcome=failed failure_code=unstable_performance_state" in message
+    assert "actual_warmup_runs=50 warmup_converged=True" in message
+    assert "stationary=False drift_ratio=0.2" in message
+
+
 async def test_prepare_envelope_carries_registration_and_canonical_session(
     tmp_path: Path,
 ) -> None:
@@ -943,7 +1032,9 @@ async def test_opaque_environment_result_is_protocol_violation(tmp_path: Path) -
 # ---------------------------------------------------------------------------
 
 
-async def test_partial_experiment_completion(tmp_path: Path) -> None:
+async def test_partial_experiment_completion(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     """P2G DoD: one case succeeds, one fails → PARTIALLY_COMPLETED."""
     rig = make_rig(tmp_path)
     await register_worker(rig, W1)
@@ -966,7 +1057,10 @@ async def test_partial_experiment_completion(tmp_path: Path) -> None:
         ),
     )
 
-    report = await rig.controller.run_experiment(experiment.experiment_id)
+    with caplog.at_level(
+        logging.INFO, logger="edgeshard.control.master.profiling"
+    ):
+        report = await rig.controller.run_experiment(experiment.experiment_id)
 
     assert report.state is ExperimentState.PARTIALLY_COMPLETED
     assert report_for(report, good.case_id).state is CaseState.COMPLETED
@@ -980,6 +1074,18 @@ async def test_partial_experiment_completion(tmp_path: Path) -> None:
     assert rig.store.query_measurements(case_id=bad.case_id) == ()
     assert rig.store.get_experiment(experiment.experiment_id).state is (  # type: ignore[union-attr]
         ExperimentState.PARTIALLY_COMPLETED
+    )
+
+    outcome_logs = [
+        item.message
+        for item in caplog.records
+        if item.message.startswith("profiling_case_outcome ")
+    ]
+    assert len(outcome_logs) == 2
+    assert any("outcome=completed failure_code=None" in item for item in outcome_logs)
+    assert any(
+        "outcome=failed failure_code=profiler_failed" in item
+        for item in outcome_logs
     )
 
 

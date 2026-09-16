@@ -7,9 +7,12 @@ hardware is needed (spec §50).
 
 from __future__ import annotations
 
+import errno
 import sys
 import uuid
 from pathlib import Path
+
+import pytest
 
 from edgeshard.cluster.state import DeviceAvailability
 from edgeshard.control.worker.discovery.jetson import SYSTEM_MEMORY_POOL_ID
@@ -146,11 +149,32 @@ def test_parser_handles_gr3d_with_clock_suffix() -> None:
     assert sample.gpu_temperature_c == 45.0
 
 
-def test_cached_profiling_sample_does_not_start_tegrastats() -> None:
+def test_parser_accepts_orin_line_without_gpu_temperature_or_clock_fields() -> None:
+    sample = TegrastatsParser().parse(
+        "RAM 1/2MB GR3D_FREQ 0% cpu@45C soc0@44C soc1@43C soc2@42C "
+        "tj@46C VDD_GPU_SOC 310mW"
+    )
+    assert sample is not None
+    assert sample.gpu_utilization == 0.0
+    assert sample.gpu_clock_mhz is None
+    assert sample.emc_clock_mhz is None
+    assert sample.gpu_temperature_c is None
+    assert sample.gpu_power_w == 0.31
+
+
+def _write_text(root: Path, relative: str, value: str) -> None:
+    path = root / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(value, encoding="ascii")
+
+
+def test_cached_profiling_sample_uses_devfreq_clock_without_starting_tegrastats(
+    tmp_path: Path,
+) -> None:
     class CachedTegrastats:
         def __init__(self) -> None:
             self.latest = TegrastatsParser().parse(
-                "RAM 1/2MB EMC_FREQ 5%@204 GR3D_FREQ 7%@306 GPU@44C"
+                "RAM 1/2MB GR3D_FREQ 7% VDD_GPU_SOC 310mW"
             )
             self.starts = 0
 
@@ -165,13 +189,49 @@ def test_cached_profiling_sample_does_not_start_tegrastats() -> None:
             return None
 
     cached = CachedTegrastats()
-    backend = JetsonTelemetryBackend(WORKER_ID, tegrastats=cached)  # type: ignore[arg-type]
+    gpu = "sys/devices/platform/bus@0/17000000.gpu/devfreq/17000000.gpu"
+    _write_text(tmp_path, f"{gpu}/cur_freq", "306000000")
+    backend = JetsonTelemetryBackend(
+        WORKER_ID, tegrastats=cached, sysfs_root=tmp_path  # type: ignore[arg-type]
+    )
     sample = backend.sample_fresh_device(derive_jetson_gpu_device_id(WORKER_ID))
     assert sample is not None
     assert sample.clock_mhz == 306.0
-    assert sample.emc_clock_mhz == 204.0
-    assert sample.temperature_c == 44.0
+    assert sample.emc_clock_mhz is None
+    assert sample.temperature_c is None
+    assert sample.utilization == 7.0
+    assert sample.power_w == 0.31
     assert cached.starts == 0
+
+
+def test_gpu_thermal_enodata_is_unknown_and_never_substituted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_text(tmp_path, "sys/class/thermal/thermal_zone1/type", "gpu-thermal\n")
+    _write_text(tmp_path, "sys/class/thermal/thermal_zone1/temp", "45000\n")
+    original_read_text = Path.read_text
+
+    def read_text(path: Path, *args: object, **kwargs: object) -> str:
+        if path.as_posix().endswith("thermal_zone1/temp"):
+            raise OSError(errno.ENODATA, "No data available")
+        return original_read_text(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+
+    class CachedTegrastats:
+        latest = TegrastatsParser().parse(
+            "RAM 1/2MB GR3D_FREQ 1% cpu@41C soc0@42C tj@43C"
+        )
+
+    backend = JetsonTelemetryBackend(
+        WORKER_ID,
+        tegrastats=CachedTegrastats(),  # type: ignore[arg-type]
+        sysfs_root=tmp_path,
+    )
+    sample = backend.sample_fresh_device(derive_jetson_gpu_device_id(WORKER_ID))
+
+    assert sample is not None
+    assert sample.temperature_c is None
 
 
 def _tegrastats_script(tmp_path: Path) -> Path:
