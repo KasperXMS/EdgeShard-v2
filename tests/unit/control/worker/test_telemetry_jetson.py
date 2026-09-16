@@ -314,10 +314,11 @@ async def test_backend_maps_sample_into_state_fragment(tmp_path: Path) -> None:
     assert memory_state.available_bytes >= 0
 
 
-async def test_backend_without_tegrastats_reports_unknown_gpu() -> None:
+async def test_backend_without_tegrastats_reports_unknown_gpu(tmp_path: Path) -> None:
     backend = JetsonTelemetryBackend(
         WORKER_ID,
         tegrastats=TegrastatsProcess(command=("definitely-not-tegrastats",)),
+        sysfs_root=tmp_path,
         first_sample_timeout_s=0.1,
     )
     fragment = await backend.sample()
@@ -333,6 +334,26 @@ async def test_backend_without_tegrastats_reports_unknown_gpu() -> None:
     (memory_state,) = fragment.memory_states
     assert memory_state.memory_pool_id == SYSTEM_MEMORY_POOL_ID
     assert memory_state.available_bytes is not None
+
+
+async def test_backend_without_tegrastats_uses_readable_gpu_devfreq(
+    tmp_path: Path,
+) -> None:
+    gpu = "sys/devices/platform/bus@0/17000000.gpu/devfreq/17000000.gpu"
+    _write_text(tmp_path, f"{gpu}/cur_freq", "306000000")
+    backend = JetsonTelemetryBackend(
+        WORKER_ID,
+        tegrastats=TegrastatsProcess(command=("definitely-not-tegrastats",)),
+        sysfs_root=tmp_path,
+        first_sample_timeout_s=0.1,
+    )
+
+    fragment = await backend.sample()
+    await backend.close()
+
+    _cpu_state, gpu_state = fragment.device_states
+    assert gpu_state.availability is DeviceAvailability.AVAILABLE
+    assert gpu_state.utilization is None
 
 
 async def test_repeated_samples_reuse_the_single_process(tmp_path: Path) -> None:
