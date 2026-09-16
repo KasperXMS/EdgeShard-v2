@@ -238,6 +238,7 @@ class FakeTransport:
         self.prepare_response: PrepareProfilingSessionResponse = (
             PrepareProfilingSessionResponse(accepted=True)
         )
+        self.run_environment = OPERATOR_ENVIRONMENT
         self.prepare_error: Exception | None = None
         self._run_scripts: dict[str, RunProfilingCaseResponse | Exception] = {}
         self._get_scripts: dict[str, GetProfilingCaseResponse | Exception] = {}
@@ -286,7 +287,7 @@ class FakeTransport:
                 make_record(
                     request.case.case_id,
                     environment=dataclasses.replace(
-                        OPERATOR_ENVIRONMENT,
+                        self.run_environment,
                         worker_id=request.case.worker_id,
                         device_id=(
                             request.case.spec.device_ids[0]
@@ -507,6 +508,40 @@ def test_create_experiment_is_idempotent_and_dedupes(tmp_path: Path) -> None:
     assert second.experiment_id == first.experiment_id
     assert second.created_at == first.created_at  # history never rewritten
     assert second.requested_by == first.requested_by
+
+
+def test_missing_only_allocates_new_execution_for_terminal_configuration(
+    tmp_path: Path,
+) -> None:
+    rig = make_rig(tmp_path)
+    case = operator_case()
+    first = rig.controller.create_experiment(strategy_id="default", cases=[case])
+    rig.store.update_case_state(case.case_id, CaseState.COMPLETED)
+    rig.store.update_experiment_state(first.experiment_id, ExperimentState.COMPLETED)
+
+    second = rig.controller.create_experiment(
+        strategy_id="default",
+        cases=[case],
+        rerun_terminal_configuration=True,
+    )
+
+    assert second.experiment_id != first.experiment_id
+    assert second.configuration_id == first.configuration_id
+    assert second.case_ids != first.case_ids
+
+
+def test_missing_only_resumes_nonterminal_configuration(tmp_path: Path) -> None:
+    rig = make_rig(tmp_path)
+    case = operator_case()
+    first = rig.controller.create_experiment(strategy_id="default", cases=[case])
+
+    second = rig.controller.create_experiment(
+        strategy_id="default",
+        cases=[case],
+        rerun_terminal_configuration=True,
+    )
+
+    assert second == first
 
 
 async def test_run_unknown_experiment_fails_loudly(tmp_path: Path) -> None:

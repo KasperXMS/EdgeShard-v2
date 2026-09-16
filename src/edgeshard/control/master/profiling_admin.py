@@ -124,6 +124,10 @@ class MasterProfilingAdmin:
                 cases=cases,
                 requested_by=intent.requested_by,
                 force_new_execution=not intent.missing_only,
+                rerun_terminal_configuration=(
+                    intent.missing_only
+                    and intent.kind is ProfilingSessionKind.OPERATOR
+                ),
             )
             self._launch(experiment.experiment_id, held_target_locks)
             launched = True

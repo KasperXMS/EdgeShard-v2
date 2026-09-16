@@ -83,3 +83,54 @@ def test_reader_observes_nvpmodel_and_policy_ranges(tmp_path: Path) -> None:
         3199,
         False,
     )
+
+
+def _reader_for_jetson_clocks(
+    tmp_path: Path, jetson_clocks_output: str
+) -> JetsonPerformanceStateReader:
+    def run(command: tuple[str, ...]) -> str:
+        if command == ("nvpmodel", "-q"):
+            return "NV Power Mode: MODE_30W\n8\n"
+        assert command == ("jetson_clocks", "--show")
+        return jetson_clocks_output
+
+    return JetsonPerformanceStateReader(root=tmp_path, command_runner=run)
+
+
+def test_reader_parses_dynamic_emc_range_from_jetson_clocks(tmp_path: Path) -> None:
+    state = _reader_for_jetson_clocks(
+        tmp_path,
+        "GPU MinFreq=306000000 MaxFreq=612000000 CurrentFreq=408000000\n"
+        "EMC MinFreq=204000000 MaxFreq=3199000000 CurrentFreq=2133000000\n",
+    ).read()
+
+    assert (state.emc_min_mhz, state.emc_max_mhz, state.emc_locked) == (
+        204,
+        3199,
+        False,
+    )
+
+
+def test_reader_parses_locked_emc_range_from_jetson_clocks(tmp_path: Path) -> None:
+    state = _reader_for_jetson_clocks(
+        tmp_path,
+        "EMC MinFreq=3199000000 MaxFreq=3199000000 CurrentFreq=3199000000\n",
+    ).read()
+
+    assert (state.emc_min_mhz, state.emc_max_mhz, state.emc_locked) == (
+        3199,
+        3199,
+        True,
+    )
+
+
+def test_reader_leaves_emc_unknown_when_jetson_clocks_has_no_range(
+    tmp_path: Path,
+) -> None:
+    state = _reader_for_jetson_clocks(tmp_path, "GPU MinFreq=306000000 MaxFreq=612000000\n").read()
+
+    assert (state.emc_min_mhz, state.emc_max_mhz, state.emc_locked) == (
+        None,
+        None,
+        None,
+    )

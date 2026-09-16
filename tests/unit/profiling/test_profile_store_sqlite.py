@@ -621,6 +621,7 @@ class TestReuseIndex:
         }
 
     def test_reuse_requires_the_same_performance_state(self, store: SqliteProfileStore) -> None:
+        class_id = device_performance_class_id(PERFORMANCE_CLASS)
         dynamic_state = PerformanceState(
             power_mode="MODE_30W",
             gpu_min_mhz=306,
@@ -633,8 +634,18 @@ class TestReuseIndex:
             gpu_max_mhz=612,
             gpu_locked=True,
         )
-        dynamic = _fingerprint(dtype="fp32", performance_state=dynamic_state)
-        locked = _fingerprint(dtype="fp32", performance_state=locked_state)
+        shared_environment = {
+            "dtype": "fp32",
+            "torch_version": "2.8.0",
+            "device_performance_class_id": class_id,
+            "device_performance_class": PERFORMANCE_CLASS,
+        }
+        dynamic = _fingerprint(
+            **shared_environment, performance_state=dynamic_state
+        )
+        locked = _fingerprint(
+            **shared_environment, performance_state=locked_state
+        )
         case = _operator_case()
         store.append_case(case)
         store.append_measurement(
@@ -649,6 +660,75 @@ class TestReuseIndex:
             operator_signature_id(OP_SIG)
         }
         assert store.measured_operator_signature_ids_for_environment(locked) == frozenset()
+
+    def test_legacy_null_performance_state_does_not_cover_observed_dynamic_state(
+        self, store: SqliteProfileStore
+    ) -> None:
+        legacy = _fingerprint(dtype="fp32", performance_state=None)
+        dynamic = _fingerprint(
+            dtype="fp32",
+            performance_state=PerformanceState(
+                power_mode="MODE_30W",
+                gpu_min_mhz=306,
+                gpu_max_mhz=612,
+                gpu_locked=False,
+            ),
+        )
+        case = _operator_case()
+        store.append_case(case)
+        store.append_measurement(
+            _latency_record(
+                case,
+                "m-legacy",
+                environment_fingerprint_id(legacy),
+                environment=legacy,
+            )
+        )
+
+        assert store.measured_operator_signature_ids_for_environment(dynamic) == frozenset()
+
+    @pytest.mark.parametrize(
+        ("existing_overrides", "current_overrides"),
+        [
+            pytest.param(
+                {"backend_revision": "sha256:image-a"},
+                {"backend_revision": "sha256:image-b"},
+                id="backend-revision",
+            ),
+            pytest.param(
+                {"profiling_implementation_revision": "0.1.0"},
+                {"profiling_implementation_revision": "0.2.0"},
+                id="profiling-implementation-revision",
+            ),
+        ],
+    )
+    def test_reuse_rejects_other_environment_revision_changes(
+        self,
+        store: SqliteProfileStore,
+        existing_overrides: dict[str, object],
+        current_overrides: dict[str, object],
+    ) -> None:
+        class_id = device_performance_class_id(PERFORMANCE_CLASS)
+        common = {
+            "dtype": "fp32",
+            "torch_version": "2.8.0",
+            "device_performance_class_id": class_id,
+            "device_performance_class": PERFORMANCE_CLASS,
+        }
+        existing = _fingerprint(**common, **existing_overrides)
+        current = _fingerprint(**common, **current_overrides)
+        case = _operator_case()
+        store.append_case(case)
+        store.append_measurement(
+            _latency_record(
+                case,
+                "m-existing",
+                environment_fingerprint_id(existing),
+                environment=existing,
+            )
+        )
+
+        assert store.measured_operator_signature_ids_for_environment(current) == frozenset()
 
     def test_nonstationary_record_is_not_reusable(self, store: SqliteProfileStore) -> None:
         environment = _fingerprint(dtype="fp32")

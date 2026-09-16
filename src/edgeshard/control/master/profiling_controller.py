@@ -453,6 +453,7 @@ class ProfilingController:
         cases: Sequence[ProfilingCase],
         requested_by: str | None = None,
         force_new_execution: bool = False,
+        rerun_terminal_configuration: bool = False,
     ) -> ProfilingExperiment:
         """Persist one configuration or an explicit new execution (§7/§44).
 
@@ -460,6 +461,12 @@ class ProfilingController:
         supports restart/resume. ``force_new_execution`` retains that identity
         but allocates fresh experiment/case execution ids so a requested rerun
         appends measurements without rewriting terminal history.
+
+        ``rerun_terminal_configuration`` is the missing-only bridge: planning
+        has already established that these cases lack a compatible
+        measurement in the current environment. If their canonical execution
+        is terminal, fresh execution ids are therefore required; an existing
+        non-terminal execution is still resumed unchanged.
         """
         configuration_case_ids = tuple(
             sorted(
@@ -472,6 +479,22 @@ class ProfilingController:
         configuration_id = profiling_experiment_id(
             strategy_id, configuration_case_ids
         )
+        existing_configuration = self._store.get_experiment(configuration_id)
+        if not force_new_execution and existing_configuration is not None:
+            if (
+                rerun_terminal_configuration
+                and existing_configuration.state in _TERMINAL_EXPERIMENT_STATES
+            ):
+                force_new_execution = True
+            else:
+                logger.info(
+                    "experiment %s already persisted (state=%s); replaying the "
+                    "stored definition (§44)",
+                    configuration_id,
+                    existing_configuration.state.value,
+                )
+                return existing_configuration.experiment
+
         execution_cases = tuple(cases)
         experiment_id = configuration_id
         if force_new_execution:

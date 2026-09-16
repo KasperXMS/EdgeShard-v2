@@ -14,6 +14,10 @@ logger = logging.getLogger("worker.performance_state")
 
 CommandRunner = Callable[[tuple[str, ...]], str | None]
 _POWER_MODE_RE = re.compile(r"^NV Power Mode:\s*(\S.*?)\s*$", re.MULTILINE)
+_JETSON_CLOCKS_EMC_RE = re.compile(
+    r"\bEMC\s+MinFreq=(\d+)\s+MaxFreq=(\d+)"
+    r"(?:\s+CurrentFreq=(\d+))?\b"
+)
 
 
 def normalize_performance_state(
@@ -75,6 +79,8 @@ class JetsonPerformanceStateReader:
             maximum_name=None,
             divisor=1_000_000,
         )
+        if emc is None:
+            emc = self._jetson_clocks_emc_range()
         return normalize_performance_state(
             power_mode=mode,
             cpu_range_mhz=cpu,
@@ -99,6 +105,25 @@ class JetsonPerformanceStateReader:
         if not minima or not maxima:
             return None
         return min(minima), max(maxima)
+
+    def _jetson_clocks_emc_range(self) -> tuple[int, int] | None:
+        """Read EMC policy limits exposed only by ``jetson_clocks --show``.
+
+        Some JetPack releases do not expose a readable EMC min/max pair in
+        sysfs/debugfs. ``CurrentFreq`` is deliberately ignored: it is live
+        telemetry, not operating-policy compatibility state.
+        """
+        output = self._command_runner(("jetson_clocks", "--show"))
+        if not output:
+            return None
+        match = _JETSON_CLOCKS_EMC_RE.search(output)
+        if match is None:
+            return None
+        minimum = round(int(match.group(1)) / 1_000_000)
+        maximum = round(int(match.group(2)) / 1_000_000)
+        if minimum <= 0 or maximum <= 0 or minimum > maximum:
+            return None
+        return minimum, maximum
 
     def _first_range(
         self,
@@ -145,10 +170,14 @@ class JetsonPerformanceStateReader:
                 timeout=2.0,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
-            logger.warning("cannot read Jetson power mode: %s", exc)
+            logger.warning("Jetson policy query %r failed: %s", command, exc)
             return None
         if completed.returncode != 0:
-            logger.warning("nvpmodel query failed with exit code %d", completed.returncode)
+            logger.warning(
+                "Jetson policy query %r failed with exit code %d",
+                command,
+                completed.returncode,
+            )
             return None
         return completed.stdout
 

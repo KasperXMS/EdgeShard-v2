@@ -18,6 +18,7 @@ from test_profiling_controller import (
     CHARACTERIZATION,
     ENDPOINT_2,
     MODEL,
+    OPERATOR_ENVIRONMENT,
     SESSION_FACTS,
     W1,
     W2,
@@ -29,6 +30,10 @@ from test_profiling_controller import (
 )
 
 from edgeshard.control.master.profiling_admin import MasterProfilingAdmin
+from edgeshard.profiling.domain.environment import (
+    PerformanceState,
+    environment_fingerprint_id,
+)
 from edgeshard.profiling.domain.experiment import (
     CaseOutcome,
     CaseState,
@@ -703,6 +708,66 @@ class TestStartExperimentModelFamily:
         second = await admin.start_experiment(StartExperimentRequest(request=intent))
         assert second.accepted is False
         assert "zero cases" in second.detail
+
+    async def test_missing_only_reruns_terminal_case_in_new_environment(
+        self, tmp_path: Path
+    ) -> None:
+        """A newly incompatible environment executes; it cannot replay history."""
+        rig = make_rig(tmp_path)
+        await register_worker(rig, W1)
+        script_healthy_inspection(rig)
+        admin = make_admin(rig)
+        intent = model_intent(kind=ProfilingSessionKind.OPERATOR)
+
+        first = await admin.start_experiment(StartExperimentRequest(request=intent))
+        assert first.accepted is True
+        await drain(admin, first.experiment_id)
+
+        transport = transport_for(rig)
+        assert SESSION_FACTS.environment is not None
+        dynamic = PerformanceState(
+            power_mode="MODE_30W",
+            cpu_min_mhz=730,
+            cpu_max_mhz=1728,
+            gpu_min_mhz=306,
+            gpu_max_mhz=612,
+            emc_min_mhz=204,
+            emc_max_mhz=3199,
+            cpu_locked=False,
+            gpu_locked=False,
+            emc_locked=False,
+        )
+        changed_model_environment = dataclasses.replace(
+            SESSION_FACTS.environment,
+            profiling_implementation_revision="0.2.0",
+            backend_revision="sha256:new-image",
+            performance_state=dynamic,
+            device_id=RTX_GPU_DEVICE_ID,
+        )
+        transport.prepare_response = PrepareProfilingSessionResponse(
+            accepted=True,
+            session_facts=dataclasses.replace(
+                SESSION_FACTS, environment=changed_model_environment
+            ),
+        )
+        transport.run_environment = dataclasses.replace(
+            changed_model_environment, model_revision=None
+        )
+
+        second = await admin.start_experiment(StartExperimentRequest(request=intent))
+        assert second.accepted is True
+        assert second.experiment_id != first.experiment_id
+        await drain(admin, second.experiment_id)
+
+        snapshot = rig.store.build_snapshot("environment-rerun")
+        assert len(snapshot.measurements) == 2
+        assert {
+            measurement.environment_fingerprint
+            for measurement in snapshot.measurements
+        } == {
+            environment_fingerprint_id(OPERATOR_ENVIRONMENT),
+            environment_fingerprint_id(transport.run_environment),
+        }
 
     async def test_include_measured_replans_everything(self, tmp_path: Path) -> None:
         rig = make_rig(tmp_path)
