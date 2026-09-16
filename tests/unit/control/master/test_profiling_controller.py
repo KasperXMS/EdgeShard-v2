@@ -546,6 +546,67 @@ def test_missing_only_resumes_nonterminal_configuration(tmp_path: Path) -> None:
     assert second == first
 
 
+async def test_missing_only_dispatches_terminal_canonical_case_without_old_config(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    rig = make_rig(tmp_path)
+    await register_worker(rig, W1)
+    case = operator_case()
+    rig.store.append_case(case)
+    rig.store.update_case_state(case.case_id, CaseState.COMPLETED)
+
+    experiment = rig.controller.create_experiment(
+        strategy_id="filtered-missing-only",
+        cases=[case],
+        rerun_terminal_configuration=True,
+    )
+
+    assert experiment.experiment_id != experiment.configuration_id
+    assert experiment.case_ids != (case.case_id,)
+    execution_case_id = experiment.case_ids[0]
+
+    with caplog.at_level(
+        logging.INFO, logger="edgeshard.control.master.profiling"
+    ):
+        report = await rig.controller.run_experiment(experiment.experiment_id)
+
+    assert report.state is ExperimentState.COMPLETED
+    assert [request.case.case_id for request in rig.transport().run_requests] == [
+        execution_case_id
+    ]
+    records = rig.store.query_measurements(case_id=execution_case_id)
+    assert len(records) == 1
+    assert any(
+        item.message.startswith("profiling_case_outcome ")
+        and f"case_id={execution_case_id}" in item.message
+        for item in caplog.records
+    )
+
+
+def test_missing_only_refreshes_terminal_case_and_resumes_pending_case(
+    tmp_path: Path,
+) -> None:
+    rig = make_rig(tmp_path)
+    terminal = operator_case()
+    pending = operator_case(signature=OPERATOR_SIG_B)
+    rig.store.append_case(terminal)
+    rig.store.update_case_state(terminal.case_id, CaseState.COMPLETED)
+    rig.store.append_case(pending)
+
+    experiment = rig.controller.create_experiment(
+        strategy_id="mixed-missing-only",
+        cases=[terminal, pending],
+        rerun_terminal_configuration=True,
+    )
+
+    assert experiment.experiment_id != experiment.configuration_id
+    assert experiment.case_ids[0] != terminal.case_id
+    assert experiment.case_ids[1] == pending.case_id
+    assert rig.store.get_case(terminal.case_id).state is CaseState.COMPLETED  # type: ignore[union-attr]
+    assert rig.store.get_case(experiment.case_ids[0]).state is CaseState.PENDING  # type: ignore[union-attr]
+    assert rig.store.get_case(pending.case_id).state is CaseState.PENDING  # type: ignore[union-attr]
+
+
 async def test_run_unknown_experiment_fails_loudly(tmp_path: Path) -> None:
     rig = make_rig(tmp_path)
     with pytest.raises(ValueError, match="unknown experiment"):

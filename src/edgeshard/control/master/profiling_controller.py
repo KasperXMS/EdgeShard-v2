@@ -467,9 +467,9 @@ class ProfilingController:
 
         ``rerun_terminal_configuration`` is the missing-only bridge: planning
         has already established that these cases lack a compatible
-        measurement in the current environment. If their canonical execution
-        is terminal, fresh execution ids are therefore required; an existing
-        non-terminal execution is still resumed unchanged.
+        measurement in the current environment. Each terminal canonical case
+        gets a fresh execution id, while non-terminal canonical cases keep
+        their ids so an interrupted execution is resumed rather than copied.
         """
         configuration_case_ids = tuple(
             sorted(
@@ -483,24 +483,44 @@ class ProfilingController:
             strategy_id, configuration_case_ids
         )
         existing_configuration = self._store.get_experiment(configuration_id)
-        if not force_new_execution and existing_configuration is not None:
-            if (
-                rerun_terminal_configuration
-                and existing_configuration.state in _TERMINAL_EXPERIMENT_STATES
-            ):
-                force_new_execution = True
-            else:
-                logger.info(
-                    "experiment %s already persisted (state=%s); replaying the "
-                    "stored definition (§44)",
-                    configuration_id,
-                    existing_configuration.state.value,
-                )
-                return existing_configuration.experiment
+        canonical_cases = tuple(
+            dataclasses.replace(
+                case, case_id=profiling_case_id(case.worker_id, case.spec)
+            )
+            for case in cases
+        )
+        fresh_case_ids = (
+            set(configuration_case_ids) if force_new_execution else set()
+        )
+        if rerun_terminal_configuration and not force_new_execution:
+            for case_id in configuration_case_ids:
+                stored_case = self._store.get_case(case_id)
+                if (
+                    stored_case is not None
+                    and stored_case.state in _TERMINAL_CASE_STATES
+                ):
+                    fresh_case_ids.add(case_id)
 
-        execution_cases = tuple(cases)
+        if (
+            not force_new_execution
+            and not fresh_case_ids
+            and existing_configuration is not None
+        ):
+            logger.info(
+                "experiment %s already persisted (state=%s); replaying the "
+                "stored definition (§44)",
+                configuration_id,
+                existing_configuration.state.value,
+            )
+            return existing_configuration.experiment
+
+        execution_cases = (
+            canonical_cases
+            if force_new_execution or rerun_terminal_configuration
+            else tuple(cases)
+        )
         experiment_id = configuration_id
-        if force_new_execution:
+        if force_new_execution or fresh_case_ids:
             run_nonce = uuid4().hex
             execution_cases = tuple(
                 dataclasses.replace(
@@ -513,7 +533,9 @@ class ProfilingController:
                         )
                     ),
                 )
-                for case in cases
+                if case.case_id in fresh_case_ids
+                else case
+                for case in canonical_cases
             )
             experiment_id = canonical_sha256(
                 ("profiling_execution", configuration_id, run_nonce)
