@@ -24,6 +24,7 @@ from test_profiling_controller import (
     W2,
     FakeTransport,
     Rig,
+    make_record,
     make_rig,
     register_worker,
     transport_for,
@@ -40,14 +41,32 @@ from edgeshard.profiling.domain.experiment import (
     ExperimentState,
     ModelCaseSpec,
     NetworkCaseSpec,
+    ProfilingCase,
     ProfilingErrorCategory,
     ProfilingFailure,
     ProfilingRequest,
     WorkerDeviceTarget,
 )
+from edgeshard.profiling.domain.measurement import (
+    LatencyMetrics,
+    MeasurementMetrics,
+    MeasurementQuality,
+    TimeUnit,
+    summarize_samples,
+)
 from edgeshard.profiling.domain.network import NetworkPair, ProbeKind
-from edgeshard.profiling.domain.session import ProfilingSessionKind
-from edgeshard.profiling.domain.signature import ProfilingGranularity
+from edgeshard.profiling.domain.session import (
+    ModelSessionFacts,
+    ProfilingSessionKind,
+)
+from edgeshard.profiling.domain.signature import (
+    GemmSignature,
+    OperatorKind,
+    OperatorSignature,
+    ProfilingGranularity,
+    operator_signature_id,
+)
+from edgeshard.profiling.operator.planning import operator_case_spec
 from edgeshard.protocol.profiling.mapper import (
     BuildProfileSnapshotRequest,
     CancelExperimentRequest,
@@ -105,6 +124,88 @@ def script_healthy_inspection(rig: Rig) -> None:
     transport_for(rig).prepare_response = PrepareProfilingSessionResponse(
         accepted=True, session_facts=facts
     )
+
+
+def verification_signatures(count: int = 12) -> tuple[OperatorSignature, ...]:
+    return tuple(
+        OperatorSignature(
+            kind=OperatorKind.GEMM,
+            parameters=GemmSignature(
+                m=64 * (index + 1), n=64, k=64, dtype="fp32"
+            ),
+            backend_family="torch",
+        )
+        for index in range(count)
+    )
+
+
+async def setup_verification_devices(
+    rig: Rig,
+    *,
+    reference_state: PerformanceState | None = None,
+    candidate_state: PerformanceState | None = None,
+    reference_quality: MeasurementQuality | None = None,
+) -> tuple[
+    tuple[OperatorSignature, ...],
+    ModelSessionFacts,
+]:
+    """Seed verified A references and script unverified candidate B facts."""
+    signatures = verification_signatures()
+    assert SESSION_FACTS.environment is not None
+    source_environment = dataclasses.replace(
+        SESSION_FACTS.environment,
+        worker_id=W1,
+        device_id=RTX_GPU_DEVICE_ID,
+        performance_state=reference_state,
+    )
+    source_facts = dataclasses.replace(
+        SESSION_FACTS,
+        operator_signatures=signatures,
+        environment=source_environment,
+    )
+    rig.controller.record_model_facts(source_facts)
+    source_operator_environment = dataclasses.replace(
+        source_environment, model_revision=None
+    )
+    quality = reference_quality or MeasurementQuality(
+        stationary=True,
+        drift_ratio=0.0,
+        coefficient_of_variation=0.0,
+        eligible_for_calibration=True,
+    )
+    for index, signature in enumerate(signatures):
+        case = ProfilingCase.for_spec(
+            W1, operator_case_spec(signature, device_id=RTX_GPU_DEVICE_ID)
+        )
+        rig.store.append_case(case)
+        rig.store.append_measurement(
+            dataclasses.replace(
+                make_record(
+                    case.case_id,
+                    measurement_id=f"reference-{index}",
+                    environment=source_operator_environment,
+                ),
+                quality=quality,
+            )
+        )
+
+    await register_worker(rig, W2, profiling_endpoint=ENDPOINT_2)
+    candidate_environment = dataclasses.replace(
+        source_environment,
+        worker_id=W2,
+        performance_state=candidate_state,
+    )
+    candidate_facts = dataclasses.replace(
+        source_facts, environment=candidate_environment
+    )
+    candidate_transport = transport_for(rig, ENDPOINT_2)
+    candidate_transport.prepare_response = PrepareProfilingSessionResponse(
+        accepted=True, session_facts=candidate_facts
+    )
+    candidate_transport.run_environment = dataclasses.replace(
+        candidate_environment, model_revision=None
+    )
+    return signatures, candidate_facts
 
 
 def stored_cases(rig: Rig, experiment_id: str):
@@ -768,6 +869,186 @@ class TestStartExperimentModelFamily:
             environment_fingerprint_id(OPERATOR_ENVIRONMENT),
             environment_fingerprint_id(transport.run_environment),
         }
+
+    async def test_unverified_candidate_runs_sentinels_then_reuses_reference(
+        self, tmp_path: Path
+    ) -> None:
+        rig = make_rig(tmp_path)
+        signatures, candidate_facts = await setup_verification_devices(rig)
+        admin = make_admin(rig)
+        intent = model_intent(
+            kind=ProfilingSessionKind.OPERATOR,
+            worker_device_targets=(WorkerDeviceTarget(W2, RTX_GPU_DEVICE_ID),),
+        )
+        source_measurement_ids = {
+            record.measurement_id for record in rig.store.query_measurements()
+        }
+
+        first = await admin.start_experiment(StartExperimentRequest(request=intent))
+
+        assert first.accepted
+        verification_cases = stored_cases(rig, first.experiment_id)
+        assert len(verification_cases) == 3
+        assert {
+            operator_signature_id(case.spec.operator_signature)
+            for case in verification_cases
+            if isinstance(case.spec, ModelCaseSpec)
+            and case.spec.operator_signature is not None
+        } == {
+            operator_signature_id(signatures[index]) for index in (0, 6, 11)
+        }
+        await drain(admin, first.experiment_id)
+
+        snapshot = rig.store.build_snapshot("verified-candidate")
+        candidate_membership = next(
+            membership
+            for membership in snapshot.device_performance_class_memberships
+            if membership.worker_id == W2
+        )
+        assert candidate_membership.verified
+        assert len(candidate_membership.evidence_measurement_ids) == 3
+        assert all(
+            rig.store.get_measurement(measurement_id) is not None
+            for measurement_id in candidate_membership.evidence_measurement_ids
+        )
+        assert source_measurement_ids <= {
+            record.measurement_id for record in rig.store.query_measurements()
+        }
+
+        assert candidate_facts.environment is not None
+        candidate_operator_environment = dataclasses.replace(
+            candidate_facts.environment, model_revision=None
+        )
+        assert rig.controller.measured_operator_signature_ids_for_environment(
+            candidate_operator_environment
+        ) == {operator_signature_id(signature) for signature in signatures}
+
+        second = await admin.start_experiment(StartExperimentRequest(request=intent))
+        assert not second.accepted
+        assert "zero cases" in second.detail
+
+    async def test_failed_verification_keeps_cross_device_reuse_disabled(
+        self, tmp_path: Path
+    ) -> None:
+        rig = make_rig(tmp_path)
+        signatures, candidate_facts = await setup_verification_devices(rig)
+        admin = make_admin(rig)
+        intent = model_intent(
+            kind=ProfilingSessionKind.OPERATOR,
+            worker_device_targets=(WorkerDeviceTarget(W2, RTX_GPU_DEVICE_ID),),
+        )
+
+        first = await admin.start_experiment(StartExperimentRequest(request=intent))
+        assert first.accepted
+        assert candidate_facts.environment is not None
+        candidate_environment = dataclasses.replace(
+            candidate_facts.environment, model_revision=None
+        )
+        transport = transport_for(rig, ENDPOINT_2)
+        for case in stored_cases(rig, first.experiment_id):
+            samples = (4.0, 4.0, 4.0)
+            record = dataclasses.replace(
+                make_record(case.case_id, environment=candidate_environment),
+                samples=samples,
+                metrics=MeasurementMetrics(
+                    latency=LatencyMetrics(
+                        summary=summarize_samples(samples),
+                        unit=TimeUnit.MILLISECONDS,
+                    )
+                ),
+            )
+            transport.script_run(
+                case.case_id,
+                RunProfilingCaseResponse(
+                    accepted=True, outcome=CaseOutcome.from_record(record)
+                ),
+            )
+        await drain(admin, first.experiment_id)
+
+        snapshot = rig.store.build_snapshot("failed-verification")
+        candidate_membership = next(
+            membership
+            for membership in snapshot.device_performance_class_memberships
+            if membership.worker_id == W2
+        )
+        assert not candidate_membership.verified
+        assert len(candidate_membership.evidence_measurement_ids) == 3
+        measured = rig.controller.measured_operator_signature_ids_for_environment(
+            candidate_environment
+        )
+        assert len(measured) == 3
+        assert measured < {
+            operator_signature_id(signature) for signature in signatures
+        }
+
+        second = await admin.start_experiment(StartExperimentRequest(request=intent))
+        assert second.accepted
+        assert len(stored_cases(rig, second.experiment_id)) == 9
+        await drain(admin, second.experiment_id)
+
+    async def test_dynamic_candidate_cannot_verify_against_locked_reference(
+        self, tmp_path: Path
+    ) -> None:
+        locked = PerformanceState(
+            gpu_min_mhz=612,
+            gpu_max_mhz=612,
+            gpu_locked=True,
+        )
+        dynamic = PerformanceState(
+            gpu_min_mhz=306,
+            gpu_max_mhz=612,
+            gpu_locked=False,
+        )
+        rig = make_rig(tmp_path)
+        await setup_verification_devices(
+            rig, reference_state=locked, candidate_state=dynamic
+        )
+        admin = make_admin(rig)
+
+        response = await admin.start_experiment(
+            StartExperimentRequest(
+                request=model_intent(
+                    kind=ProfilingSessionKind.OPERATOR,
+                    worker_device_targets=(
+                        WorkerDeviceTarget(W2, RTX_GPU_DEVICE_ID),
+                    ),
+                )
+            )
+        )
+
+        assert response.accepted
+        assert len(stored_cases(rig, response.experiment_id)) == 12
+        await drain(admin, response.experiment_id)
+
+    async def test_ineligible_reference_cannot_be_verification_baseline(
+        self, tmp_path: Path
+    ) -> None:
+        rig = make_rig(tmp_path)
+        await setup_verification_devices(
+            rig,
+            reference_quality=MeasurementQuality(
+                stationary=False,
+                drift_ratio=0.5,
+                coefficient_of_variation=0.5,
+                eligible_for_calibration=False,
+            ),
+        )
+        admin = make_admin(rig)
+
+        response = await admin.start_experiment(
+            StartExperimentRequest(
+                request=model_intent(
+                    kind=ProfilingSessionKind.OPERATOR,
+                    worker_device_targets=(
+                        WorkerDeviceTarget(W2, RTX_GPU_DEVICE_ID),
+                    ),
+                )
+            )
+        )
+
+        assert response.accepted
+        assert len(stored_cases(rig, response.experiment_id)) == 12
+        await drain(admin, response.experiment_id)
 
     async def test_include_measured_replans_everything(self, tmp_path: Path) -> None:
         rig = make_rig(tmp_path)

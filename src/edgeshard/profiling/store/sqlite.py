@@ -730,7 +730,7 @@ class SqliteProfileStore:
         payload_text = encode_json(membership)
         with self._lock, self._conn:
             current = self._conn.execute(
-                "SELECT verified FROM device_performance_class_memberships "
+                "SELECT verified, payload FROM device_performance_class_memberships "
                 "WHERE device_performance_class_id = ? AND worker_id = ? "
                 "AND device_id = ?",
                 (
@@ -741,6 +741,17 @@ class SqliteProfileStore:
             ).fetchone()
             if current is not None and bool(current["verified"]) and not membership.verified:
                 return
+            if current is not None and not membership.verified:
+                persisted = self._decode(
+                    DevicePerformanceClassMembership,
+                    current["payload"],
+                    "device performance class membership",
+                )
+                if (
+                    persisted.evidence_measurement_ids
+                    and not membership.evidence_measurement_ids
+                ):
+                    return
             self._conn.execute(
                 "INSERT INTO device_performance_class_memberships ("
                 "device_performance_class_id, worker_id, device_id, verified, payload) "
@@ -755,6 +766,25 @@ class SqliteProfileStore:
                     payload_text,
                 ),
             )
+
+    def performance_class_memberships(
+        self, device_performance_class_id: str
+    ) -> tuple[DevicePerformanceClassMembership, ...]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT payload FROM device_performance_class_memberships "
+                "WHERE device_performance_class_id = ? "
+                "ORDER BY worker_id, device_id",
+                (device_performance_class_id,),
+            ).fetchall()
+        return tuple(
+            self._decode(
+                DevicePerformanceClassMembership,
+                row["payload"],
+                "device performance class membership",
+            )
+            for row in rows
+        )
 
     def measured_operator_signature_ids_for_environment(
         self, fingerprint: EnvironmentFingerprint

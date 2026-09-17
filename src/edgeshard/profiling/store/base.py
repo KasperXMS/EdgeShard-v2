@@ -168,6 +168,11 @@ class ProfileStore(Protocol):
     ) -> None:
         """Persist a physical device's verified or pending class membership."""
 
+    def performance_class_memberships(
+        self, device_performance_class_id: str
+    ) -> tuple[DevicePerformanceClassMembership, ...]:
+        """Return all physical members of one performance class."""
+
     def measured_operator_signature_ids_for_environment(
         self, fingerprint: EnvironmentFingerprint
     ) -> AbstractSet[str]:

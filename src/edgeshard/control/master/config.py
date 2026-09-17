@@ -14,11 +14,16 @@ threshold invariants remain the single place cross-field timing rules live.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
 from pydantic import BaseModel, ConfigDict, model_validator
+
+from edgeshard.profiling.operator.verification import (
+    DEFAULT_VERIFICATION_TOLERANCE,
+)
 
 
 @dataclass(frozen=True)
@@ -104,6 +109,7 @@ class MasterProfilingSection(BaseModel):
     admin_host: str = DEFAULT_MASTER_HOST
     admin_port: int = DEFAULT_PROFILING_ADMIN_PORT
     store_path: str = DEFAULT_PROFILE_STORE_PATH
+    verification_tolerance: float = DEFAULT_VERIFICATION_TOLERANCE
 
     @model_validator(mode="after")
     def _check_listen(self) -> MasterProfilingSection:
@@ -113,6 +119,13 @@ class MasterProfilingSection(BaseModel):
             raise ValueError(f"profiling admin port out of range: {self.admin_port}")
         if not self.store_path:
             raise ValueError("profile store path must be non-empty")
+        if (
+            not math.isfinite(self.verification_tolerance)
+            or self.verification_tolerance <= 0.0
+        ):
+            raise ValueError(
+                "profiling verification_tolerance must be finite and positive"
+            )
         return self
 
 

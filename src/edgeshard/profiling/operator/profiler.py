@@ -31,8 +31,7 @@ performance class.
 from __future__ import annotations
 
 import logging
-import math
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
@@ -47,12 +46,6 @@ from edgeshard.profiling.domain.experiment import (
 )
 from edgeshard.profiling.domain.measurement import MeasurementRecord, TimeUnit
 from edgeshard.profiling.domain.signature import (
-    AttentionSignature,
-    GemmSignature,
-    InferencePhase,
-    NormSignature,
-    NormVariant,
-    OperatorKind,
     OperatorSignature,
     ProfilingGranularity,
     operator_signature_id,
@@ -71,6 +64,14 @@ from edgeshard.profiling.operator.planning import (
 from edgeshard.profiling.operator.registry import (
     OperatorWorkloadRegistry,
     default_operator_workload_registry,
+)
+from edgeshard.profiling.operator.verification import (
+    DEFAULT_VERIFICATION_TOLERANCE,
+    PerformanceClassVerification,
+    VerificationComparison,
+    select_verification_signatures,
+    verification_suite,
+    verify_performance_class,
 )
 from edgeshard.profiling.operator.workloads import OperatorWorkload
 
@@ -269,159 +270,6 @@ class IncrementalOperatorProfiler:
         return IncrementalProfilingResult(plan=plan, records=records)
 
 
-# ---------------------------------------------------------------------------
-# §29 — performance-class verification
-# ---------------------------------------------------------------------------
-
-DEFAULT_VERIFICATION_TOLERANCE = 0.15
-"""Default relative-mean tolerance for class-compatibility verdicts."""
-
-
-def verification_suite(
-    *,
-    dtype: str = "bf16",
-    backend_family: str = "torch",
-    gemm_dim: int = 1024,
-    attention_batch: int = 1,
-    attention_heads: int = 16,
-    attention_kv_heads: int = 4,
-    attention_head_dim: int = 64,
-    attention_length: int = 256,
-    norm_batch: int = 1,
-    norm_tokens: int = 512,
-    norm_hidden: int = 4096,
-) -> tuple[OperatorSignature, ...]:
-    """The very small §29 suite: one GEMM, one attention, one norm.
-
-    The norm case is the memory-sensitive workload (bandwidth-bound eager
-    kernels over a large activation). Dimensions default to production
-    scale but every knob is explicit so the suite can be shrunk for tests
-    or widened per class — it is a policy, not a domain constant.
-    """
-    return (
-        OperatorSignature(
-            kind=OperatorKind.GEMM,
-            parameters=GemmSignature(
-                m=gemm_dim, n=gemm_dim, k=gemm_dim, dtype=dtype, transpose_b=True
-            ),
-            backend_family=backend_family,
-        ),
-        OperatorSignature(
-            kind=OperatorKind.ATTENTION,
-            parameters=AttentionSignature(
-                batch_size=attention_batch,
-                num_heads=attention_heads,
-                num_kv_heads=attention_kv_heads,
-                head_dim=attention_head_dim,
-                q_len=attention_length,
-                kv_len=attention_length,
-                dtype=dtype,
-                phase=InferencePhase.PREFILL,
-            ),
-            backend_family=backend_family,
-        ),
-        OperatorSignature(
-            kind=OperatorKind.NORM,
-            parameters=NormSignature(
-                batch_size=norm_batch,
-                sequence_length=norm_tokens,
-                hidden_size=norm_hidden,
-                dtype=dtype,
-                variant=NormVariant.RMS,
-            ),
-            backend_family=backend_family,
-        ),
-    )
-
-
-@dataclass(frozen=True)
-class VerificationComparison:
-    """One suite signature compared between reference and candidate."""
-
-    operator_signature_id: str
-    reference_mean_ms: float
-    candidate_mean_ms: float
-    relative_deviation: float
-    within_tolerance: bool
-
-
-@dataclass(frozen=True)
-class PerformanceClassVerification:
-    """§29 verdict for a device claiming an existing performance class.
-
-    ``compatible`` licenses reuse of the class's measurements on the
-    candidate device; otherwise the device must be separated into its own
-    class (or marked incompatible) — that decision belongs to the Master,
-    the verdict here is the empirical fact.
-    """
-
-    tolerance: float
-    comparisons: tuple[VerificationComparison, ...]
-    max_relative_deviation: float
-    compatible: bool
-
-
-def verify_performance_class(
-    references: Mapping[str, MeasurementRecord],
-    candidates: Mapping[str, MeasurementRecord],
-    *,
-    tolerance: float = DEFAULT_VERIFICATION_TOLERANCE,
-) -> PerformanceClassVerification:
-    """Compare candidate-device means against class references (§29).
-
-    Both sides must cover exactly the same signature ids (the suite), and
-    every record must carry a latency mean — comparisons are between
-    observed facts, never estimates (§52.1, §52.2). Deliberately simple:
-    per-signature relative deviation against one shared tolerance.
-    """
-    if not references:
-        raise ValueError("verification suite must not be empty")
-    if tolerance <= 0.0:
-        raise ValueError(f"tolerance must be positive, got {tolerance}")
-    missing_in_candidate = sorted(set(references) - set(candidates))
-    missing_in_reference = sorted(set(candidates) - set(references))
-    if missing_in_candidate or missing_in_reference:
-        raise ValueError(
-            "reference and candidate must cover the same suite signatures; "
-            f"missing in candidate: {missing_in_candidate}, "
-            f"missing in reference: {missing_in_reference}"
-        )
-    comparisons = []
-    for signature_id in sorted(references):
-        reference_mean = _latency_mean_ms(references[signature_id], "reference")
-        candidate_mean = _latency_mean_ms(candidates[signature_id], "candidate")
-        deviation = abs(candidate_mean - reference_mean) / reference_mean
-        comparisons.append(
-            VerificationComparison(
-                operator_signature_id=signature_id,
-                reference_mean_ms=reference_mean,
-                candidate_mean_ms=candidate_mean,
-                relative_deviation=deviation,
-                within_tolerance=deviation <= tolerance,
-            )
-        )
-    return PerformanceClassVerification(
-        tolerance=tolerance,
-        comparisons=tuple(comparisons),
-        max_relative_deviation=max(
-            comparison.relative_deviation for comparison in comparisons
-        ),
-        compatible=all(comparison.within_tolerance for comparison in comparisons),
-    )
-
-
-def _latency_mean_ms(record: MeasurementRecord, role: str) -> float:
-    latency = record.metrics.latency
-    if latency is None or latency.summary.mean is None:
-        raise ValueError(
-            f"{role} record {record.measurement_id} carries no latency observation"
-        )
-    mean = latency.summary.mean
-    if not math.isfinite(mean) or mean <= 0.0:
-        raise ValueError(f"{role} record {record.measurement_id} has a non-positive mean")
-    return mean
-
-
 __all__ = [
     "DEFAULT_VERIFICATION_TOLERANCE",
     "IncrementalOperatorProfiler",
@@ -433,6 +281,7 @@ __all__ = [
     "VerificationComparison",
     "operator_case_spec",
     "plan_incremental_profiling",
+    "select_verification_signatures",
     "verification_suite",
     "verify_performance_class",
 ]

@@ -134,6 +134,7 @@ def test_profiling_defaults_are_disabled_and_frozen_shape() -> None:
     assert config.profiling.admin_host == "0.0.0.0"
     assert config.profiling.admin_port == 51_001
     assert config.profiling.store_path == "edgeshard-profiles.sqlite3"
+    assert config.profiling.verification_tolerance == 0.15
 
 
 def test_profiling_section_from_yaml(tmp_path: Path) -> None:
@@ -145,6 +146,7 @@ profiling:
   admin_host: 127.0.0.1
   admin_port: 0
   store_path: /tmp/profiles.sqlite3
+  verification_tolerance: 0.2
 """,
     )
     config = MasterServeConfig.from_yaml(path)
@@ -152,6 +154,7 @@ profiling:
     assert config.profiling.admin_host == "127.0.0.1"
     assert config.profiling.admin_port == 0  # OS-chosen; READY reports it
     assert config.profiling.store_path == "/tmp/profiles.sqlite3"
+    assert config.profiling.verification_tolerance == 0.2
 
 
 @pytest.mark.parametrize(
@@ -161,6 +164,8 @@ profiling:
         {"admin_port": -1},
         {"admin_port": 65_536},
         {"store_path": ""},
+        {"verification_tolerance": 0.0},
+        {"verification_tolerance": float("nan")},
         {"bogus": 1},  # extra keys are forbidden (Phase 0 config discipline)
     ],
 )

@@ -37,7 +37,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Protocol
+from typing import Protocol
 from uuid import uuid4
 
 import grpc
@@ -46,6 +46,7 @@ from edgeshard.control.master.service import MasterService
 from edgeshard.profiling.domain.environment import (
     DevicePerformanceClassMembership,
     EnvironmentFingerprint,
+    environment_fingerprint_id,
 )
 from edgeshard.profiling.domain.experiment import (
     CaseOutcome,
@@ -63,6 +64,7 @@ from edgeshard.profiling.domain.experiment import (
     profiling_experiment_id,
 )
 from edgeshard.profiling.domain.hashing import JsonScalar, canonical_sha256
+from edgeshard.profiling.domain.measurement import MeasurementRecord
 from edgeshard.profiling.domain.network import NetworkEndpointProfile, ProbeKind
 from edgeshard.profiling.domain.session import (
     ModelSessionFacts,
@@ -71,6 +73,7 @@ from edgeshard.profiling.domain.session import (
     profiling_session_id,
 )
 from edgeshard.profiling.domain.signature import (
+    OperatorSignature,
     ProfilingGranularity,
     operator_signature_id,
 )
@@ -80,6 +83,12 @@ from edgeshard.profiling.network.classifier import (
     WorkerNetworkFacts,
     selected_ipv4_address,
     worker_network_facts,
+)
+from edgeshard.profiling.operator.verification import (
+    PerformanceClassVerification,
+    PerformanceClassVerificationPlan,
+    select_verification_signatures,
+    verify_performance_class,
 )
 from edgeshard.profiling.store.base import ProfileStore, ProfileStoreError, StoredExperiment
 from edgeshard.protocol.profiling.grpc_client import WorkerProfilingClient
@@ -102,9 +111,6 @@ from edgeshard.protocol.profiling.mapper import (
 )
 
 logger = logging.getLogger("edgeshard.control.master.profiling")
-
-if TYPE_CHECKING:
-    from edgeshard.profiling.operator.profiler import PerformanceClassVerification
 
 _TERMINAL_CASE_STATES = frozenset(
     {CaseState.COMPLETED, CaseState.FAILED, CaseState.CANCELLED}
@@ -643,6 +649,180 @@ class ProfilingController:
         return self._store.measured_operator_signature_ids_for_environment(
             fingerprint
         )
+
+    def plan_performance_class_verification(
+        self,
+        fingerprint: EnvironmentFingerprint,
+        signatures: Iterable[OperatorSignature],
+        *,
+        tolerance: float,
+    ) -> PerformanceClassVerificationPlan | None:
+        """Plan §29 sentinels against one verified compatible reference.
+
+        ``None`` means that the candidate is already verified, already had a
+        failed verification attempt, or has no complete trustworthy baseline;
+        callers then continue with normal local profiling.
+        """
+        class_id = fingerprint.device_performance_class_id
+        worker_id = fingerprint.worker_id
+        device_id = fingerprint.device_id
+        if class_id is None or worker_id is None or device_id is None:
+            return None
+
+        memberships = self._store.performance_class_memberships(class_id)
+        candidate = next(
+            (
+                membership
+                for membership in memberships
+                if membership.worker_id == worker_id
+                and membership.device_id == device_id
+            ),
+            None,
+        )
+        if (
+            candidate is None
+            or candidate.verified
+            or candidate.evidence_measurement_ids
+        ):
+            return None
+        verified_sources = {
+            (membership.worker_id, membership.device_id)
+            for membership in memberships
+            if membership.verified
+        }
+        if not verified_sources:
+            return None
+
+        suite = select_verification_signatures(signatures)
+        if not suite:
+            return None
+        wanted = {operator_signature_id(signature) for signature in suite}
+        compatible_id = environment_fingerprint_id(fingerprint)
+        by_source: dict[tuple[str, str], dict[str, MeasurementRecord]] = {}
+        for record in self._store.query_measurements(
+            environment_fingerprint_id=compatible_id
+        ):
+            quality = record.quality
+            environment = record.environment
+            if quality is None or not quality.eligible_for_calibration:
+                continue
+            if (
+                environment is None
+                or environment.device_performance_class_id != class_id
+                or environment.worker_id is None
+                or environment.device_id is None
+                or environment_fingerprint_id(environment) != compatible_id
+            ):
+                continue
+            source = (environment.worker_id, environment.device_id)
+            if source not in verified_sources:
+                continue
+            stored_case = self._store.get_case(record.case_id)
+            if (
+                stored_case is None
+                or not isinstance(stored_case.case.spec, ModelCaseSpec)
+                or stored_case.case.spec.operator_signature is None
+            ):
+                continue
+            signature_id = operator_signature_id(
+                stored_case.case.spec.operator_signature
+            )
+            if signature_id in wanted:
+                # query_measurements is chronological; the newest eligible
+                # append is the deterministic baseline for this source.
+                by_source.setdefault(source, {})[signature_id] = record
+
+        complete_sources = sorted(
+            source for source, records in by_source.items() if set(records) == wanted
+        )
+        if not complete_sources:
+            return None
+        reference_worker_id, reference_device_id = complete_sources[0]
+        references = by_source[(reference_worker_id, reference_device_id)]
+        return PerformanceClassVerificationPlan(
+            candidate_environment=fingerprint,
+            signatures=suite,
+            reference_measurements=tuple(
+                references[operator_signature_id(signature)] for signature in suite
+            ),
+            reference_worker_id=reference_worker_id,
+            reference_device_id=reference_device_id,
+            tolerance=tolerance,
+        )
+
+    def complete_performance_class_verification(
+        self,
+        plan: PerformanceClassVerificationPlan,
+        report: ExperimentReport,
+    ) -> PerformanceClassVerification | None:
+        """Persist a §29 verdict after every sentinel produced a measurement."""
+        fingerprint = plan.candidate_environment
+        worker_id = fingerprint.worker_id
+        device_id = fingerprint.device_id
+        if worker_id is None or device_id is None:
+            return None
+        wanted = {operator_signature_id(signature) for signature in plan.signatures}
+        candidates: dict[str, MeasurementRecord] = {}
+        for case_report in report.cases:
+            outcome = case_report.outcome
+            record = outcome.record if outcome is not None else None
+            if record is None or record.environment is None:
+                continue
+            environment = record.environment
+            if (
+                environment.worker_id != worker_id
+                or environment.device_id != device_id
+                or environment_fingerprint_id(environment)
+                != environment_fingerprint_id(fingerprint)
+            ):
+                continue
+            stored_case = self._store.get_case(case_report.case_id)
+            if (
+                stored_case is None
+                or not isinstance(stored_case.case.spec, ModelCaseSpec)
+                or stored_case.case.spec.operator_signature is None
+            ):
+                continue
+            signature_id = operator_signature_id(
+                stored_case.case.spec.operator_signature
+            )
+            if signature_id in wanted:
+                candidates[signature_id] = record
+        if set(candidates) != wanted:
+            logger.warning(
+                "performance-class verification incomplete for %s@%s: "
+                "%d/%d sentinel measurements",
+                worker_id,
+                device_id,
+                len(candidates),
+                len(wanted),
+            )
+            return None
+
+        verification = verify_performance_class(
+            plan.references, candidates, tolerance=plan.tolerance
+        )
+        evidence_measurement_ids = tuple(
+            candidates[operator_signature_id(signature)].measurement_id
+            for signature in plan.signatures
+        )
+        self.record_performance_class_verification(
+            fingerprint,
+            verification,
+            evidence_measurement_ids=evidence_measurement_ids,
+        )
+        logger.info(
+            "performance-class verification %s for %s@%s "
+            "(reference=%s@%s, tolerance=%s, max_deviation=%s)",
+            "passed" if verification.compatible else "failed",
+            worker_id,
+            device_id,
+            plan.reference_worker_id,
+            plan.reference_device_id,
+            verification.tolerance,
+            verification.max_relative_deviation,
+        )
+        return verification
 
     def record_performance_class_verification(
         self,

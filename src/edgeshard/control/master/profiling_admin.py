@@ -35,6 +35,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
+import math
 from collections.abc import Mapping
 from collections.abc import Set as AbstractSet
 
@@ -59,6 +60,11 @@ from edgeshard.profiling.domain.session import (
     ProfilingSessionRequest,
 )
 from edgeshard.profiling.domain.signature import ProfilingGranularity
+from edgeshard.profiling.operator.planning import operator_case_spec
+from edgeshard.profiling.operator.verification import (
+    DEFAULT_VERIFICATION_TOLERANCE,
+    PerformanceClassVerificationPlan,
+)
 from edgeshard.profiling.store.base import ProfileStoreError
 from edgeshard.profiling.strategy.base import ProfilingStrategy
 from edgeshard.profiling.strategy.default import DefaultProfilingStrategy
@@ -88,11 +94,21 @@ class MasterProfilingAdmin:
         *,
         controller: ProfilingController,
         strategy: ProfilingStrategy | None = None,
+        verification_tolerance: float = DEFAULT_VERIFICATION_TOLERANCE,
     ) -> None:
+        if not math.isfinite(verification_tolerance) or verification_tolerance <= 0.0:
+            raise ValueError(
+                "verification_tolerance must be finite and positive, got "
+                f"{verification_tolerance}"
+            )
         self._controller = controller
         self._strategy = strategy if strategy is not None else DefaultProfilingStrategy()
+        self._verification_tolerance = verification_tolerance
         self._runs: dict[str, asyncio.Task[ExperimentReport]] = {}
         self._reports: dict[str, ExperimentReport] = {}
+        self._pending_verifications: dict[
+            str, tuple[PerformanceClassVerificationPlan, ...]
+        ] = {}
         self._target_locks: dict[tuple[str, str], asyncio.Lock] = {}
         self._run_target_locks: dict[str, tuple[asyncio.Lock, ...]] = {}
 
@@ -105,8 +121,11 @@ class MasterProfilingAdmin:
         held_target_locks = await self._acquire_target_locks(intent)
         launched = False
         try:
+            verification_plans: list[PerformanceClassVerificationPlan] = []
             try:
-                cases = await self._expand(intent)
+                cases = await self._expand(
+                    intent, verification_plans=verification_plans
+                )
             except _AdminRejection as exc:
                 logger.info("start_experiment rejected: %s", exc)
                 return mapper.StartExperimentResponse(accepted=False, detail=str(exc))
@@ -129,6 +148,10 @@ class MasterProfilingAdmin:
                     and intent.kind is ProfilingSessionKind.OPERATOR
                 ),
             )
+            if verification_plans:
+                self._pending_verifications[experiment.experiment_id] = tuple(
+                    verification_plans
+                )
             self._launch(experiment.experiment_id, held_target_locks)
             launched = True
             logger.info(
@@ -175,6 +198,7 @@ class MasterProfilingAdmin:
         self._release_target_locks(
             self._run_target_locks.pop(experiment_id, ())
         )
+        verification_plans = self._pending_verifications.pop(experiment_id, ())
         if task.cancelled():
             return
         exc = task.exception()
@@ -187,7 +211,19 @@ class MasterProfilingAdmin:
             return
         # Keep the terminal report for callers already attached to this
         # process. The durable store remains authoritative after restart.
-        self._reports[experiment_id] = task.result()
+        report = task.result()
+        for plan in verification_plans:
+            try:
+                self._controller.complete_performance_class_verification(
+                    plan, report
+                )
+            except Exception:
+                logger.exception(
+                    "finalizing performance-class verification for experiment %s "
+                    "failed",
+                    experiment_id,
+                )
+        self._reports[experiment_id] = report
 
     async def _acquire_target_locks(
         self, intent: ProfilingRequest
@@ -330,11 +366,20 @@ class MasterProfilingAdmin:
 
     # -- intent expansion (§46-§47) -----------------------------------------------
 
-    async def _expand(self, intent: ProfilingRequest) -> tuple[ProfilingCase, ...]:
+    async def _expand(
+        self,
+        intent: ProfilingRequest,
+        *,
+        verification_plans: list[PerformanceClassVerificationPlan] | None = None,
+    ) -> tuple[ProfilingCase, ...]:
         if intent.kind is ProfilingSessionKind.NETWORK:
             workers = self._resolve_workers(intent.worker_ids)
             return self._expand_network(intent, workers)
-        return await self._expand_model_family(intent, self._resolve_targets(intent))
+        return await self._expand_model_family(
+            intent,
+            self._resolve_targets(intent),
+            verification_plans=verification_plans,
+        )
 
     def _resolve_targets(
         self, intent: ProfilingRequest
@@ -454,7 +499,11 @@ class MasterProfilingAdmin:
         return cases
 
     async def _expand_model_family(
-        self, intent: ProfilingRequest, targets: tuple[WorkerDeviceTarget, ...]
+        self,
+        intent: ProfilingRequest,
+        targets: tuple[WorkerDeviceTarget, ...],
+        *,
+        verification_plans: list[PerformanceClassVerificationPlan] | None = None,
     ) -> tuple[ProfilingCase, ...]:
         model = intent.model
         dtype = intent.dtype
@@ -506,6 +555,27 @@ class MasterProfilingAdmin:
                     if facts.environment is not None
                     else None
                 )
+                verification_plan = (
+                    self._controller.plan_performance_class_verification(
+                        operator_environment,
+                        facts.operator_signatures,
+                        tolerance=self._verification_tolerance,
+                    )
+                    if intent.kind is ProfilingSessionKind.OPERATOR
+                    and operator_environment is not None
+                    else None
+                )
+                if verification_plan is not None:
+                    cases.extend(
+                        ProfilingCase.for_spec(
+                            worker_id,
+                            operator_case_spec(signature, device_id=device_id),
+                        )
+                        for signature in verification_plan.signatures
+                    )
+                    if verification_plans is not None:
+                        verification_plans.append(verification_plan)
+                    continue
                 measured_ids = (
                     self._controller.measured_operator_signature_ids_for_environment(
                         operator_environment

@@ -43,6 +43,7 @@ from edgeshard.profiling.operator.profiler import (
     DEFAULT_VERIFICATION_TOLERANCE,
     OperatorProfiler,
     operator_case_spec,
+    select_verification_signatures,
     verification_suite,
     verify_performance_class,
 )
@@ -144,6 +145,26 @@ class TestVerificationSuite:
 
     def test_default_tolerance_is_a_policy_constant(self) -> None:
         assert DEFAULT_VERIFICATION_TOLERANCE == 0.15
+
+    def test_model_suite_selects_gemm_attention_and_memory_sensitive_norm(
+        self,
+    ) -> None:
+        suite = _tiny_suite()
+        assert select_verification_signatures(suite) == suite
+
+    def test_gemm_only_model_selects_small_medium_large(self) -> None:
+        signatures = tuple(
+            OperatorSignature(
+                kind=OperatorKind.GEMM,
+                parameters=GemmSignature(
+                    m=64 * (index + 1), n=64, k=64, dtype="fp32"
+                ),
+                backend_family="torch",
+            )
+            for index in range(12)
+        )
+        selected = select_verification_signatures(reversed(signatures))
+        assert selected == (signatures[0], signatures[6], signatures[11])
 
 
 class TestVerifyPerformanceClass:

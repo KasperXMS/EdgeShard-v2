@@ -436,7 +436,12 @@ async def _master_serve(
     if serve_config.profiling.enabled:
         store = SqliteProfileStore(serve_config.profiling.store_path)
         controller = ProfilingController(service=service, store=store)
-        admin = MasterProfilingAdmin(controller=controller)
+        admin = MasterProfilingAdmin(
+            controller=controller,
+            verification_tolerance=(
+                serve_config.profiling.verification_tolerance
+            ),
+        )
         admin_server, admin_port = await start_admin_server(
             admin,
             host=serve_config.profiling.admin_host,
