@@ -33,7 +33,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -146,6 +146,9 @@ Experiment-dispatched sessions are scoped by their ``experiment_id``; an
 inspection happens *before* any experiment exists, so it gets its own scope
 namespace (uniqueness per call is added by :meth:`_inspection_session_id`).
 """
+
+DEFAULT_DEVICE_BUSY_BACKOFF_S = (1.0, 2.0, 4.0, 8.0)
+"""Bounded PrepareProfilingSession retry schedule for transient GPU activity."""
 
 
 class ProfilingTransport(Protocol):
@@ -441,6 +444,7 @@ class ProfilingController:
         transport_factory: Callable[[str], ProfilingTransport] = WorkerProfilingClient,
         clock: Callable[[], datetime] = _utc_now,
         rpc_timeout: float | None = None,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         if rpc_timeout is not None and rpc_timeout <= 0:
             raise ValueError(
@@ -451,6 +455,8 @@ class ProfilingController:
         self._transport_factory = transport_factory
         self._clock = clock
         self._rpc_timeout = rpc_timeout
+        self._device_busy_backoff_s = DEFAULT_DEVICE_BUSY_BACKOFF_S
+        self._sleep = sleep
         self._inspection_seq = 0
 
     # -- experiment definitions (§8.1, §44) ----------------------------------
@@ -649,6 +655,68 @@ class ProfilingController:
         return self._store.measured_operator_signature_ids_for_environment(
             fingerprint
         )
+
+    def missing_model_cases_for_environment(
+        self,
+        cases: Iterable[ProfilingCase],
+        fingerprint: EnvironmentFingerprint,
+    ) -> tuple[ProfilingCase, ...]:
+        """Filter measured MODULE/LAYER cases in one physical environment.
+
+        Execution case ids are intentionally ignored: reruns have append-only
+        ids, while reuse is keyed by the canonical worker + case spec. Operator
+        cases retain their existing performance-class-aware planning path.
+        """
+        planned = tuple(cases)
+        worker_id = fingerprint.worker_id
+        device_id = fingerprint.device_id
+        if worker_id is None or device_id is None:
+            return planned
+        compatibility_id = environment_fingerprint_id(fingerprint)
+        measured_canonical_ids: set[str] = set()
+        for record in self._store.query_measurements(
+            environment_fingerprint_id=compatibility_id
+        ):
+            if (
+                record.quality is not None
+                and not record.quality.eligible_for_calibration
+            ):
+                continue
+            environment = record.environment
+            if (
+                environment is None
+                or environment.worker_id != worker_id
+                or environment.device_id != device_id
+                or environment_fingerprint_id(environment) != compatibility_id
+            ):
+                continue
+            stored_case = self._store.get_case(record.case_id)
+            if stored_case is None or not isinstance(
+                stored_case.case.spec, ModelCaseSpec
+            ):
+                continue
+            if stored_case.case.spec.granularity not in {
+                ProfilingGranularity.MODULE,
+                ProfilingGranularity.TRANSFORMER_LAYER,
+            }:
+                continue
+            measured_canonical_ids.add(
+                profiling_case_id(
+                    stored_case.case.worker_id, stored_case.case.spec
+                )
+            )
+
+        missing: list[ProfilingCase] = []
+        for case in planned:
+            spec = case.spec
+            if (
+                not isinstance(spec, ModelCaseSpec)
+                or spec.granularity is ProfilingGranularity.OPERATOR
+                or profiling_case_id(case.worker_id, spec)
+                not in measured_canonical_ids
+            ):
+                missing.append(case)
+        return tuple(missing)
 
     def plan_performance_class_verification(
         self,
@@ -1317,27 +1385,47 @@ class ProfilingController:
             session_request=plan.session_request,
             network_facts=network_facts,
         )
-        try:
-            response = await transport.prepare_profiling_session(
-                request, timeout=self._rpc_timeout
+        response: PrepareProfilingSessionResponse
+        for attempt in range(len(self._device_busy_backoff_s) + 1):
+            try:
+                response = await transport.prepare_profiling_session(
+                    request, timeout=self._rpc_timeout
+                )
+            except grpc.aio.AioRpcError as exc:
+                logger.warning(
+                    "prepare of session %s on worker %s lost: %s",
+                    plan.session_id,
+                    tokens.worker_id,
+                    exc,
+                )
+                return _transport_failure(exc, "PrepareProfilingSession")
+            except Exception as exc:
+                logger.exception(
+                    "prepare of session %s on worker %s raised",
+                    plan.session_id,
+                    tokens.worker_id,
+                )
+                return _unexpected_failure(exc, "PrepareProfilingSession")
+            if response.accepted:
+                return response
+            busy = response.reason is ProfilingRejection.DEVICE_BUSY or (
+                response.failure is not None
+                and response.failure.category is ProfilingErrorCategory.DEVICE_BUSY
             )
-        except grpc.aio.AioRpcError as exc:
-            logger.warning(
-                "prepare of session %s on worker %s lost: %s",
-                plan.session_id,
-                tokens.worker_id,
-                exc,
-            )
-            return _transport_failure(exc, "PrepareProfilingSession")
-        except Exception as exc:
-            logger.exception(
-                "prepare of session %s on worker %s raised",
-                plan.session_id,
-                tokens.worker_id,
-            )
-            return _unexpected_failure(exc, "PrepareProfilingSession")
-        if response.accepted:
-            return response
+            if busy and attempt < len(self._device_busy_backoff_s):
+                delay = self._device_busy_backoff_s[attempt]
+                logger.info(
+                    "session %s prepare on worker %s is device_busy; retrying "
+                    "in %.1fs (%d/%d)",
+                    plan.session_id,
+                    tokens.worker_id,
+                    delay,
+                    attempt + 1,
+                    len(self._device_busy_backoff_s),
+                )
+                await self._sleep(delay)
+                continue
+            break
         if response.failure is not None:
             # Typed domain preparation failure (§42): the category (e.g.
             # UNSUPPORTED_MODEL) travels into the case reports intact.

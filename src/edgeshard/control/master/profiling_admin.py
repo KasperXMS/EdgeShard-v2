@@ -145,7 +145,8 @@ class MasterProfilingAdmin:
                 force_new_execution=not intent.missing_only,
                 rerun_terminal_configuration=(
                     intent.missing_only
-                    and intent.kind is ProfilingSessionKind.OPERATOR
+                    and intent.kind
+                    in {ProfilingSessionKind.MODEL, ProfilingSessionKind.OPERATOR}
                 ),
             )
             if verification_plans:
@@ -590,7 +591,18 @@ class MasterProfilingAdmin:
                 device_ids=(device_id,),
                 measured_signature_ids=measured,
             )
-            cases.extend(plan.cases)
+            planned_cases = plan.cases
+            if (
+                intent.kind is ProfilingSessionKind.MODEL
+                and intent.missing_only
+                and facts.environment is not None
+            ):
+                planned_cases = (
+                    self._controller.missing_model_cases_for_environment(
+                        planned_cases, facts.environment
+                    )
+                )
+            cases.extend(planned_cases)
         if intent.kind is ProfilingSessionKind.OPERATOR:
             cases = [
                 case

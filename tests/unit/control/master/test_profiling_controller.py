@@ -240,6 +240,7 @@ class FakeTransport:
         self.prepare_response: PrepareProfilingSessionResponse = (
             PrepareProfilingSessionResponse(accepted=True)
         )
+        self.prepare_responses: list[PrepareProfilingSessionResponse] = []
         self.run_environment = OPERATOR_ENVIRONMENT
         self.prepare_error: Exception | None = None
         self._run_scripts: dict[str, RunProfilingCaseResponse | Exception] = {}
@@ -271,6 +272,8 @@ class FakeTransport:
         self.timeouts.append(timeout)
         if self.prepare_error is not None:
             raise self.prepare_error
+        if self.prepare_responses:
+            return self.prepare_responses.pop(0)
         return self.prepare_response
 
     async def run_profiling_case(
@@ -363,6 +366,7 @@ class Rig:
     controller: ProfilingController
     clock: FakeClock
     transports: dict[str, FakeTransport]
+    sleep_delays: list[float]
 
     def transport(self, endpoint: str = ENDPOINT_1) -> FakeTransport:
         return self.transports[endpoint]
@@ -373,6 +377,10 @@ def make_rig(tmp_path: Path, *, rpc_timeout: float | None = None) -> Rig:
     service = MasterService(None, monotonic=clock.monotonic, wall=clock.wall)
     store = SqliteProfileStore(tmp_path / "profile.sqlite")
     transports: dict[str, FakeTransport] = {}
+    sleep_delays: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        sleep_delays.append(delay)
 
     def factory(endpoint: str) -> FakeTransport:
         return transports.setdefault(endpoint, FakeTransport(endpoint))
@@ -383,6 +391,7 @@ def make_rig(tmp_path: Path, *, rpc_timeout: float | None = None) -> Rig:
         transport_factory=factory,
         clock=clock.wall,
         rpc_timeout=rpc_timeout,
+        sleep=fake_sleep,
     )
     return Rig(
         service=service,
@@ -390,6 +399,7 @@ def make_rig(tmp_path: Path, *, rpc_timeout: float | None = None) -> Rig:
         controller=controller,
         clock=clock,
         transports=transports,
+        sleep_delays=sleep_delays,
     )
 
 
@@ -897,6 +907,38 @@ async def test_worker_without_profiling_endpoint_fails_typed(tmp_path: Path) -> 
 # ---------------------------------------------------------------------------
 
 
+async def test_prepare_transient_device_busy_retries_without_duplicate_work(
+    tmp_path: Path,
+) -> None:
+    rig = make_rig(tmp_path)
+    await register_worker(rig, W1)
+    case = operator_case()
+    experiment = rig.controller.create_experiment(strategy_id="default", cases=[case])
+    transport = rig.transports.setdefault(ENDPOINT_1, FakeTransport(ENDPOINT_1))
+    busy = PrepareProfilingSessionResponse(
+        accepted=False,
+        detail="profiling telemetry still observes the previous container",
+        reason=ProfilingRejection.DEVICE_BUSY,
+    )
+    transport.prepare_responses = [
+        busy,
+        busy,
+        PrepareProfilingSessionResponse(accepted=True),
+    ]
+
+    report = await rig.controller.run_experiment(experiment.experiment_id)
+
+    assert report.state is ExperimentState.COMPLETED
+    assert rig.sleep_delays == [1.0, 2.0]
+    assert len(transport.prepare_requests) == 3
+    assert len(
+        {request.profiling_session_id for request in transport.prepare_requests}
+    ) == 1
+    assert len(transport.run_requests) == 1
+    assert len(transport.close_requests) == 1
+    assert len(rig.store.query_measurements(case_id=case.case_id)) == 1
+
+
 async def test_prepare_device_busy_refusal_keeps_category(tmp_path: Path) -> None:
     """P2G DoD busy GPU: the §39 lease refusal survives into the report."""
     rig = make_rig(tmp_path)
@@ -919,6 +961,8 @@ async def test_prepare_device_busy_refusal_keeps_category(tmp_path: Path) -> Non
     assert failure.category is ProfilingErrorCategory.DEVICE_BUSY
     assert "device_busy" in failure.message
     assert transport.run_requests == []  # never benchmarked
+    assert len(transport.prepare_requests) == 5
+    assert rig.sleep_delays == [1.0, 2.0, 4.0, 8.0]
     assert len(transport.close_requests) == 1
     assert rig.store.query_measurements(case_id=case.case_id) == ()
 
@@ -943,6 +987,8 @@ async def test_prepare_typed_failure_preserved(tmp_path: Path) -> None:
 
     failure = failure_of(report_for(report, case.case_id))
     assert failure is typed  # category AND details preserved, no string parsing
+    assert len(transport.prepare_requests) == 1
+    assert rig.sleep_delays == []
     assert transport.run_requests == []
 
 
@@ -1619,6 +1665,46 @@ class TestClusterNetworkFactsAndReuse:
         ) == {
             operator_signature_id(OPERATOR_SIG)
         }
+
+    def test_model_case_reuse_requires_same_target_and_environment(
+        self, tmp_path: Path
+    ) -> None:
+        rig = make_rig(tmp_path)
+        layer = layer_case()
+        module = ProfilingCase.for_spec(
+            W1,
+            ModelCaseSpec(
+                granularity=ProfilingGranularity.MODULE,
+                device_ids=("gpu-0",),
+                dtype="fp32",
+                model=MODEL,
+                module_signature=MODULE_SIG_MLP,
+                sequence_length=512,
+            ),
+        )
+        for index, case in enumerate((layer, module)):
+            rig.store.append_case(case)
+            rig.store.append_measurement(
+                make_record(
+                    case.case_id,
+                    measurement_id=f"model-measurement-{index}",
+                    environment=ENVIRONMENT,
+                )
+            )
+
+        assert rig.controller.missing_model_cases_for_environment(
+            (layer, module), ENVIRONMENT
+        ) == ()
+        incompatible = dataclasses.replace(
+            ENVIRONMENT, backend_revision="sha256:different-image"
+        )
+        assert rig.controller.missing_model_cases_for_environment(
+            (layer, module), incompatible
+        ) == (layer, module)
+        other_device = dataclasses.replace(ENVIRONMENT, device_id="gpu-1")
+        assert rig.controller.missing_model_cases_for_environment(
+            (layer, module), other_device
+        ) == (layer, module)
 
     async def test_record_model_facts_lands_in_the_snapshot(
         self, tmp_path: Path

@@ -329,14 +329,16 @@ async def _worker_serve(config: WorkerConfig) -> None:
             registration_session_id=registration_session_id,
         )
 
+    compute_executor = ContainerComputeProfilingExecutor(
+        docker_client_factory=inspector.require_docker_client,
+        model_store=ModelStore(model_root=config.model_store.root),
+    )
+    compute_executor.cleanup_stale_containers()
     runner = WorkerProfilingRunner(
         sessions=ProfilingSessionManager(token_source=current_tokens),
         inspector=inspector,
         model_store_root=config.model_store.root,
-        compute_executor=ContainerComputeProfilingExecutor(
-            docker_client_factory=inspector.require_docker_client,
-            model_store=ModelStore(model_root=config.model_store.root),
-        ),
+        compute_executor=compute_executor,
     )
     server, port = await start_profiling_server(
         runner, host=config.profiling.host, port=config.profiling.port

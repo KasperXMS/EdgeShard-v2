@@ -870,6 +870,118 @@ class TestStartExperimentModelFamily:
             environment_fingerprint_id(transport.run_environment),
         }
 
+    async def test_model_missing_only_reruns_only_failed_layer_cases(
+        self, tmp_path: Path
+    ) -> None:
+        rig = make_rig(tmp_path)
+        await register_worker(rig, W1)
+        assert SESSION_FACTS.environment is not None
+        model_environment = dataclasses.replace(
+            SESSION_FACTS.environment, device_id=RTX_GPU_DEVICE_ID
+        )
+        layer_template = SESSION_FACTS.layer_entries[0]
+        facts = dataclasses.replace(
+            SESSION_FACTS,
+            characterization=dataclasses.replace(
+                SESSION_FACTS.characterization,
+                num_layers=25,
+                stages=tuple(
+                    dataclasses.replace(stage, layer_count=25)
+                    if stage.layer_count is not None
+                    else stage
+                    for stage in SESSION_FACTS.characterization.stages
+                ),
+            ),
+            layer_entries=tuple(
+                dataclasses.replace(
+                    layer_template,
+                    index=index,
+                    module_path=f"model.layers.{index}",
+                )
+                for index in range(25)
+            ),
+            environment=model_environment,
+        )
+        transport = transport_for(rig)
+        transport.prepare_response = PrepareProfilingSessionResponse(
+            accepted=True, session_facts=facts
+        )
+        transport.run_environment = model_environment
+        admin = make_admin(rig)
+        intent = model_intent()
+
+        first = await admin.start_experiment(StartExperimentRequest(request=intent))
+        assert first.accepted
+        first_cases = stored_cases(rig, first.experiment_id)
+        assert len(first_cases) == 11
+        busy_case_ids: list[str] = []
+        for index, case in enumerate(first_cases):
+            assert isinstance(case.spec, ModelCaseSpec)
+            if (
+                case.spec.granularity is ProfilingGranularity.TRANSFORMER_LAYER
+                and case.spec.layer_index == 24
+            ):
+                busy_case_ids.append(case.case_id)
+                transport.script_run(
+                    case.case_id,
+                    RunProfilingCaseResponse(
+                        accepted=True,
+                        outcome=CaseOutcome.from_failure(
+                            ProfilingFailure(
+                                category=ProfilingErrorCategory.DEVICE_BUSY,
+                                message="profiling utilization floor still active",
+                            )
+                        ),
+                    ),
+                )
+                continue
+            environment = (
+                dataclasses.replace(model_environment, model_revision=None)
+                if case.spec.granularity is ProfilingGranularity.OPERATOR
+                else model_environment
+            )
+            transport.script_run(
+                case.case_id,
+                RunProfilingCaseResponse(
+                    accepted=True,
+                    outcome=CaseOutcome.from_record(
+                        make_record(
+                            case.case_id,
+                            measurement_id=f"model-first-{index}",
+                            environment=environment,
+                        )
+                    ),
+                ),
+            )
+        assert len(busy_case_ids) == 3
+
+        first_report = await drain(admin, first.experiment_id)
+        assert first_report.state is ExperimentState.PARTIALLY_COMPLETED
+        assert len(rig.store.query_measurements()) == 8
+
+        second = await admin.start_experiment(StartExperimentRequest(request=intent))
+        assert second.accepted
+        assert second.experiment_id != first.experiment_id
+        second_cases = stored_cases(rig, second.experiment_id)
+        assert len(second_cases) == 3
+        assert all(
+            isinstance(case.spec, ModelCaseSpec)
+            and case.spec.granularity is ProfilingGranularity.TRANSFORMER_LAYER
+            and case.spec.layer_index == 24
+            for case in second_cases
+        )
+        assert {case.case_id for case in second_cases}.isdisjoint(busy_case_ids)
+
+        second_report = await drain(admin, second.experiment_id)
+        assert second_report.state is ExperimentState.COMPLETED
+        assert len(rig.store.query_measurements()) == 11
+        for case_id in busy_case_ids:
+            stored = rig.store.get_case(case_id)
+            assert stored is not None
+            assert stored.state is CaseState.FAILED
+            assert stored.failure is not None
+            assert stored.failure.category is ProfilingErrorCategory.DEVICE_BUSY
+
     async def test_unverified_candidate_runs_sentinels_then_reuses_reference(
         self, tmp_path: Path
     ) -> None:

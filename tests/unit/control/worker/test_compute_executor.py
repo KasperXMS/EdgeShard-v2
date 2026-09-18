@@ -128,11 +128,12 @@ class FakeImages:
 
 
 class FakeContainer:
-    def __init__(self) -> None:
+    def __init__(self, *, status: str = "running", name: str = "profile") -> None:
         self.id = "container-1"
-        self.status = "running"
+        self.name = name
+        self.status = status
         self.attrs = {
-            "State": {"Status": "running", "ExitCode": 0},
+            "State": {"Status": status, "ExitCode": 0},
             "NetworkSettings": {
                 "Ports": {
                     f"{CONTAINER_COMPUTE_PORT}/tcp": [
@@ -144,6 +145,8 @@ class FakeContainer:
         self.reloaded = False
         self.stop_timeout: int | None = None
         self.removed = False
+        self.removed_force = False
+        self.remove_error: Exception | None = None
         self.logs_payload = b""
         self.logs_calls = 0
 
@@ -153,8 +156,11 @@ class FakeContainer:
     def stop(self, timeout: int) -> None:
         self.stop_timeout = timeout
 
-    def remove(self) -> None:
+    def remove(self, *, force: bool = False) -> None:
+        if self.remove_error is not None:
+            raise self.remove_error
         self.removed = True
+        self.removed_force = force
 
     def logs(self, **kwargs: object) -> bytes:
         self.logs_calls += 1
@@ -165,10 +171,32 @@ class FakeContainers:
     def __init__(self, container: FakeContainer) -> None:
         self.container = container
         self.calls: list[tuple[str, dict[str, object]]] = []
+        self.run_error: Exception | None = None
+        self.known: dict[str, FakeContainer] = {}
+        self.get_calls: list[str] = []
+        self.list_calls: list[tuple[bool, dict[str, str]]] = []
+        self.listed: list[FakeContainer] | None = None
 
     def run(self, image: str, **kwargs: object) -> FakeContainer:
         self.calls.append((image, kwargs))
+        name = str(kwargs["name"])
+        self.container.name = name
+        self.known[name] = self.container
+        if self.run_error is not None:
+            raise self.run_error
         return self.container
+
+    def get(self, name: str) -> FakeContainer:
+        self.get_calls.append(name)
+        if name not in self.known:
+            raise KeyError(name)
+        return self.known[name]
+
+    def list(
+        self, *, all: bool, filters: dict[str, str]
+    ) -> list[FakeContainer]:
+        self.list_calls.append((all, filters))
+        return list(self.listed if self.listed is not None else self.known.values())
 
 
 class FakeDockerClient:
@@ -324,6 +352,67 @@ def test_prepare_failure_propagates_typed_error_and_cleans_up(tmp_path: Path) ->
     assert str(raised.value) == "container export failed"
     assert service_client.client_closed
     assert docker_client.container.removed
+
+
+def test_run_timeout_recovers_created_container_by_preallocated_name(
+    tmp_path: Path,
+) -> None:
+    docker_client = FakeDockerClient()
+    docker_client.container.status = "created"
+    docker_client.containers.run_error = TimeoutError(
+        "Docker API timed out after creating the container"
+    )
+    service_client = FakeServiceClient()
+    executor = make_executor(tmp_path, docker_client, service_client)
+
+    with pytest.raises(ProfilingError) as raised:
+        executor.prepare_session(
+            "session-timeout", WORKER_ID, SESSION_REQUEST, None, gpu_capability()
+        )
+
+    assert raised.value.category is ProfilingErrorCategory.INTERNAL_ERROR
+    assert "Docker API timed out after creating the container" in str(raised.value)
+    (_, kwargs), = docker_client.containers.calls
+    container_name = str(kwargs["name"])
+    assert docker_client.containers.get_calls == [container_name]
+    assert docker_client.container.removed
+    assert docker_client.container.removed_force
+    assert not service_client.client_closed
+
+
+def test_run_timeout_cleanup_failure_preserves_original_error(tmp_path: Path) -> None:
+    docker_client = FakeDockerClient()
+    docker_client.containers.run_error = TimeoutError("original launch timeout")
+    docker_client.container.remove_error = RuntimeError("cleanup failed")
+    executor = make_executor(tmp_path, docker_client, FakeServiceClient())
+
+    with pytest.raises(ProfilingError) as raised:
+        executor.prepare_session(
+            "session-timeout", WORKER_ID, SESSION_REQUEST, None, gpu_capability()
+        )
+
+    assert "original launch timeout" in str(raised.value)
+    assert "cleanup failed" not in str(raised.value)
+
+
+def test_startup_cleanup_removes_only_terminal_profiling_containers(
+    tmp_path: Path,
+) -> None:
+    docker_client = FakeDockerClient()
+    created = FakeContainer(status="created", name="created-profile")
+    exited = FakeContainer(status="exited", name="exited-profile")
+    dead = FakeContainer(status="dead", name="dead-profile")
+    running = FakeContainer(status="running", name="running-profile")
+    docker_client.containers.listed = [created, exited, dead, running]
+    executor = make_executor(tmp_path, docker_client, FakeServiceClient())
+
+    executor.cleanup_stale_containers()
+
+    assert docker_client.containers.list_calls == [
+        (True, {"label": "io.edgeshard.profiling=true"})
+    ]
+    assert all(container.removed_force for container in (created, exited, dead))
+    assert not running.removed
 
 
 def test_container_exit_before_readiness_fails_fast_with_logs_and_cleanup(

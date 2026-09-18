@@ -449,6 +449,29 @@ class ContainerComputeProfilingExecutor:
         self._poll_interval_s = poll_interval_s
         self._client_factory = client_factory or _HttpComputeServiceClient
 
+    def cleanup_stale_containers(self) -> None:
+        """Remove terminal profiling containers left by an earlier Worker."""
+        try:
+            docker_client = self._docker_client_factory()
+            containers = docker_client.containers.list(
+                all=True, filters={"label": "io.edgeshard.profiling=true"}
+            )
+        except Exception as exc:
+            logger.warning("listing stale profiling containers failed: %s", exc)
+            return
+        for container in containers:
+            status = str(getattr(container, "status", ""))
+            if status not in {"created", "exited", "dead"}:
+                continue
+            try:
+                container.remove(force=True)
+            except Exception as exc:
+                logger.warning(
+                    "removing stale profiling container %s failed: %s",
+                    getattr(container, "name", getattr(container, "id", "<unknown>")),
+                    exc,
+                )
+
     def prepare_session(
         self,
         session_id: str,
@@ -489,13 +512,14 @@ class ContainerComputeProfilingExecutor:
             _EXECUTION_DEVICE_ENV: execution_device,
             _BACKEND_REVISION_ENV: image_revision,
         }
+        container_name = (
+            "edgeshard-profile-"
+            f"{hashlib.sha256(session_id.encode()).hexdigest()[:16]}-"
+            f"{uuid.uuid4().hex[:8]}"
+        )
         kwargs: dict[str, object] = {
             "detach": True,
-            "name": (
-                "edgeshard-profile-"
-                f"{hashlib.sha256(session_id.encode()).hexdigest()[:16]}-"
-                f"{uuid.uuid4().hex[:8]}"
-            ),
+            "name": container_name,
             "command": [
                 "_compute-profile-service",
                 "--host",
@@ -549,9 +573,13 @@ class ContainerComputeProfilingExecutor:
                 opaque=_ContainerSessionState(container=container, client=client),
             )
         except ProfilingError:
+            if container is None:
+                _cleanup_named_container(docker_client, container_name)
             _cleanup_container(container, client)
             raise
         except Exception as exc:
+            if container is None:
+                _cleanup_named_container(docker_client, container_name)
             _cleanup_container(container, client)
             raise ProfilingError(
                 ProfilingErrorCategory.INTERNAL_ERROR,
@@ -799,6 +827,27 @@ def _cleanup_container(
         container.remove()
     except Exception as exc:
         logger.warning("profiling container removal failed: %s", exc)
+
+
+def _cleanup_named_container(docker_client: Any, container_name: str) -> None:
+    """Recover a container handle when ``containers.run`` failed post-create."""
+    try:
+        container = docker_client.containers.get(container_name)
+    except Exception as exc:
+        logger.warning(
+            "profiling container %s could not be recovered after launch failure: %s",
+            container_name,
+            exc,
+        )
+        return
+    try:
+        container.remove(force=True)
+    except Exception as exc:
+        logger.warning(
+            "profiling container %s cleanup after launch failure failed: %s",
+            container_name,
+            exc,
+        )
 
 
 class _ContainerService:

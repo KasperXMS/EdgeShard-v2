@@ -258,6 +258,9 @@ async def test_worker_serve_binds_wildcard_and_advertises_dialable_endpoint(
         def __init__(self, **kwargs: object) -> None:
             events["executor_kwargs"] = kwargs
 
+        def cleanup_stale_containers(self) -> None:
+            events["stale_cleanup"] = True
+
     class FakeRunner:
         def __init__(self, **kwargs: object) -> None:
             events["runner_kwargs"] = kwargs
@@ -324,6 +327,7 @@ async def test_worker_serve_binds_wildcard_and_advertises_dialable_endpoint(
     assert events["bind"] == ("0.0.0.0", 0)
     assert events["profiling_endpoint"] == "192.168.0.12:49321"
     assert events["agent_ran"] is True
+    assert events["stale_cleanup"] is True
     assert events["runner_stopped"] is True
     assert "server_stopped" in events
 
