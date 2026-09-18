@@ -1238,7 +1238,9 @@ class WorkerProfilingRunner:
         # answer accepted, and the lease release is unconditional so a close
         # can never strand a reservation (§39).
         try:
-            self._sessions.close_session(request.profiling_session_id)
+            await asyncio.to_thread(
+                self._sessions.close_session, request.profiling_session_id
+            )
         finally:
             # Model/container cleanup is deliberately allowed to fail loudly,
             # but it must never prevent release of the independent physical
@@ -1252,11 +1254,29 @@ class WorkerProfilingRunner:
         Leases MUST NOT outlive the runner: a leaked reservation would
         permanently shrink the profileable device set of the next serve.
         """
-        for session_id in self._sessions.close_all():
-            self._leases.release_session(session_id)
-        for server_id in tuple(self._iperf_servers):
-            await self._stop_iperf_server(server_id)
-        self._leases.release_all()
+        cleanup_error: Exception | None = None
+        try:
+            for session_id in self._sessions.session_ids:
+                try:
+                    await asyncio.to_thread(self._sessions.close_session, session_id)
+                except Exception as exc:
+                    # Keep shutting down the remaining sessions. The first
+                    # cleanup error is re-raised after every resource had its
+                    # chance to close and every physical lease was released.
+                    logger.exception(
+                        "cleanup of profiling session %s failed during shutdown",
+                        session_id,
+                    )
+                    if cleanup_error is None:
+                        cleanup_error = exc
+                finally:
+                    self._leases.release_session(session_id)
+            for server_id in tuple(self._iperf_servers):
+                await self._stop_iperf_server(server_id)
+        finally:
+            self._leases.release_all()
+        if cleanup_error is not None:
+            raise cleanup_error
         logger.info("profiling runner shut down")
 
     # ------------------------------------------------------------------

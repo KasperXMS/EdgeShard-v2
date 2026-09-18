@@ -21,7 +21,9 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import shutil
+import threading
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -358,11 +360,15 @@ class StubComputeExecutor:
         environment: ComputeExecutionEnvironment,
         *,
         delay_s: float = 0.0,
+        close_delay_s: float = 0.0,
+        close_sleep: Callable[[float], None] = time.sleep,
         close_error: Exception | None = None,
         profile_error: ProfilingError | None = None,
     ) -> None:
         self.environment = environment
         self.delay_s = delay_s
+        self.close_delay_s = close_delay_s
+        self.close_sleep = close_sleep
         self.close_error = close_error
         self.profile_error = profile_error
         self.closed = False
@@ -381,6 +387,8 @@ class StubComputeExecutor:
         return make_record(case)
 
     def close_session(self, session) -> None:
+        if self.close_delay_s:
+            self.close_sleep(self.close_delay_s)
         session.closed = True
         self.closed = True
         if self.close_error is not None:
@@ -1509,6 +1517,83 @@ async def test_close_cleanup_failure_still_releases_physical_lease() -> None:
     assert rig.sessions.open_session_count() == 0
 
 
+@pytest.mark.parametrize("operation", ("close", "shutdown"))
+async def test_slow_session_cleanup_does_not_block_event_loop(operation: str) -> None:
+    cleanup_started = threading.Event()
+    cleanup_release = threading.Event()
+    cleanup_thread_ids: list[int] = []
+    requested_sleeps: list[float] = []
+
+    def mock_sleep(seconds: float) -> None:
+        requested_sleeps.append(seconds)
+        cleanup_thread_ids.append(threading.get_ident())
+        cleanup_started.set()
+        if not cleanup_release.wait(timeout=5):
+            raise TimeoutError("test did not release mocked slow cleanup")
+
+    executor = StubComputeExecutor(
+        ComputeExecutionEnvironment(
+            torch_version="test",
+            cuda_version=None,
+            backend_revision="host-test",
+            target_device_id=CPU_DEVICE,
+            execution_device="cpu",
+        ),
+        close_delay_s=15.0,
+        close_sleep=mock_sleep,
+    )
+    rig = make_rig(compute_executor=executor)
+    assert (await prepare(rig)).accepted is True
+
+    ticks = 0
+    stop_ticker = asyncio.Event()
+
+    async def heartbeat_ticker() -> None:
+        nonlocal ticks
+        while not stop_ticker.is_set():
+            ticks += 1
+            await asyncio.sleep(0)
+
+    async def wait_for_cleanup_start() -> None:
+        while not cleanup_started.is_set():
+            await asyncio.sleep(0.001)
+
+    ticker_task = asyncio.create_task(heartbeat_ticker())
+    if operation == "close":
+        operation_task = asyncio.create_task(
+            rig.runner.close_profiling_session(
+                CloseProfilingSessionRequest(
+                    **fields(profiling_session_id=SESSION_ID)
+                )
+            )
+        )
+    else:
+        operation_task = asyncio.create_task(rig.runner.shutdown())
+
+    result = None
+    try:
+        await asyncio.wait_for(wait_for_cleanup_start(), timeout=1)
+        ticks_before = ticks
+        await asyncio.sleep(0.05)
+        assert ticks >= ticks_before + 10
+        assert not operation_task.done()
+    finally:
+        cleanup_release.set()
+        result = await asyncio.wait_for(operation_task, timeout=1)
+        stop_ticker.set()
+        await ticker_task
+
+    assert requested_sleeps == [15.0]
+    assert cleanup_thread_ids
+    assert all(thread_id != threading.get_ident() for thread_id in cleanup_thread_ids)
+    if operation == "close":
+        assert result is not None and result.accepted is True
+    else:
+        assert result is None
+    assert rig.leases.leased_device_ids == ()
+    assert rig.sessions.open_session_count() == 0
+
+
 async def test_shutdown_closes_everything_and_leaks_no_lease() -> None:
     rig = make_rig()
     assert (await prepare(rig, OPERATOR_SESSION, session_id="ps-a")).accepted is True
@@ -1517,6 +1602,27 @@ async def test_shutdown_closes_everything_and_leaks_no_lease() -> None:
     ).accepted is True
     assert rig.leases.leased_device_ids == (CPU_DEVICE,)
     await rig.runner.shutdown()
+    assert rig.leases.leased_device_ids == ()
+    assert rig.sessions.open_session_count() == 0
+
+
+async def test_shutdown_cleanup_failure_still_releases_physical_lease() -> None:
+    executor = StubComputeExecutor(
+        ComputeExecutionEnvironment(
+            torch_version="test",
+            cuda_version=None,
+            backend_revision="host-test",
+            target_device_id=CPU_DEVICE,
+            execution_device="cpu",
+        ),
+        close_error=RuntimeError("container cleanup exploded"),
+    )
+    rig = make_rig(compute_executor=executor)
+    assert (await prepare(rig)).accepted is True
+
+    with pytest.raises(RuntimeError, match="container cleanup exploded"):
+        await rig.runner.shutdown()
+
     assert rig.leases.leased_device_ids == ()
     assert rig.sessions.open_session_count() == 0
 
