@@ -246,19 +246,28 @@ async def test_worker_serve_binds_wildcard_and_advertises_dialable_endpoint(
     from edgeshard.cli import _worker_serve
 
     events: dict[str, object] = {}
+    call_order: list[str] = []
 
     class FakeInspector:
         def __init__(self, config: WorkerConfig) -> None:
             events["inspector_config"] = config
+
+        async def start(self) -> None:
+            call_order.append("inspector.start")
+
+        async def close(self) -> None:
+            call_order.append("inspector.close")
 
         def require_docker_client(self) -> object:
             return object()
 
     class FakeExecutor:
         def __init__(self, **kwargs: object) -> None:
+            call_order.append("executor.construct")
             events["executor_kwargs"] = kwargs
 
         def cleanup_stale_containers(self) -> None:
+            call_order.append("cleanup_stale_containers")
             events["stale_cleanup"] = True
 
     class FakeRunner:
@@ -289,6 +298,7 @@ async def test_worker_serve_binds_wildcard_and_advertises_dialable_endpoint(
             events["profiling_endpoint"] = profiling_endpoint
 
         async def run(self) -> None:
+            call_order.append("agent.run")
             events["agent_ran"] = True
 
     async def fake_start_profiling_server(
@@ -330,6 +340,121 @@ async def test_worker_serve_binds_wildcard_and_advertises_dialable_endpoint(
     assert events["stale_cleanup"] is True
     assert events["runner_stopped"] is True
     assert "server_stopped" in events
+    assert call_order.index("inspector.start") < call_order.index(
+        "executor.construct"
+    )
+    assert call_order.index("executor.construct") < call_order.index(
+        "cleanup_stale_containers"
+    )
+    assert call_order.index("cleanup_stale_containers") < call_order.index(
+        "agent.run"
+    )
+    assert call_order[-1] == "inspector.close"
+
+
+@pytest.mark.parametrize("failure_stage", ("server", "agent_construct", "agent_run"))
+async def test_worker_serve_closes_inspector_on_startup_failure(
+    failure_stage: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from edgeshard.cli import _worker_serve
+
+    events: list[str] = []
+
+    class FakeInspector:
+        def __init__(self, config: WorkerConfig) -> None:
+            pass
+
+        async def start(self) -> None:
+            events.append("inspector.start")
+
+        async def close(self) -> None:
+            events.append("inspector.close")
+
+        def require_docker_client(self) -> object:
+            return object()
+
+    class FakeExecutor:
+        def __init__(self, **kwargs: object) -> None:
+            pass
+
+        def cleanup_stale_containers(self) -> None:
+            events.append("cleanup_stale_containers")
+
+    class FakeRunner:
+        def __init__(self, **kwargs: object) -> None:
+            pass
+
+        async def shutdown(self) -> None:
+            events.append("runner.shutdown")
+
+    class FakeServer:
+        async def stop(self, grace: object) -> None:
+            events.append("server.stop")
+
+    class FakeWorkerAgent:
+        worker_id = "worker-12"
+        instance_id = "instance-12"
+        registration_session_id = "registration-12"
+
+        def __init__(
+            self,
+            config: WorkerConfig,
+            *,
+            inspector: object,
+            profiling_endpoint: str,
+        ) -> None:
+            events.append("agent.construct")
+            if failure_stage == "agent_construct":
+                raise RuntimeError("agent construction failed")
+
+        async def run(self) -> None:
+            events.append("agent.run")
+            if failure_stage == "agent_run":
+                raise RuntimeError("agent startup failed")
+
+    async def fake_start_profiling_server(
+        runner: object, *, host: str, port: int
+    ) -> tuple[FakeServer, int]:
+        events.append("server.start")
+        if failure_stage == "server":
+            raise RuntimeError("server startup failed")
+        return FakeServer(), 49_321
+
+    monkeypatch.setattr("edgeshard.cli.LocalWorkerInspector", FakeInspector)
+    monkeypatch.setattr("edgeshard.cli.WorkerAgent", FakeWorkerAgent)
+    monkeypatch.setattr(
+        "edgeshard.cli.start_profiling_server", fake_start_profiling_server
+    )
+    monkeypatch.setattr(
+        "edgeshard.control.worker.compute_executor.ContainerComputeProfilingExecutor",
+        FakeExecutor,
+    )
+    monkeypatch.setattr(
+        "edgeshard.control.worker.profiling_runner.WorkerProfilingRunner",
+        FakeRunner,
+    )
+    config = WorkerConfig.model_validate(
+        {
+            "profiling": {
+                "enabled": True,
+                "host": "127.0.0.1",
+                "port": 0,
+            }
+        }
+    )
+
+    with pytest.raises(RuntimeError):
+        await _worker_serve(config)
+
+    assert events[0:2] == ["inspector.start", "cleanup_stale_containers"]
+    assert events[-1] == "inspector.close"
+    assert events.count("inspector.close") == 1
+    assert "runner.shutdown" in events
+    if failure_stage == "server":
+        assert "server.stop" not in events
+    else:
+        assert "server.stop" in events
 
 
 def test_worker_serve_profiling_enabled_without_master_exits_nonzero(

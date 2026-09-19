@@ -286,12 +286,12 @@ def _local_advertise_host(bind_host: str) -> str:
 async def _worker_serve(config: WorkerConfig) -> None:
     """Serve loop; hosts the profiling plane alongside the Agent when enabled.
 
-    Ordering is the §41 contract: the profiling server binds *before*
+    Ordering is the §41 contract: the shared inspector starts before stale
+    profiling-container cleanup, then the profiling server binds *before*
     registration so the Agent advertises the resolved ``host:bound_port``
-    (port 0 → OS-chosen), and the shared inspector serves both loops (§37:
-    one long-lived process, fresh state per RPC). Shutdown closes the Agent
-    first — its ``run`` owns the inspector lifecycle — then releases every
-    profiling session and lease (§39: no reservation outlives the runner).
+    (port 0 → OS-chosen). The outer lifecycle closes the inspector even if
+    construction fails before the Agent takes over; Agent start/close calls
+    remain idempotent. No profiling session or lease outlives the runner (§39).
     """
     if not config.profiling.enabled:
         plain_agent = WorkerAgent(config)  # exact Phase 1 behavior
@@ -308,60 +308,66 @@ async def _worker_serve(config: WorkerConfig) -> None:
     from edgeshard.control.worker.profiling_runner import WorkerProfilingRunner
 
     inspector = LocalWorkerInspector(config)
-    agent: WorkerAgent | None = None
-
-    def current_tokens() -> RegistrationTokens | None:
-        """The Agent's live registration, or ``None`` between registrations.
-
-        The §41 gate: while the Agent is unregistered (startup, reconnect
-        backoff) every profiling RPC is refused STALE_SESSION rather than
-        executing under a dead registration.
-        """
-        if agent is None:
-            return None
-        worker_id = agent.worker_id
-        registration_session_id = agent.registration_session_id
-        if worker_id is None or registration_session_id is None:
-            return None
-        return RegistrationTokens(
-            worker_id=worker_id,
-            instance_id=agent.instance_id,
-            registration_session_id=registration_session_id,
-        )
-
-    compute_executor = ContainerComputeProfilingExecutor(
-        docker_client_factory=inspector.require_docker_client,
-        model_store=ModelStore(model_root=config.model_store.root),
-    )
-    compute_executor.cleanup_stale_containers()
-    runner = WorkerProfilingRunner(
-        sessions=ProfilingSessionManager(token_source=current_tokens),
-        inspector=inspector,
-        model_store_root=config.model_store.root,
-        compute_executor=compute_executor,
-    )
-    server, port = await start_profiling_server(
-        runner, host=config.profiling.host, port=config.profiling.port
-    )
-    endpoint = _worker_profiling_endpoint(
-        config.profiling.host, config.profiling.advertise_host, port
-    )
-    logger.info(
-        "profiling service listening, advertising %s (bound on %s:%d)",
-        endpoint,
-        config.profiling.host,
-        port,
-    )
     try:
-        # Constructed inside the try: a config the Agent rejects (e.g. a
-        # missing master endpoint) must still stop the bound server and
-        # release the runner (§39), never leave them dangling on a closed
-        # loop.
-        agent = WorkerAgent(config, inspector=inspector, profiling_endpoint=endpoint)
-        await agent.run()
+        await inspector.start()
+        agent: WorkerAgent | None = None
+
+        def current_tokens() -> RegistrationTokens | None:
+            """The Agent's live registration, or ``None`` between registrations.
+
+            The §41 gate: while the Agent is unregistered (startup, reconnect
+            backoff) every profiling RPC is refused STALE_SESSION rather than
+            executing under a dead registration.
+            """
+            if agent is None:
+                return None
+            worker_id = agent.worker_id
+            registration_session_id = agent.registration_session_id
+            if worker_id is None or registration_session_id is None:
+                return None
+            return RegistrationTokens(
+                worker_id=worker_id,
+                instance_id=agent.instance_id,
+                registration_session_id=registration_session_id,
+            )
+
+        compute_executor = ContainerComputeProfilingExecutor(
+            docker_client_factory=inspector.require_docker_client,
+            model_store=ModelStore(model_root=config.model_store.root),
+        )
+        compute_executor.cleanup_stale_containers()
+        runner = WorkerProfilingRunner(
+            sessions=ProfilingSessionManager(token_source=current_tokens),
+            inspector=inspector,
+            model_store_root=config.model_store.root,
+            compute_executor=compute_executor,
+        )
+        server: grpc.aio.Server | None = None
+        try:
+            server, port = await start_profiling_server(
+                runner, host=config.profiling.host, port=config.profiling.port
+            )
+            endpoint = _worker_profiling_endpoint(
+                config.profiling.host, config.profiling.advertise_host, port
+            )
+            logger.info(
+                "profiling service listening, advertising %s (bound on %s:%d)",
+                endpoint,
+                config.profiling.host,
+                port,
+            )
+            agent = WorkerAgent(
+                config, inspector=inspector, profiling_endpoint=endpoint
+            )
+            await agent.run()
+        finally:
+            try:
+                await runner.shutdown()
+            finally:
+                if server is not None:
+                    await server.stop(grace=None)
     finally:
-        await runner.shutdown()
-        await server.stop(grace=None)
+        await inspector.close()
 
 
 @master_app.command("serve")
